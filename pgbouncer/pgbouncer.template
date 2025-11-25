@@ -1,0 +1,44 @@
+[databases]
+* = host=%HOST_IP% port=%HOST_PORT% dbname=%DATABASE%
+
+[pgbouncer]
+listen_port = 5432
+listen_addr = *
+user = %CLIENT%
+unix_socket_dir = %SCRIPT_DIR%/../run/%PGID%
+so_reuseport = 1
+auth_type = scram-sha-256
+auth_file = %SCRIPT_DIR%/userlist.txt
+admin_users = %CLIENT%
+logfile = %SCRIPT_DIR%/../pgbouncer.%PGID%.log
+pidfile = %SCRIPT_DIR%/../pgbouncer.%PGID%.pid
+pool_mode = transaction
+max_client_conn = 8192
+default_pool_size = %SIZE%
+max_db_connections = %SIZE%
+max_user_connections = %SIZE%
+min_pool_size = 10
+reserve_pool_size = 10
+reserve_pool_timeout = 10
+pkt_buf = 8192
+tcp_keepalive = 1
+listen_backlog = 4096
+server_round_robin = 1
+ignore_startup_parameters = extra_float_digits,options,autoReconnect,ApplicationName,reWriteBatchedInserts
+
+# Log settings
+log_connections = 1
+log_disconnections = 1
+log_pooler_errors = 1
+verbose = 0
+
+# Connection sanity checks, timeouts
+server_reset_query = DISCARD ALL
+server_reset_query_always = 1
+server_lifetime = 3600
+
+# TLS settings
+server_tls_sslmode = prefer
+
+# Dangerous timeouts
+query_wait_timeout = 300
