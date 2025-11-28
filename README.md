@@ -6,7 +6,8 @@
 1. [CockroachDB](#cockroachdb)
 1. [PgBouncer](#pgbouncer)
 1. [High Availability](#high-availability)
-1. [Workload Tests](#workload-tests)
+1. [Flight Schedules Workload](#flight-schedules)
+1. [Train Events Workload](#train-evemts)
 
 ## Overview
 
@@ -272,7 +273,7 @@ colima start --network-address --memory 8 --cpu 4 --disk 100
 
 Then increase the kernel and networking limits on the VM 
 ```
-colima sh
+colima ssh
 
 # socket state snapshot
 ss -s
@@ -746,11 +747,66 @@ Also check the stats pages at http://localhost:8404/stats
 
 ## Workload Tests
 
-### Initial Schema
+### Flight Schedules
+This workload simulates the day-to-day lifecycle of airline flight schedules: generating flight plans, updating operational details, and serving read traffic that represents downstream planning, monitoring, and customer-facing systems.
+It focuses on **high-frequency, lightweight read/write transactions** that stress indexing, row-level updates, and concurrent access to time-based operational data.
+
+It is a **simple, high-velocity transactional workload** designed to model the core interactions of systems responsible for schedule publication, flight status updates, and operational synchronization across airline services.
+
+The workload exercises three primary interaction patterns:
+
+#### 1. Schedule Generation Transactions
+
+These transactions create new flight schedule entries, representing upstream schedule-planning systems that continuously publish changes.
+
+Each insert models a single flight with structured attributes such as:
+- Airline and flight number
+- Origin / destination
+- Planned departure and arrival times
+- Equipment type
+- Operational metadata (status, gate, terminal, etc.)
+
+These operations simulate steady-state introduction of new flights into the operational window for a given day or period.
+
+#### 2. Schedule Update Transactions
+
+Existing schedule records are selected and updated in place, simulating the frequent minor changes that occur throughout the day:
+- Departure time adjustments
+- Gate reassignments
+- Equipment swaps
+- Status changes (e.g., SCHEDULED → BOARDING → DEPARTED → ARRIVED)
+
+These are **small, implicit read-modify-write** transactions:
+1. Read the current schedule row
+1. Apply a deterministic or randomized update
+1. Write the updated row back atomically
+
+They represent load patterns from real-world operational control centers, partner data feeds, and automated synchronization services.
+
+#### 3. Schedule Lookup Transactions
+
+These transactions issue low-latency point reads or small range scans—queries commonly used by:
+- Customer-facing flight-status APIs
+- Gate/terminal display systems
+- Mobile apps polling for updates
+- Operational dashboards or planning tools
+
+These reads stress index usage and concurrent access patterns across “hot” rows (near-term departure windows) without modifying data.
+
+#### What This Workload Demonstrates
+- **Concurrent read/write behavior** on time-partitioned data such as upcoming flight legs
+- **Update-heavy vs read-heavy balance**, reflecting real operational systems
+- **Impact of concurrent updates** on single-row transactions and hot partitions
+- **Index and storage efficiency** for schedule lookup patterns (origin/destination + time)
+- **Real-world stress characteristics** of systems that must ingest updates continuously while serving high-volume read queries
+- **Predictable ACID behavior** for small, frequent transactions
+- **Throughput and latency characteristics** under mixed operational load
+
+#### Initial Schema
 First we'll execute the sql to create a sample schema and load some data into it.
 ```
-cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -f ./sql/initial-schema.sql
-cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -f ./sql/populate-sample-data.sql
+cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -f ./workloads/flight-schedules/initial-schema.sql
+cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -f ./workloads/flight-schedules/populate-sample-data.sql
 ```
 
 Then permission access to the tables for our pgbouncer client.
@@ -760,7 +816,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE defaultdb.* TO pgb;
 """
 ```
 
-### dbworkload
+#### dbworkload
 This is a tool we use to simulate data flowing into cockroach, developed by one of our colleagues with python.  We can install the tool with ```pip3 install "dbworkload[postgres]"```, and then add it to your path.  On Mac or Linux with Bash you can use:
 ```
 echo -e '\nexport PATH=`python3 -m site --user-base`/bin:$PATH' >> ~/.bashrc 
@@ -779,7 +835,7 @@ We can control the velocity and volume of the workload with a few properties des
 * batch_size: the number of records we want to update in a single cycle
 * delay: the number of milliseconds we should pause between transactions, so we don't overload admission controls
 
-These parameters are set in the run-workload.sh script.  We'll run multiple workers to simulate client apps (from a docker container) that run concurrently to process the total workload, each with a proportion of the total connection pool.  We'll pass the following parameters to the workload script.
+These parameters are set in the run_workloads.sh script.  We'll run multiple workers to simulate client apps (from a docker container) that run concurrently to process the total workload, each with a proportion of the total connection pool.  We'll pass the following parameters to the workload script.
 * connection string: this is the uri we'll used to connect to the database
 * test name: identifies the name of the test in the logs, i.e. direct
 * txn poolimg: true if connections should be bound to the transaction, false for session
@@ -788,18 +844,22 @@ These parameters are set in the run-workload.sh script.  We'll run multiple work
 
 To execute the tests in docker we'll need to publish our python dependencies
 ```
+cd ./workloads/flight-schedules
 pip freeze > requirements.txt
 sed -E '/^(pyobjc-core|pyobjc-framework-Cocoa|py2app|rumps|macholib|tensorflow-macos|tensorflow-metal)(=|==)/d' \
   requirements.txt > requirements-runner.txt
+cd ../../
 ```
 
-### Direct Connections
+#### Direct Connections
 Then we can use our workload script to simulate the workload going directly against the database running on our host machine.
 ```
+cd ./workloads/flight-schedules
 export TEST_URI="postgresql://pgb:secret@host.docker.internal:26257/defaultdb?sslmode=prefer"
 export TEST_NAME="direct"
 export TXN_POOLONG="false"
 ./run_workloads.sh 1024 4
+cd ../../
 ```
 You can tail the files in the logs directory or open another terminal and run ```docker logs -f dbw-1```
 
@@ -834,13 +894,15 @@ ramp           0
 args           {'schedule_freq': 10, 'status_freq': 90, 'inventory_freq': 75, 'price_freq': 25, 'batch_size': 64, 'delay': 100, 'txn_pooling': False}
 ```
 
-### Managed Connections
+#### Managed Connections
 We can simulate the workload again, this time using our PgBouncer HA cluster with transaction pooling, but we'll have to disable prepared statements due to connection multiplexing between clients.
 ```
+cd ./workloads/flight-schedules
 export TEST_URI="postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer"
 export TEST_NAME="pooling"
 export TXN_POOLONG="true"
 ./run_workloads.sh 1024 4
+cd ../../
 ```
 You can tail the files in the logs directory or open another terminal and run ```docker logs -f dbw-1```
 
@@ -874,4 +936,43 @@ iterations     8192
 ramp           0
 args           {'schedule_freq': 10, 'status_freq': 90, 'inventory_freq': 75, 'price_freq': 25, 'batch_size': 64, 'delay': 100, 'txn_pooling': True}
 ```
+
+### Train Events
+This workload simulates the ingestion, processing, state-transition, and archival lifecycle of train and track-management events using realistic multi-event ACID transactions that stress both concurrency control and JSON-heavy data paths.
+
+It is a **multi-event transactional workload** designed to simulate the operational data flow of a modern railway control, dispatching, and track-management system.
+It exercises a realistic mix of **read**, **write**, and **state-transition** operations that occur as trains move across a network, infrastructure states change, and control systems emit telemetry or directives.
+
+The workload models three primary interaction patterns:
+
+#### 1. Event Ingestion Transactions
+
+Each transaction inserts a **batch of 10–100 synthetic railway events**, such as route authorizations, signal clearances, speed restrictions, switch position changes, position updates, and infrastructure condition reports.
+Every event is written atomically alongside a corresponding status record, simulating upstream publish or capture systems generating operational messages.
+
+#### 2. Event Processing Transactions
+
+Batches of events in PENDING or PROCESSING states are selected with **row-level locking**, updated, and advanced through their lifecycle.
+
+The workload includes:
+- **FOR UPDATE** row locking
+- Application of business logic modifications to the event payload
+- State machine transitions (e.g., PENDING → PROCESSING → COMPLETE)
+
+This represents downstream consumers such as dispatch systems, safety logic, or orchestration services that process operational rail messages concurrently.
+
+#### 3. Archival Transactions
+
+Events that reach a terminal state are **bulk-archived** into a history table and then removed from the primary tables as part of a single ACID transaction.
+This simulates data movement pipelines—ETL, retention policies, or system rollups—that extract completed operational events to long-term storage.
+
+#### What This Workload Demonstrates
+- **Contention behavior** under multi-row, multi-statement transactions
+- **Impact of JSONB vs TEXT** for storing and processing nested operational documents
+- **Concurrency control patterns** (locks, retries, write–write conflicts)
+- **End-to-end lifecycle simulation** of operational messages in a real dispatching or control system
+- **Mixed read/write access** across hot rows and rolling windows of recent events
+- **Batch-oriented transactional throughput** similar to real event-driven systems
+
+#### Initial Schema
 

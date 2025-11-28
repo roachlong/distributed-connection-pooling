@@ -212,6 +212,7 @@ override.tf.json
 terraform.rc
 
 # Local files
+build/
 certs/
 data/
 logs/
