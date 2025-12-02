@@ -861,7 +861,7 @@ cd ../../
 ```
 You can tail the files in the logs directory or open another terminal and run ```docker logs -f dbw-1```
 
-A summary of the test results for our two workers are outlined below...
+A summary of the test results for one of the workers is outlined below...
 ```
 >>> Worker 2 (logs/results_direct_20251124_081158_w2.log)
 run_name       Transactions.20251124_131951
@@ -935,6 +935,56 @@ ramp           0
 args           {'schedule_freq': 10, 'status_freq': 90, 'inventory_freq': 75, 'price_freq': 25, 'batch_size': 64, 'delay': 100, 'txn_pooling': True}
 ```
 
+### Interpretation
+From the client’s perspective, both the direct-connection and managed-connection (PgBouncer) executions completed the same total number of operations:
+- **8192 operations per worker**
+- **256 concurrent threads**
+- **4 workers**
+- **~1024 total concurrency**
+
+But the client-side latency profile inside those fixed iterations is dramatically different:
+
+**1. Mean latency per operation drops substantially with PgBouncer**
+
+For example:
+
+| Operation | Direct Mean (ms) | Pooled Mean (ms) | Improvement |
+| ------------- | ------------- | ------------- | ------------- |
+| cycle | 27,418 ms | 11,414 ms | ~58% faster |
+| inventory | 10,100 ms | 4,229 ms | ~58% faster |
+| price | 3,302 ms | 1,392 ms | ~58% faster |
+| schedule | 1,375 ms | 587 ms | ~57% faster |
+| status | 12,526 ms | 5,098 ms | ~59% faster |
+
+That pattern is consistent across **all** event types:<br/>
+client-side work is ~50–60% faster under pooled connections.
+
+**2. Tail latencies (p90–p99) shrink even more dramatically**
+
+Direct connections exhibit very large long-tail behavior:
+- **p95 up to ~57 seconds**
+- **p99 up to ~73 seconds**
+ - **max > 2 minutes**
+
+Under managed connections:
+- **p95 typically under 8 seconds**
+- **p99 under 10 seconds**
+- **max ~9 seconds**
+
+This is a **10×–20×** reduction in tail latency.
+
+Why?
+
+Because CockroachDB is handling far fewer active backend sessions, so:
+- fewer competing goroutines
+- fewer pgwire buffers
+- fewer session-level memory contexts
+- less scheduler pressure
+- far fewer concurrent KV requests
+- fewer write queues forming
+
+The client sees more predictable, more stable response times as a direct result.
+
 ## Train Events
 This workload simulates the ingestion, processing, state-transition, and archival lifecycle of train and track-management events using realistic multi-event ACID transactions that stress both concurrency control and JSON-heavy data paths.
 
@@ -973,4 +1023,273 @@ This simulates data movement pipelines—ETL, retention policies, or system roll
 - **Batch-oriented transactional throughput** similar to real event-driven systems
 
 ### Initial Schema
+First we'll execute the sql to create a sample schema and load some data into it.
+```
+cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -f ./workloads/train-events/initial-schema.sql
+cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -f ./workloads/train-events/populate-sample-data.sql
+```
 
+Then permission access to the tables for our pgbouncer client.
+```
+cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -e """
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE defaultdb.* TO pgb;
+"""
+```
+
+### dbworkload
+This is a tool we use to simulate data flowing into cockroach, developed by one of our colleagues with python.  We can install the tool with ```pip3 install "dbworkload[postgres]"```, and then add it to your path.  On Mac or Linux with Bash you can use:
+```
+echo -e '\nexport PATH=`python3 -m site --user-base`/bin:$PATH' >> ~/.bashrc 
+source ~/.bashrc
+```
+For Windows you can add the location of the dbworkload.exe file (i.e. C:\Users\myname\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.9_abcdefghijk99\LocalCache\local-packages\Python39\Scripts) to your Windows Path environment variable.  The pip command above should provide the exact path to your local python executables.
+
+We can control the velocity and volume of the workload with a few properties described below.
+* num_connections: we'll simulate the workload across a number of processes
+* duration: the number of minutes for which we want to run the simulation
+* iterations: or use the number of executions for each loop of the simulation
+* min_batch_size: the minimum number of events we want to process in a single transaction
+* max_batch_size: the maximum number of events we want to process in a single transaction
+* delay: the number of milliseconds we should pause between transactions, so we don't overload admission controls
+
+These parameters are set in the run_workloads.sh script.  We'll run multiple workers to simulate client apps (from a docker container) that run concurrently to process the total workload, each with a proportion of the total connection pool.  We'll pass the following parameters to the workload script.
+* connection string: this is the uri we'll used to connect to the database
+* test name: identifies the name of the test in the logs, i.e. direct
+* txn poolimg: true if connections should be bound to the transaction, false for session
+* total connections: the total number of connections we want to simulate across all workers
+* num workers: the number of instances we want to spread the workload across
+
+To execute the tests in docker we'll need to publish our python dependencies
+```
+cd ./workloads/train-events
+pip freeze > requirements.txt
+sed -E '/^(pyobjc-core|pyobjc-framework-Cocoa|py2app|rumps|macholib|tensorflow-macos|tensorflow-metal)(=|==)/d' \
+  requirements.txt > requirements-runner.txt
+cd ../../
+```
+
+### Direct Connections
+Then we can use our workload script to simulate the workload going directly against the database running on our host machine.
+```
+cd ./workloads/train-events
+export TEST_URI="postgresql://pgb:secret@host.docker.internal:26257/defaultdb?sslmode=prefer"
+export TEST_NAME="direct"
+export TXN_POOLONG="false"
+./run_workloads.sh 512 4
+cd ../../
+```
+You can tail the files in the logs directory or open another terminal and run ```docker logs -f dbw-1```
+
+A summary of the test results for one of the workers is outlined below...
+
+**Using JSONB Fields**
+```
+>>> Worker 2 (logs/results_direct_jsonb_20251130_193430_w2.log)
+run_name       Transactionsjsonb.20251201_004236
+start_time     2025-12-01 00:42:36
+end_time       2025-12-01 06:58:26
+test_duration  22550
+-------------  ---------------------------------
+
+┌───────────┬───────────┬───────────┬───────────┬─────────────┬──────────────┬────────────┬──────────────┬──────────────┬──────────────┬───────────────┐
+│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │     mean(ms) │    p50(ms) │      p90(ms) │      p95(ms) │      p99(ms) │       max(ms) │
+├───────────┼───────────┼───────────┼───────────┼─────────────┼──────────────┼────────────┼──────────────┼──────────────┼──────────────┼───────────────┤
+│    22,550 │ __cycle__ │       128 │     2,048 │           0 │ 1,181,943.54 │ 484,743.71 │ 3,231,329.46 │ 4,321,847.35 │ 6,280,597.23 │ 13,704,440.28 │
+│    22,550 │ add       │       128 │     2,048 │           0 │    68,135.58 │  25,042.43 │   162,019.06 │   340,040.77 │   659,524.03 │    935,443.13 │
+│    22,550 │ archive   │       128 │     2,048 │           0 │    31,205.86 │  10,125.94 │    70,397.50 │   125,083.27 │   375,331.41 │  1,318,715.29 │
+│    22,550 │ process   │       128 │     2,048 │           0 │ 1,082,500.62 │ 377,693.80 │ 3,121,893.29 │ 4,174,144.33 │ 6,155,143.14 │ 13,680,428.80 │
+└───────────┴───────────┴───────────┴───────────┴─────────────┴──────────────┴────────────┴──────────────┴──────────────┴──────────────┴───────────────┘
+
+Parameter      Value
+-------------  --------------------------------------------------------------------------------------------------------------------------------------------------
+workload_path  /work/transactionsJsonb.py
+conn_params    {'conninfo': 'postgresql://pgb:secret@host.docker.internal:26257/defaultdb?sslmode=prefer&application_name=Transactionsjsonb', 'autocommit': True}
+conn_extras    {}
+concurrency    128
+duration
+iterations     2048
+ramp           0
+args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': False}
+```
+
+**Versus Text Fields**
+```
+>>> Worker 2 (logs/results_direct_text_20251130_193430_w2.log)
+run_name       Transactionstext.20251201_071843
+start_time     2025-12-01 07:18:43
+end_time       2025-12-01 08:10:26
+test_duration  3103
+-------------  --------------------------------
+
+┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬────────────┬────────────┬────────────┬────────────┬──────────────┐
+│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │    p50(ms) │    p90(ms) │    p95(ms) │    p99(ms) │      max(ms) │
+├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼────────────┼────────────┼────────────┼────────────┼──────────────┤
+│     3,103 │ __cycle__ │       128 │     2,048 │           0 │ 167,998.93 │ 109,581.05 │ 376,809.94 │ 643,908.30 │ 981,693.04 │ 1,537,120.24 │
+│     3,103 │ add       │       128 │     2,048 │           0 │  19,684.26 │  16,925.65 │  44,239.11 │  49,473.15 │  61,934.11 │   121,511.96 │
+│     3,103 │ archive   │       128 │     2,048 │           0 │  17,617.78 │   2,229.42 │  61,146.24 │  93,807.39 │ 203,677.86 │   426,512.19 │
+│     3,103 │ process   │       128 │     2,048 │           0 │ 130,594.01 │  64,083.91 │ 341,346.50 │ 583,468.49 │ 872,766.48 │ 1,517,372.06 │
+└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴────────────┴────────────┴────────────┴────────────┴──────────────┘
+
+Parameter      Value
+-------------  -------------------------------------------------------------------------------------------------------------------------------------------------
+workload_path  /work/transactionsText.py
+conn_params    {'conninfo': 'postgresql://pgb:secret@host.docker.internal:26257/defaultdb?sslmode=prefer&application_name=Transactionstext', 'autocommit': True}
+conn_extras    {}
+concurrency    128
+duration
+iterations     2048
+ramp           0
+args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': False}
+```
+
+### Managed Connections
+We can simulate the workload again, this time using our PgBouncer HA cluster with transaction pooling, but we'll have to disable prepared statements due to connection multiplexing between clients.
+```
+cd ./workloads/train-events
+export TEST_URI="postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer"
+export TEST_NAME="pooling"
+export TXN_POOLONG="true"
+./run_workloads.sh 512 4
+cd ../../
+```
+You can tail the files in the logs directory or open another terminal and run ```docker logs -f dbw-1```
+
+And a summary of the test results for one of the workers is outlined below...
+
+**Using JSONB Fields**
+```
+>>> Worker 2 (logs/results_pooling_jsonb_20251201_140514_w2.log)
+run_name       Transactionsjsonb.20251201_191248
+start_time     2025-12-01 19:12:48
+end_time       2025-12-01 22:54:49
+test_duration  13321
+-------------  ---------------------------------
+
+┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬────────────┬──────────────┬──────────────┬──────────────┬──────────────┐
+│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │    p50(ms) │      p90(ms) │      p95(ms) │      p99(ms) │      max(ms) │
+├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼────────────┼──────────────┼──────────────┼──────────────┼──────────────┤
+│    13,321 │ __cycle__ │       128 │     2,048 │           0 │ 815,609.64 │ 703,129.62 │ 1,004,977.64 │ 2,268,000.43 │ 2,350,959.58 │ 3,106,766.67 │
+│    13,321 │ add       │       128 │     2,048 │           0 │ 242,604.46 │ 201,617.77 │   325,851.99 │   375,890.85 │ 1,941,835.49 │ 2,101,634.99 │
+│    13,321 │ archive   │       128 │     2,048 │           0 │ 263,691.48 │ 215,986.87 │   407,631.80 │   531,846.62 │ 1,625,728.39 │ 2,599,985.38 │
+│    13,321 │ process   │       128 │     2,048 │           0 │ 309,213.12 │ 250,818.61 │   427,179.48 │   534,836.47 │ 1,993,676.53 │ 2,030,037.81 │
+└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴────────────┴──────────────┴──────────────┴──────────────┴──────────────┘
+
+Parameter      Value
+-------------  -----------------------------------------------------------------------------------------------------------------------------------------
+workload_path  /work/transactionsJsonb.py
+conn_params    {'conninfo': 'postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer&application_name=Transactionsjsonb', 'autocommit': True}
+conn_extras    {}
+concurrency    128
+duration
+iterations     2048
+ramp           0
+args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': True}
+```
+
+**Versus Text Fields**
+```
+>>> Worker 2 (logs/results_pooling_text_20251202_130844_w2.log)
+run_name       Transactionstext.20251202_181644
+start_time     2025-12-02 18:16:44
+end_time       2025-12-02 18:26:29
+test_duration  585
+-------------  --------------------------------
+
+┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬───────────┬───────────┬───────────┬───────────┐
+│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │   p90(ms) │   p95(ms) │   p99(ms) │   max(ms) │
+├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼───────────┼───────────┼───────────┼───────────┤
+│       585 │ __cycle__ │       128 │     2,048 │           3 │  34,344.72 │ 35,350.35 │ 44,850.78 │ 46,681.42 │ 51,327.14 │ 55,677.71 │
+│       585 │ add       │       128 │     2,048 │           3 │  10,997.23 │ 10,828.93 │ 14,706.88 │ 15,723.68 │ 19,642.67 │ 23,032.99 │
+│       585 │ archive   │       128 │     2,048 │           3 │  10,810.96 │ 10,684.68 │ 16,598.57 │ 18,180.35 │ 20,161.36 │ 24,008.58 │
+│       585 │ process   │       128 │     2,048 │           3 │  12,436.07 │ 12,669.71 │ 16,789.01 │ 17,953.65 │ 20,663.01 │ 24,225.55 │
+└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴───────────┴───────────┴───────────┴───────────┘
+
+Parameter      Value
+-------------  ----------------------------------------------------------------------------------------------------------------------------------------
+workload_path  /work/transactionsText.py
+conn_params    {'conninfo': 'postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer&application_name=Transactionstext', 'autocommit': True}
+conn_extras    {}
+concurrency    128
+duration
+iterations     2048
+ramp           0
+args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': True}
+```
+
+### Interpretation
+
+**<ins>PART 1 - JSONB vs TEXT DATA TYPES</ins>**
+
+The output from our testing shows that JSONB is not a good match for a high-throughput event queue with heavy writes and no nested JSON querying.  TEXT is absolutely the right approach for this workload.
+
+**Mean Latency Comparison (per operation)**
+| Operation | JSONB Mean (ms) | TEXT Mean (ms) | Improvement When Using TEXT |
+| ------------- | ------------- | ------------- | ------------- |
+| add | 68,135 ms | 19,684 ms | ~71% faster |
+| process | 1,082,500 ms | 130,594 ms | ~88% faster |
+| archive | 31,205 ms | 17,618 ms | ~44% faster |
+| cycle | 1,181,943 ms | 167,998 ms | ~86% faster |
+
+TEXT is *40–90%* faster depending on the phase, with the largest gains in the high-contention process stage.
+
+**Why is JSONB so much slower?**
+
+Using the CRDB metrics (statement activity & txn activity), several major factors become obvious:
+- JSONB updates rewrite **large structured documents**, whereas TEXT just replaces a blob
+- JSONB inverted indexes generate much higher **write amplification** (many more KV keys per write)
+- JSONB transactions create significantly **more contention** and **longer lock hold times**
+- JSONB ‘process’ operations often run ~1 second to multiple seconds per statement, while TEXT runs them in **tens of milliseconds**
+
+From the database metrics:
+- JSONB transactions show multi-minute average latencies in some cases, and heavy retry behavior (p99 5–10 seconds+)
+- TEXT transactions remain sub-second to low-second even under load
+
+**<ins>PART 2 - DIRECT vs MANAGED CONNECTIONS</ins>**
+
+The output from our testing shows that we get much better throughput with managed connections, even with the larger payloads.  However, longer transaction times will tie up 
+those shared connections and you will see some latency while the client waits for a pooled connection to become available.  But it's far better to block at the client than to throttle performance on the database.  And we can always increase capacity if we need more connections.
+
+**Mean Latencies (per operation)**
+| Operation | Direct Cxn Mean | Managed Cxn Mean | Client Experience |
+| ------------- | ------------- | ------------- | ------------- |
+| add | 19,684 ms | 10,997 ms | ~44% faster |
+| process | 130,594 ms | 12,436 ms | ~90% faster |
+| archive | 17,618 ms | 10,810 ms | ~38% faster |
+| cycle | 167,998 ms | 34,344 ms | ~80% faster |
+
+If we had more capacity in the dababase we could increase our connection pool size to meet demand and would see sub-second response times in the client for most of these transactions.  But even without that, **managed pooling reduces client-perceived mean latency by ~40–90%**, depending on the operation.
+
+The database behaves dramatically better when concurrency is controlled by PgBouncer, and the client sees faster completion of its total workload.  Here we did 2048 cycles in less than 10 minutes with managed transaction connections versus almost 52 minutes with session based connections.
+
+**Why is pooling so effective here?**
+
+Under Direct Connections:
+- High KV execution latency
+- High admission queue delays
+- Spiky WAL fsync latency
+- Many concurrent backends running expensive JSONB/TEXT updates
+- Significant retry behavior even with TEXT
+
+Under Managed Connections:
+- Database sees only ~64 active sessions (instead of 512)
+- Fewer active KV requests = **less contention**
+- Shorter lock durations = **fewer restarts**
+- Lower CPU scheduling pressure
+
+**External pooling protects the database from the client’s concurrency**, so fewer queries overlap, causing fewer RB conflicts and much lower overall latency.
+
+**<ins>SUMMARY OF WORKLOAD TESTING</ins>**
+
+A. JSONB vs TEXT Data Types:
+- TEXT is **40–90%** faster across all operations
+- JSONB’s write amplification, inverted-index maintenance, and structural costs significantly degrade throughput
+- JSONB workloads show much higher contention and long-tail latency
+- TEXT workloads show stable, predictable performance
+**JSONB is not appropriate for a write-heavy OLTP queue workload.**
+
+B. Direct vs Managed Connections:
+- Managed pooling makes client operations **40–90%** faster on average
+- Tail latency (p95/p99) improves **5–10×**
+- Database metrics show smoother CPU usage, lower contention, higher throughput
+- Client waits longer for pooled connections, but benefits from dramatically faster DB execution
+**Managed pooling is the superior deployment model for this workload.**

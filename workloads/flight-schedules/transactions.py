@@ -17,6 +17,25 @@ class Transactions:
 
         # you can arbitrarely add any variables you want
         self.counter: int = 0
+    
+
+
+    def _exec(self, cur, sql, params=None):
+        """
+        Wrapper around cursor.execute() that always disables server-side
+        prepared statements (prepare=False), which is required when using
+        PgBouncer in transaction pooling mode.
+        """
+        if params is None:
+            if self.txn_pooling:
+                return cur.execute(sql, prepare=False)
+            else:
+                return cur.execute(sql)
+        else:
+            if self.txn_pooling:
+                return cur.execute(sql, params, prepare=False)
+            else:
+                return cur.execute(sql, params)
 
 
 
@@ -29,7 +48,7 @@ class Transactions:
         if self.txn_pooling:
             # 👇 Disable server-side prepared statements for PgBouncer transaction pooling
             try:
-                conn.prepare_threshold = None
+                conn.prepare_threshold = 0
             except Exception as e:
                 print(f"Could not disable prepared statements: {e}")
         
@@ -37,7 +56,7 @@ class Transactions:
             print(
                 f"My thread ID is {id}. The total count of threads is {total_thread_count}"
             )
-            print(cur.execute(f"select version()").fetchone()[0])
+            print(self._exec(cur, f"select version()").fetchone()[0])
 
 
 
@@ -67,7 +86,7 @@ OFFSET floor(random() * (
 LIMIT {self.batch_size};
 """
         with conn.cursor() as cur:
-            cur.execute(query)
+            self._exec(cur, query)
             return [row[0] for row in cur]
 
 
@@ -95,7 +114,7 @@ SET scheduled_departure = scheduled_departure
 WHERE flight_id IN ({values});
 """
             with conn.cursor() as cur:
-                cur.execute(query, tuple(flight_ids))
+                self._exec(cur, query, tuple(flight_ids))
 
 
 
@@ -114,7 +133,7 @@ SET status = (
 WHERE flight_id IN ({values});
 """
             with conn.cursor() as cur:
-                cur.execute(query, tuple(flight_ids))
+                self._exec(cur, query, tuple(flight_ids))
 
 
 
@@ -131,7 +150,7 @@ SET seats_available = (seats_available::FLOAT * (1 + (random()-0.25)/10))::INT,
 WHERE flight_id IN ({values});
 """
             with conn.cursor() as cur:
-                cur.execute(query, tuple(flight_ids))
+                self._exec(cur, query, tuple(flight_ids))
 
 
 
@@ -148,4 +167,4 @@ SET price_usd = price_usd * (1 + (random()-0.5)/10)::DECIMAL,
 WHERE flight_id IN ({values});
 """
             with conn.cursor() as cur:
-                cur.execute(query, tuple(flight_ids))
+                self._exec(cur, query, tuple(flight_ids))

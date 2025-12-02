@@ -41,4 +41,6 @@ server_lifetime = 3600
 server_tls_sslmode = prefer
 
 # Dangerous timeouts
-query_wait_timeout = 300
+# query_wait_timeout = 300
+# disable for txn load testing
+query_wait_timeout = 0
