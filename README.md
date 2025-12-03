@@ -18,6 +18,8 @@ Modern distributed databases like CockroachDB can handle large volumes of concur
 By **centralizing and externalizing connection pooling**, we decouple connection lifecycle management from the application tier — allowing each service to use lightweight, short-lived database sessions while still maintaining consistent access to a shared pool of open connections.
 
 ### Why External Connection Pooling?
+<details>
+<summary>more info...</summary>
 
 **External connection pooling** (using PgBouncer or similar) provides several operational and architectural benefits:
 
@@ -48,6 +50,7 @@ By **centralizing and externalizing connection pooling**, we decouple connection
     Connection metrics, session reuse rates, and transaction throughput can be monitored independently of application code.
 
     Connection-level policies (e.g., limits, timeouts, user mapping) can be tuned dynamically.
+</details>
 
 ## Solution Architecture
 
@@ -62,6 +65,8 @@ This demo uses a **Docker-based local cluster** that emulates a full high-availa
 | **CockroachDB** | Target database backend to validate connection routing and failover behaviors |
 
 ### Architecture (Problem): Direct Connections → Connection Swarm / Starvation
+<details>
+<summary>more info...</summary>
 
 When many microservices each maintain their own pools, the database sees a “fan-out” of sessions. Spiky traffic and idle-but-open sessions waste resources and can starve active work.
 
@@ -72,8 +77,11 @@ When many microservices each maintain their own pools, the database sees a “fa
 - **Starvation / head-of-line blocking**: Busy services grab connections while others sit idle; spikes cause thrash.
 - **High session churn & metadata overhead**: DB spends cycles managing sessions instead of executing queries.
 - **Operational sprawl**: Auth, timeouts, and limits duplicated across every app.
+</details>
 
 ### Architecture (Solution): Distributed Connection Pooling with HA
+<details>
+<summary>more info...</summary>
 
 Centralize connection lifecycle management behind a **stable VIP**. HAProxy handles frontend health/routing; PgBouncer multiplexes many client sessions onto a compact backend pool; Pacemaker/Corosync orchestrates failover and fencing.
 
@@ -84,8 +92,11 @@ Centralize connection lifecycle management behind a **stable VIP**. HAProxy hand
 - **Fewer idle drains**: PgBouncer reuses backends across sessions/transactions; HAProxy evens out spikes.
 - **Fast, clean failover**: Pacemaker moves the VIP + services; fencing prevents split-brain.
 - **Centralized control**: One place to tune auth, timeouts, pool sizes, and limits.
+</details>
 
 ### Key Attributes of This Solution
+<details>
+<summary>more info...</summary>
 
 - **Highly Available**: Automatic failover of the PgBouncer + HAProxy stack through Pacemaker-managed floating IPs.
 
@@ -98,6 +109,7 @@ Centralize connection lifecycle management behind a **stable VIP**. HAProxy hand
 - **Configurable Topology**: Supports both session and transaction pooling modes, adjustable via PgBouncer configuration.
 
 - **Demonstrable Locally**: The full HA setup (including Corosync, Pacemaker, HAProxy, and PgBouncer) runs in containers for experimentation and reproducibility.
+</details>
 
 ## Test Results
 
@@ -116,13 +128,21 @@ By reducing the number of active backend sessions, CockroachDB spent far less ti
 This shift in resource allocation led to higher throughput and lower latency—**more work accomplished with fewer active connections**.
 SQL activity logs show a 97 % reduction in average statement execution time when PgBouncer was used, highlighting how efficient connection multiplexing improves utilization and minimizes internal contention in the database.
 
-### Direct Connections
+### SQL Activity
+<details>
+<summary>more info...</summary>
+
+**Direct Connections**
 [<img src="https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/direct-sql-activity.png">](https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/direct-sql-activity.png)
 
-### Managed Connections
+**Managed Connections**
 [<img src="https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/pooling-sql-activity.png">](https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/pooling-sql-activity.png)
+</details>
 
 ### Side-by-Side Metrics
+<details>
+<summary>more info...</summary>
+
 Metrics collected from the database during both executions reveal significant differences in **internal transaction management and resource utilization**. The following charts present the two runs side by side.
 
 | Metric | Direct Connections | Managed Connections |
@@ -145,8 +165,11 @@ Metrics collected from the database during both executions reveal significant di
 | IO Tokens Exhausted | [<img src="https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/direct-adm-tokens-exhausted.png" width="250">](https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/direct-adm-tokens-exhausted.png) | [<img src="https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/pooling-adm-tokens-exhausted.png" width="250">](https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/pooling-adm-tokens-exhausted.png) |
 | CPU Queueing Delay | [<img src="https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/direct-adm-queueing-delay.png" width="250">](https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/direct-adm-queueing-delay.png) | [<img src="https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/pooling-adm-queueing-delay.png" width="250">](https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/pooling-adm-queueing-delay.png) |
 | Scheduling Latency | [<img src="https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/direct-go-sched-latency.png" width="250">](https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/direct-go-sched-latency.png) | [<img src="https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/pooling-go-sched-latency.png" width="250">](https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/pooling-go-sched-latency.png) |
+</details>
 
 ### Interpretation
+<details>
+<summary>more info...</summary>
 
 In both configurations, client sessions were reused and issued the same mix of SQL statements.
 The key difference was **where** connection management occurred.
@@ -170,10 +193,9 @@ In essence, **PgBouncer amplified throughput per backend connection**—doing mo
 This is consistent with the principle that connection pooling not only stabilizes workloads but also lets distributed databases like CockroachDB dedicate more of their resources to actual query execution rather than connection lifecycle management.
 
 See below for more details on how to setup and run the workload with distributed connection pooling.
+</details>
 
 ## CockroachDB
-
-### What is CockroachDB?
 
 **CockroachDB** is a **distributed SQL database** built for **global scale, strong consistency, and high resilience**. It’s wire-compatible with PostgreSQL, which means it supports the same SQL syntax, drivers, and tools — including PgBouncer — while providing automatic replication, fault tolerance, and horizontal scalability.
 
@@ -182,14 +204,19 @@ Unlike traditional databases that rely on a single primary node, CockroachDB dis
 In this demo, CockroachDB serves as the **backend database** behind PgBouncer. While the example uses a single-node secure cluster for simplicity, the same principles apply to multi-node and multi-region deployments. The focus here is on the **connection management layer** — showing how PgBouncer can efficiently manage database sessions and reduce load on CockroachDB in high-concurrency environments.
 
 ### Why CockroachDB Benefits from Connection Pooling
+<details>
+<summary>more info...</summary>
 
 Each connection to CockroachDB represents an active **SQL session** with its own memory context, transaction state, and session-level metadata. In busy application environments — particularly those with many microservices or short-lived requests — rapidly opening and closing connections can create overhead that limits scalability and increases latency.
 
 Using **PgBouncer** as an intermediary allows applications to reuse a smaller set of persistent backend sessions while still handling thousands of concurrent client requests. This reduces pressure on CockroachDB’s session management layer, minimizes transaction contention, and ensures that the database remains focused on executing queries rather than maintaining idle connections.
 
 Together, CockroachDB and PgBouncer form a robust foundation for **distributed, fault-tolerant connection management**, where scaling the application tier doesn’t compromise database performance or stability.
+</details>
 
 ### CockroachDB Setup
+<details>
+<summary>more info...</summary>
 
 We'll start by configuring a local secure single-node database that will provide the backend for testing connections through pgbouncer.  This demo is not meant to demonstrate the reliability and throughput capabilities of CockroachDB.  It will primarily focus on the performance of connection management to the backend.
 
@@ -240,10 +267,9 @@ And test the connection
 ```
 cockroach sql --url "postgresql://pgb:secret@localhost:26257/defaultdb?sslmode=prefer" -e "show databases;"
 ```
+</details>
 
 ## PgBouncer
-
-### What is PgBouncer?
 
 **PgBouncer** is a lightweight, high-performance **connection pooler for PostgreSQL-compatible databases**, including CockroachDB.
 
@@ -264,7 +290,10 @@ In this demo, PgBouncer acts as the **connection management layer** between your
 - Centralized authentication and configuration
 - A consistent connection endpoint for HAProxy and Pacemaker to manage
 
-### Scale Network
+### Scale the Network
+<details>
+<summary>more info...</summary>
+
 Before we get started we'll need to increase the capacity of our docker network to handle 2048 connections
 ```
 colima stop
@@ -321,8 +350,11 @@ Next stop and remove any containers that we may have created previously
 docker stop pgbouncer1 pgbouncer2 ha-node1 ha-node2 vip-proxy
 docker rm pgbouncer1 pgbouncer2 ha-node1 ha-node2 vip-proxy
 ```
+</details>
 
 ### PgBouncer Setup
+<details>
+<summary>more info...</summary>
 
 Next we'll build our pgbouncer docker image and spin up two pgbouncer instances
 ```
@@ -373,10 +405,9 @@ cp cockroach-*/cockroach /usr/local/bin/
 cockroach version
 cockroach sql --url "postgresql://pgb:secret@localhost:5432/defaultdb?sslmode=prefer" -e "show databases;"
 ```
+</details>
 
 ## High Availability
-
-### What is HAProxy?
 
 **HAProxy** is a high-performance **TCP/HTTP load balancer** and reverse proxy. In this demo, it terminates **no** database protocol; instead it operates in **TCP passthrough** mode to balance PostgreSQL-compatible traffic across **PgBouncer** instances. HAProxy provides:
 - **Health checks**: automatically removes unhealthy PgBouncer nodes from rotation.
@@ -387,6 +418,8 @@ cockroach sql --url "postgresql://pgb:secret@localhost:5432/defaultdb?sslmode=pr
 By fronting PgBouncer with HAProxy, clients use a **single stable endpoint**, while PgBouncer handles **connection multiplexing** to CockroachDB — reducing backend session pressure and smoothing traffic spikes.
 
 ### What are Corosync and Pacemaker?
+<details>
+<summary>more info...</summary>
 
 **Corosync** and **Pacemaker** together form the **high-availability cluster stack** that keeps services like HAProxy and the VIP running on exactly one healthy node at a time.
 
@@ -397,8 +430,11 @@ By fronting PgBouncer with HAProxy, clients use a **single stable endpoint**, wh
 In this demo, Corosync and Pacemaker coordinate between two HAProxy nodes. Only one node at a time “owns” the virtual IP and serves traffic. If that node fails, Pacemaker moves the VIP (and HAProxy) to the other node within seconds, ensuring uninterrupted client access.
 
 Together they form the brains of the HA cluster — Corosync detects failure, Pacemaker makes recovery decisions, and fencing ensures safety.
+</details>
 
 ### What is STONITH / Fencing?
+<details>
+<summary>more info...</summary>
 
 **STONITH** stands for “**Shoot The Other Node In The Head**.” It’s Pacemaker’s fencing mechanism — the ultimate safeguard against **split-brain** conditions in a cluster.
 
@@ -413,10 +449,15 @@ Common fencing methods include:
 In this Docker-based demo, we use the lightweight fence_dummy agent — it doesn’t actually power off containers, but it lets us see how Pacemaker would trigger fencing in a real deployment.
 
 Fencing guarantees that at any given time, only one node controls critical resources — the key to maintaining **data consistency** and **cluster integrity** in any high-availability design.
+</details>
 
 ### HA Setup
+<details>
+<summary>more info...</summary>
 
-#### 1. Start by creating two containers using the host network so they can manipulate an IP on the host interface:
+<details>
+<summary>1. Start by creating two containers using the host network so they can manipulate an IP on the host interface:</summary>
+
 ```
 docker build -t ha-node ha-node
 
@@ -435,14 +476,20 @@ for n in ha-node1 ha-node2; do
         -d ha-node
 done
 ```
+</details>
 
-#### 2. And confirm that systemd is running inside each node
+<details>
+<summary>2. And confirm that systemd is running inside each node</summary>
+
 ```
 docker exec -it ha-node1 bash -lc 'systemctl is-system-running --wait || true; hostname -f'
 docker exec -it ha-node2 bash -lc 'systemctl is-system-running --wait || true; hostname -f'
 ```
+</details>
 
-#### 3. Next enable pcsd and set the hacluster password on both nodes
+<details>
+<summary>3. Next enable pcsd and set the hacluster password on both nodes</summary>
+
 ```
 for n in ha-node1 ha-node2; do
     docker exec -it $n bash -lc '
@@ -451,8 +498,11 @@ for n in ha-node1 ha-node2; do
     '
 done
 ```
+</details>
 
-#### 4. Get each HA node’s IP (on dcp-net) and ensure node name resolution
+<details>
+<summary>4. Get each HA node’s IP (on dcp-net) and ensure node name resolution</summary>
+
 ```
 IP1=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ha-node1)
 IP2=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ha-node2)
@@ -476,8 +526,10 @@ done
 docker exec -it ha-node1 bash -lc 'hostname -f; getent hosts $(hostname -s)'
 docker exec -it ha-node2 bash -lc 'hostname -f; getent hosts $(hostname -s)'
 ```
+</details>
 
-#### 5. Configure Corosync with UDPU instead of multi-cast
+<details>
+<summary>5. Configure Corosync with UDPU instead of multi-cast</summary>
 
 **Why UDPU?**
 Docker/Colima often block multicast; UDPU (unicast) avoids that and stabilizes the Corosync ring.
@@ -577,8 +629,11 @@ And check the status:
 docker exec -it ha-node1 bash -lc 'corosync-cfgtool -s; tail -n 50 /var/log/corosync/corosync.log || true'
 docker exec -it ha-node2 bash -lc 'corosync-cfgtool -s; tail -n 50 /var/log/corosync/corosync.log || true'
 ```
+</details>
 
-#### 6. Bootstrap pacemaker properties but temporarily relax fencing/quorum
+<details>
+<summary>6. Bootstrap pacemaker properties but temporarily relax fencing/quorum</summary>
+
 ```
 docker exec -it ha-node1 bash -lc '
   pcs property set stonith-enabled=false;
@@ -587,8 +642,10 @@ docker exec -it ha-node1 bash -lc '
 '
 ```
 Should report both nodes Online: [ ha-node1 ha-node2 ].
+</details>
 
-#### 7. Create the VIP inside the Docker network
+<details>
+<summary>7. Create the VIP inside the Docker network</summary>
 
 We picked 172.18.0.250/24; NIC is eth0 inside these containers:
 ```
@@ -596,8 +653,10 @@ VIP=172.18.0.250
 docker exec -it ha-node1 bash -lc \
   "pcs resource create vip ocf:heartbeat:IPaddr2 ip=${VIP} cidr_netmask=24 nic=eth0 op monitor interval=30s; pcs status resources"
 ```
+</details>
 
-#### 8. Configure HAProxy and colocate it with the VIP
+<details>
+<summary>8. Configure HAProxy and colocate it with the VIP</summary>
 
 Push a simple pgsql TCP LB config to both nodes:
 ```
@@ -652,8 +711,10 @@ docker exec -it ha-node1 bash -lc '
   pcs status
 '
 ```
+</details>
 
-#### 9. Test from a client container on the same network
+<details>
+<summary>9. Test from a client container on the same network</summary>
 
 Your host can’t reach the VIP so we'll test from another container inside dcp-net.
 ```
@@ -663,8 +724,10 @@ docker run --rm -it --network dcp-net alpine sh -c "
   echo && echo 'psql via VIP:' && \
   psql 'postgresql://pgb:secret@${VIP}:5432/defaultdb?sslmode=prefer' -c 'show databases;'"
 ```
+</details>
 
-#### 10. Prove failover
+<details>
+<summary>10. Prove failover</summary>
 Move resources to node2
 ```
 docker exec -it ha-node1 bash -lc 'pcs resource move vip ha-node2 && sleep 2 && pcs status'
@@ -682,8 +745,11 @@ docker run --rm -it --network dcp-net alpine sh -c "
   apk add --no-cache postgresql15-client >/dev/null && \
   psql 'postgresql://pgb:secret@${VIP}:5432/defaultdb?sslmode=prefer' -c 'show databases;'"
 ```
+</details>
 
-#### 11. Enable dummy fencing for demonstration
+<details>
+<summary>11. Enable dummy fencing for demonstration.</summary>
+
 ```
 docker exec -it ha-node1 bash -lc "
   pcs property set stonith-enabled=true;
@@ -691,15 +757,21 @@ docker exec -it ha-node1 bash -lc "
   pcs status"
 ```
 In real VMs/hardware, replace fence_dummy with IPMI/libvirt/cloud agents.
+</details>
 
-#### 12. Some commands to verify status of HA cluster
+<details>
+<summary>12. Some commands to verify status of HA cluster</summary>
+
 ```
 docker exec -it ha-node1 bash -lc "pcs status"
 docker exec -it ha-node1 bash -lc "corosync-cfgtool -s"
 docker exec -it ha-node1 bash -lc "tail -n 100 /var/log/corosync/corosync.log"
 ```
+</details>
 
-#### 13. Create an entry point to the VIP
+<details>
+<summary>13. (Optional) Create an entry point to the VIP</summary>
+
 You can setup nginx inside a docker container if you want to route requests from your host to the HA cluster.  This works well for experimentation, but we'll want to avoid the extra hop and network restrictions when running workload tests.
 
 Start by creating our image
@@ -744,6 +816,8 @@ And then test the connection
 cockroach sql --url "postgresql://pgb:secret@localhost:6432/defaultdb?sslmode=prefer" -e "show databases;"
 ```
 Also check the stats pages at http://localhost:8404/stats
+</details>
+</details>
 
 ## Flight Schedules
 This workload simulates the day-to-day lifecycle of airline flight schedules: generating flight plans, updating operational details, and serving read traffic that represents downstream planning, monitoring, and customer-facing systems.
@@ -754,6 +828,8 @@ It is a **simple, high-velocity transactional workload** designed to model the c
 The workload exercises three primary interaction patterns:
 
 ### 1. Schedule Generation Transactions
+<details>
+<summary>more info...</summary>
 
 These transactions create new flight schedule entries, representing upstream schedule-planning systems that continuously publish changes.
 
@@ -765,8 +841,11 @@ Each insert models a single flight with structured attributes such as:
 - Operational metadata (status, gate, terminal, etc.)
 
 These operations simulate steady-state introduction of new flights into the operational window for a given day or period.
+</details>
 
 ### 2. Schedule Update Transactions
+<details>
+<summary>more info...</summary>
 
 Existing schedule records are selected and updated in place, simulating the frequent minor changes that occur throughout the day:
 - Departure time adjustments
@@ -780,8 +859,11 @@ These are **small, implicit read-modify-write** transactions:
 1. Write the updated row back atomically
 
 They represent load patterns from real-world operational control centers, partner data feeds, and automated synchronization services.
+</details>
 
 ### 3. Schedule Lookup Transactions
+<details>
+<summary>more info...</summary>
 
 These transactions issue low-latency point reads or small range scans—queries commonly used by:
 - Customer-facing flight-status APIs
@@ -790,8 +872,12 @@ These transactions issue low-latency point reads or small range scans—queries 
 - Operational dashboards or planning tools
 
 These reads stress index usage and concurrent access patterns across “hot” rows (near-term departure windows) without modifying data.
+</details>
 
 ### What This Workload Demonstrates
+<details>
+<summary>more info...</summary>
+
 - **Concurrent read/write behavior** on time-partitioned data such as upcoming flight legs
 - **Update-heavy vs read-heavy balance**, reflecting real operational systems
 - **Impact of concurrent updates** on single-row transactions and hot partitions
@@ -799,8 +885,12 @@ These reads stress index usage and concurrent access patterns across “hot” r
 - **Real-world stress characteristics** of systems that must ingest updates continuously while serving high-volume read queries
 - **Predictable ACID behavior** for small, frequent transactions
 - **Throughput and latency characteristics** under mixed operational load
+</details>
 
 ### Initial Schema
+<details>
+<summary>more info...</summary>
+
 First we'll execute the sql to create a sample schema and load some data into it.
 ```
 cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -f ./workloads/flight-schedules/initial-schema.sql
@@ -813,8 +903,12 @@ cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb"
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE defaultdb.* TO pgb;
 """
 ```
+</details>
 
 ### dbworkload
+<details>
+<summary>more info...</summary>
+
 This is a tool we use to simulate data flowing into cockroach, developed by one of our colleagues with python.  We can install the tool with ```pip3 install "dbworkload[postgres]"```, and then add it to your path.  On Mac or Linux with Bash you can use:
 ```
 echo -e '\nexport PATH=`python3 -m site --user-base`/bin:$PATH' >> ~/.bashrc 
@@ -848,8 +942,12 @@ sed -E '/^(pyobjc-core|pyobjc-framework-Cocoa|py2app|rumps|macholib|tensorflow-m
   requirements.txt > requirements-runner.txt
 cd ../../
 ```
+</details>
 
 ### Direct Connections
+<details>
+<summary>more info...</summary>
+
 Then we can use our workload script to simulate the workload going directly against the database running on our host machine.
 ```
 cd ./workloads/flight-schedules
@@ -891,8 +989,12 @@ iterations     8192
 ramp           0
 args           {'schedule_freq': 10, 'status_freq': 90, 'inventory_freq': 75, 'price_freq': 25, 'batch_size': 64, 'delay': 100, 'txn_pooling': False}
 ```
+</details>
 
 ### Managed Connections
+<details>
+<summary>more info...</summary>
+
 We can simulate the workload again, this time using our PgBouncer HA cluster with transaction pooling, but we'll have to disable prepared statements due to connection multiplexing between clients.
 ```
 cd ./workloads/flight-schedules
@@ -934,8 +1036,12 @@ iterations     8192
 ramp           0
 args           {'schedule_freq': 10, 'status_freq': 90, 'inventory_freq': 75, 'price_freq': 25, 'batch_size': 64, 'delay': 100, 'txn_pooling': True}
 ```
+</details>
 
 ### Interpretation
+<details>
+<summary>more info...</summary>
+
 From the client’s perspective, both the direct-connection and managed-connection (PgBouncer) executions completed the same total number of operations:
 - **8192 operations per worker**
 - **256 concurrent threads**
@@ -984,6 +1090,7 @@ Because CockroachDB is handling far fewer active backend sessions, so:
 - fewer write queues forming
 
 The client sees more predictable, more stable response times as a direct result.
+</details>
 
 ## Train Events
 This workload simulates the ingestion, processing, state-transition, and archival lifecycle of train and track-management events using realistic multi-event ACID transactions that stress both concurrency control and JSON-heavy data paths.
@@ -994,11 +1101,16 @@ It exercises a realistic mix of **read**, **write**, and **state-transition** op
 The workload models three primary interaction patterns:
 
 ### 1. Event Ingestion Transactions
+<details>
+<summary>more info...</summary>
 
 Each transaction inserts a **batch of 10–100 synthetic railway events**, such as route authorizations, signal clearances, speed restrictions, switch position changes, position updates, and infrastructure condition reports.
 Every event is written atomically alongside a corresponding status record, simulating upstream publish or capture systems generating operational messages.
+</details>
 
 ### 2. Event Processing Transactions
+<details>
+<summary>more info...</summary>
 
 Batches of events in PENDING or PROCESSING states are selected with **row-level locking**, updated, and advanced through their lifecycle.
 
@@ -1008,21 +1120,32 @@ The workload includes:
 - State machine transitions (e.g., PENDING → PROCESSING → COMPLETE)
 
 This represents downstream consumers such as dispatch systems, safety logic, or orchestration services that process operational rail messages concurrently.
+</details>
 
 ### 3. Archival Transactions
+<details>
+<summary>more info...</summary>
 
 Events that reach a terminal state are **bulk-archived** into a history table and then removed from the primary tables as part of a single ACID transaction.
 This simulates data movement pipelines—ETL, retention policies, or system rollups—that extract completed operational events to long-term storage.
+</details>
 
 ### What This Workload Demonstrates
+<details>
+<summary>more info...</summary>
+
 - **Contention behavior** under multi-row, multi-statement transactions
 - **Impact of JSONB vs TEXT** for storing and processing nested operational documents
 - **Concurrency control patterns** (locks, retries, write–write conflicts)
 - **End-to-end lifecycle simulation** of operational messages in a real dispatching or control system
 - **Mixed read/write access** across hot rows and rolling windows of recent events
 - **Batch-oriented transactional throughput** similar to real event-driven systems
+</details>
 
 ### Initial Schema
+<details>
+<summary>more info...</summary>
+
 First we'll execute the sql to create a sample schema and load some data into it.
 ```
 cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -f ./workloads/train-events/initial-schema.sql
@@ -1035,8 +1158,12 @@ cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb"
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE defaultdb.* TO pgb;
 """
 ```
+</details>
 
 ### dbworkload
+<details>
+<summary>more info...</summary>
+
 This is a tool we use to simulate data flowing into cockroach, developed by one of our colleagues with python.  We can install the tool with ```pip3 install "dbworkload[postgres]"```, and then add it to your path.  On Mac or Linux with Bash you can use:
 ```
 echo -e '\nexport PATH=`python3 -m site --user-base`/bin:$PATH' >> ~/.bashrc 
@@ -1067,8 +1194,12 @@ sed -E '/^(pyobjc-core|pyobjc-framework-Cocoa|py2app|rumps|macholib|tensorflow-m
   requirements.txt > requirements-runner.txt
 cd ../../
 ```
+</details>
 
 ### Direct Connections
+<details>
+<summary>more info...</summary>
+
 Then we can use our workload script to simulate the workload going directly against the database running on our host machine.
 ```
 cd ./workloads/train-events
@@ -1141,8 +1272,12 @@ iterations     2048
 ramp           0
 args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': False}
 ```
+</details>
 
 ### Managed Connections
+<details>
+<summary>more info...</summary>
+
 We can simulate the workload again, this time using our PgBouncer HA cluster with transaction pooling, but we'll have to disable prepared statements due to connection multiplexing between clients.
 ```
 cd ./workloads/train-events
@@ -1215,8 +1350,11 @@ iterations     2048
 ramp           0
 args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': True}
 ```
+</details>
 
 ### Interpretation
+<details>
+<summary>more info...</summary>
 
 **<ins>PART 1 - JSONB vs TEXT DATA TYPES</ins>**
 
@@ -1285,6 +1423,7 @@ A. JSONB vs TEXT Data Types:
 - JSONB’s write amplification, inverted-index maintenance, and structural costs significantly degrade throughput
 - JSONB workloads show much higher contention and long-tail latency
 - TEXT workloads show stable, predictable performance
+
 **JSONB is not appropriate for a write-heavy OLTP queue workload.**
 
 B. Direct vs Managed Connections:
@@ -1292,4 +1431,6 @@ B. Direct vs Managed Connections:
 - Tail latency (p95/p99) improves **5–10×**
 - Database metrics show smoother CPU usage, lower contention, higher throughput
 - Client waits longer for pooled connections, but benefits from dramatically faster DB execution
+
 **Managed pooling is the superior deployment model for this workload.**
+</details>
