@@ -25,6 +25,7 @@ delay=${delay:-100}
 
 # workload files can be overridden via env
 JSONB_WORKLOAD=${JSONB_WORKLOAD:-"transactionsJsonb.py"}
+MANUAL_WORKLOAD=${MANUAL_WORKLOAD:-"transactionsManual.py"}
 TEXT_WORKLOAD=${TEXT_WORKLOAD:-"transactionsText.py"}
 
 # Derived
@@ -118,10 +119,15 @@ run_phase() {
   echo "Phase '${label}' done. Summary saved to ${aggregate}"
 }
 
-# Run JSONB phase, then TEXT phase
+# Run JSONB phase, then MANUAL phase, then TEXT phase
 
 echo "Running JSON workload first..."
 run_phase "${JSONB_WORKLOAD}" "jsonb"
+
+echo "Sleeping two minutes before starting MANUAL workload..."
+sleep 120
+
+run_phase "${MANUAL_WORKLOAD}" "manual"
 
 echo "Sleeping two minutes before starting TEXT workload..."
 sleep 120

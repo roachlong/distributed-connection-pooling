@@ -1142,6 +1142,87 @@ This simulates data movement pipelines—ETL, retention policies, or system roll
 - **Batch-oriented transactional throughput** similar to real event-driven systems
 </details>
 
+### Option 1: JSONB (generated columns + inverted index)
+<details>
+<summary>more info...</summary>
+
+**Best for**: Flexible schema, deep JSON querying, analytics on nested structures.
+
+**Benefits**
+- Automatic extraction of important fields via **generated columns** (event_type, authority_id, train_id).
+- **Inverted index** enables fast, ad-hoc filtering on arbitrary JSON paths.
+- Ideal when downstream systems need to query or filter deeply within the JSON payload.
+- Schema changes require no DDL — the payload can evolve naturally.
+
+**Trade-offs**
+- **Highest write amplification**: inserting/updating a JSONB document touches many KV keys.
+- **Most contention** under concurrency because the inverted index widens each transaction’s “footprint.”
+- **Slowest throughput** and longest latency in write-heavy workloads.
+- Payload updates require JSON tree rewrites rather than simple string replacement.
+
+In write-heavy queue-style systems, JSONB provides powerful read/query features, but those features come with real performance cost.
+</details>
+
+### Option 2: JSONB-Manual (explicit columns, no inverted index)
+<details>
+<summary>more info...</summary>
+
+**Best for**: Keeping structured JSON payloads while dramatically reducing write cost and contention.
+
+**Benefits**
+- Still stores payload as **JSONB**, preserving structure and downstream flexibility.
+- Removes the inverted index, eliminating the largest source of write amplification.
+- Flat columns (event_type, authority_id, train_id) are populated explicitly, leading to predictable indexing & performance.
+- Faster than full JSONB on inserts/updates; lower contention footprint.
+
+**Trade-offs**
+- Application must **extract and populate flat columns manually**, adding logic complexity.
+- No inverted index, therefore you cannot efficiently query arbitrary nested fields.
+- JSON structure is preserved, but now acts mostly as a storage envelope, not an indexed query surface.
+- And we're still encoding and decoding JSON, incurring additional overhead on every read and write operation.
+
+JSONB-Manual gives you the shape and flexibility of JSONB, but you're paying the storage costs without the benefit of .
+</details>
+
+### Option 3: TEXT (string payload + generated columns)
+<details>
+<summary>more info...</summary>
+
+**Best for**: High-throughput OLTP, event queues, ingestion scenarios, heavy write workloads.
+
+**Benefits**
+- **Fastest** of all three workloads by a large margin in high-concurrency environments.
+- Almost no write amplification; replacing a string is cheap.
+- Minimal contention footprint; best throughput under load.
+- Generated columns still allow simple field extraction without touching the JSON payload structure.
+
+**Trade-offs**
+- Payload is stored as a raw string, CRDB will not understand the internal structure.
+- No JSON operators or path-based filtering unless you cast to JSONB ad-hoc.
+- No inverted index, therefore you must index fields explicitly (via generated columns or application logic).
+
+TEXT is ideal when payloads are treated as **opaque blobs** and write throughput matters more than JSON queryability.
+</details>
+
+### Summary of Options
+<details>
+<summary>more info...</summary>
+
+| Feature / Concern | JSONB (full) | JSONB-Manual | TEXT |
+| ------------- | ------------- | ------------- | ------------- |
+| Write speed | Slowest | Medium | Fastest |
+| Contention footprint | Highest | Medium-Low | Lowest |
+| Inverted index | Yes | No | No |
+| Deep JSON querying | Best | None (unless manually added) | None (unless cast to JSONB) |
+| Schema flexibility | High | Medium-High | Medium |
+| App logic complexity | Lowest | Higher (manual extraction) | Lowest |
+| Best use case | Analytics / deep filtering / JSON-native storage | Structured JSON storage without index overhead | High-throughput ingestion / queue workloads |
+
+**JSONB** is the most flexible but the most expensive for writes.
+**JSONB-Manual** is a balanced choice: structured payloads, lower write cost, predictable indexing.
+**TEXT** is the clear winner for raw throughput and minimal contention in write-heavy pipelines.
+</details>
+
 ### Initial Schema
 <details>
 <summary>more info...</summary>
@@ -1215,21 +1296,21 @@ A summary of the test results for one of the workers is outlined below...
 
 **Using JSONB Fields**
 ```
->>> Worker 2 (logs/results_direct_jsonb_20251130_193430_w2.log)
-run_name       Transactionsjsonb.20251201_004236
-start_time     2025-12-01 00:42:36
-end_time       2025-12-01 06:58:26
-test_duration  22550
+>>> Worker 2 (logs/results_direct_jsonb_20251205_145706_w2.log)
+run_name       Transactionsjsonb.20251205_200518
+start_time     2025-12-05 20:05:18
+end_time       2025-12-05 21:20:07
+test_duration  4489
 -------------  ---------------------------------
 
-┌───────────┬───────────┬───────────┬───────────┬─────────────┬──────────────┬────────────┬──────────────┬──────────────┬──────────────┬───────────────┐
-│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │     mean(ms) │    p50(ms) │      p90(ms) │      p95(ms) │      p99(ms) │       max(ms) │
-├───────────┼───────────┼───────────┼───────────┼─────────────┼──────────────┼────────────┼──────────────┼──────────────┼──────────────┼───────────────┤
-│    22,550 │ __cycle__ │       128 │     2,048 │           0 │ 1,181,943.54 │ 484,743.71 │ 3,231,329.46 │ 4,321,847.35 │ 6,280,597.23 │ 13,704,440.28 │
-│    22,550 │ add       │       128 │     2,048 │           0 │    68,135.58 │  25,042.43 │   162,019.06 │   340,040.77 │   659,524.03 │    935,443.13 │
-│    22,550 │ archive   │       128 │     2,048 │           0 │    31,205.86 │  10,125.94 │    70,397.50 │   125,083.27 │   375,331.41 │  1,318,715.29 │
-│    22,550 │ process   │       128 │     2,048 │           0 │ 1,082,500.62 │ 377,693.80 │ 3,121,893.29 │ 4,174,144.33 │ 6,155,143.14 │ 13,680,428.80 │
-└───────────┴───────────┴───────────┴───────────┴─────────────┴──────────────┴────────────┴──────────────┴──────────────┴──────────────┴───────────────┘
+┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬────────────┬────────────┬────────────┬──────────────┬──────────────┐
+│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │    p50(ms) │    p90(ms) │    p95(ms) │      p99(ms) │      max(ms) │
+├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼────────────┼────────────┼────────────┼──────────────┼──────────────┤
+│     4,489 │ __cycle__ │       128 │     2,048 │           0 │ 235,245.13 │ 113,206.62 │ 604,262.01 │ 908,883.74 │ 1,528,382.15 │ 3,570,055.79 │
+│     4,489 │ add       │       128 │     2,048 │           0 │  26,336.08 │  14,481.14 │  67,278.95 │ 104,525.78 │   137,686.78 │   187,292.17 │
+│     4,489 │ archive   │       128 │     2,048 │           0 │  11,692.34 │   2,589.12 │  23,553.94 │  45,738.02 │   104,572.07 │   765,235.72 │
+│     4,489 │ process   │       128 │     2,048 │           0 │ 197,110.51 │  81,868.00 │ 547,268.41 │ 848,393.07 │ 1,481,179.72 │ 3,389,565.89 │
+└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴────────────┴────────────┴────────────┴──────────────┴──────────────┘
 
 Parameter      Value
 -------------  --------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1243,23 +1324,53 @@ ramp           0
 args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': False}
 ```
 
+**Versus Manual JSONB**
+```
+>>> Worker 2 (logs/results_direct_manual_20251205_145706_w2.log)
+run_name       Transactionsmanual.20251205_213022
+start_time     2025-12-05 21:30:22
+end_time       2025-12-05 21:44:21
+test_duration  839
+-------------  ----------------------------------
+
+┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬────────────┬────────────┬────────────┬────────────┐
+│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │    p90(ms) │    p95(ms) │    p99(ms) │    max(ms) │
+├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼────────────┼────────────┼────────────┼────────────┤
+│       839 │ __cycle__ │       128 │     2,048 │           2 │  46,614.11 │ 25,231.53 │ 116,763.49 │ 158,155.35 │ 250,885.12 │ 412,646.54 │
+│       839 │ add       │       128 │     2,048 │           2 │   2,911.16 │  1,645.64 │   7,452.17 │   9,401.98 │  16,640.97 │  19,200.30 │
+│       839 │ archive   │       128 │     2,048 │           2 │   1,728.39 │    402.20 │   5,001.33 │   8,154.21 │  13,622.89 │  87,210.63 │
+│       839 │ process   │       128 │     2,048 │           2 │  41,873.37 │ 20,207.13 │ 110,347.16 │ 148,431.61 │ 241,987.39 │ 412,164.05 │
+└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴────────────┴────────────┴────────────┴────────────┘
+
+Parameter      Value
+-------------  ---------------------------------------------------------------------------------------------------------------------------------------------------
+workload_path  /work/transactionsManual.py
+conn_params    {'conninfo': 'postgresql://pgb:secret@host.docker.internal:26257/defaultdb?sslmode=prefer&application_name=Transactionsmanual', 'autocommit': True}
+conn_extras    {}
+concurrency    128
+duration
+iterations     2048
+ramp           0
+args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': False}
+```
+
 **Versus Text Fields**
 ```
->>> Worker 2 (logs/results_direct_text_20251130_193430_w2.log)
-run_name       Transactionstext.20251201_071843
-start_time     2025-12-01 07:18:43
-end_time       2025-12-01 08:10:26
-test_duration  3103
+>>> Worker 2 (logs/results_direct_text_20251205_145706_w2.log)
+run_name       Transactionstext.20251205_215423
+start_time     2025-12-05 21:54:23
+end_time       2025-12-05 22:05:47
+test_duration  684
 -------------  --------------------------------
 
-┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬────────────┬────────────┬────────────┬────────────┬──────────────┐
-│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │    p50(ms) │    p90(ms) │    p95(ms) │    p99(ms) │      max(ms) │
-├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼────────────┼────────────┼────────────┼────────────┼──────────────┤
-│     3,103 │ __cycle__ │       128 │     2,048 │           0 │ 167,998.93 │ 109,581.05 │ 376,809.94 │ 643,908.30 │ 981,693.04 │ 1,537,120.24 │
-│     3,103 │ add       │       128 │     2,048 │           0 │  19,684.26 │  16,925.65 │  44,239.11 │  49,473.15 │  61,934.11 │   121,511.96 │
-│     3,103 │ archive   │       128 │     2,048 │           0 │  17,617.78 │   2,229.42 │  61,146.24 │  93,807.39 │ 203,677.86 │   426,512.19 │
-│     3,103 │ process   │       128 │     2,048 │           0 │ 130,594.01 │  64,083.91 │ 341,346.50 │ 583,468.49 │ 872,766.48 │ 1,517,372.06 │
-└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴────────────┴────────────┴────────────┴────────────┴──────────────┘
+┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬───────────┬────────────┬────────────┬────────────┐
+│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │   p90(ms) │    p95(ms) │    p99(ms) │    max(ms) │
+├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼───────────┼────────────┼────────────┼────────────┤
+│       684 │ __cycle__ │       128 │     2,048 │           2 │  36,799.64 │ 21,470.48 │ 92,092.69 │ 128,059.77 │ 211,407.33 │ 365,707.04 │
+│       684 │ add       │       128 │     2,048 │           2 │   2,239.95 │    929.97 │  6,626.54 │   8,106.83 │  12,630.61 │  14,414.35 │
+│       684 │ archive   │       128 │     2,048 │           2 │   3,700.88 │    677.17 │ 11,227.06 │  19,723.95 │  33,162.44 │ 110,019.48 │
+│       684 │ process   │       128 │     2,048 │           2 │  30,754.82 │ 13,636.28 │ 82,801.00 │ 119,674.83 │ 208,971.75 │ 354,919.80 │
+└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴───────────┴────────────┴────────────┴────────────┘
 
 Parameter      Value
 -------------  -------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1293,21 +1404,21 @@ And a summary of the test results for one of the workers is outlined below...
 
 **Using JSONB Fields**
 ```
->>> Worker 2 (logs/results_pooling_jsonb_20251201_140514_w2.log)
-run_name       Transactionsjsonb.20251201_191248
-start_time     2025-12-01 19:12:48
-end_time       2025-12-01 22:54:49
-test_duration  13321
+>>> Worker 2 (logs/results_pooling_jsonb_20251205_171253_w2.log)
+run_name       Transactionsjsonb.20251205_222037
+start_time     2025-12-05 22:20:37
+end_time       2025-12-05 23:38:12
+test_duration  4655
 -------------  ---------------------------------
 
-┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬────────────┬──────────────┬──────────────┬──────────────┬──────────────┐
-│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │    p50(ms) │      p90(ms) │      p95(ms) │      p99(ms) │      max(ms) │
-├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼────────────┼──────────────┼──────────────┼──────────────┼──────────────┤
-│    13,321 │ __cycle__ │       128 │     2,048 │           0 │ 815,609.64 │ 703,129.62 │ 1,004,977.64 │ 2,268,000.43 │ 2,350,959.58 │ 3,106,766.67 │
-│    13,321 │ add       │       128 │     2,048 │           0 │ 242,604.46 │ 201,617.77 │   325,851.99 │   375,890.85 │ 1,941,835.49 │ 2,101,634.99 │
-│    13,321 │ archive   │       128 │     2,048 │           0 │ 263,691.48 │ 215,986.87 │   407,631.80 │   531,846.62 │ 1,625,728.39 │ 2,599,985.38 │
-│    13,321 │ process   │       128 │     2,048 │           0 │ 309,213.12 │ 250,818.61 │   427,179.48 │   534,836.47 │ 1,993,676.53 │ 2,030,037.81 │
-└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴────────────┴──────────────┴──────────────┴──────────────┴──────────────┘
+┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬────────────┬────────────┬────────────┬────────────┬────────────┐
+│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │    p50(ms) │    p90(ms) │    p95(ms) │    p99(ms) │    max(ms) │
+├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼────────────┼────────────┼────────────┼────────────┼────────────┤
+│     4,655 │ __cycle__ │       128 │     2,048 │           0 │ 288,712.61 │ 286,967.91 │ 350,116.72 │ 359,988.52 │ 375,841.83 │ 475,557.90 │
+│     4,655 │ add       │       128 │     2,048 │           0 │  84,617.07 │  81,069.30 │ 130,454.07 │ 144,062.69 │ 157,494.96 │ 168,891.45 │
+│     4,655 │ archive   │       128 │     2,048 │           0 │  91,835.67 │  91,520.36 │ 116,591.05 │ 122,029.38 │ 132,162.56 │ 237,160.00 │
+│     4,655 │ process   │       128 │     2,048 │           0 │ 112,159.25 │ 108,681.20 │ 147,030.65 │ 156,819.09 │ 167,366.98 │ 216,535.58 │
+└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴────────────┴────────────┴────────────┴────────────┴────────────┘
 
 Parameter      Value
 -------------  -----------------------------------------------------------------------------------------------------------------------------------------
@@ -1321,22 +1432,52 @@ ramp           0
 args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': True}
 ```
 
+**Versus Manual JSONB**
+```
+>>> Worker 2 (logs/results_pooling_manual_20251205_171253_w2.log)
+run_name       Transactionsmanual.20251205_234809
+start_time     2025-12-05 23:48:09
+end_time       2025-12-06 00:05:27
+test_duration  1038
+-------------  ----------------------------------
+
+┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬───────────┬───────────┬───────────┬───────────┐
+│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │   p90(ms) │   p95(ms) │   p99(ms) │   max(ms) │
+├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼───────────┼───────────┼───────────┼───────────┤
+│     1,038 │ __cycle__ │       128 │     2,048 │           1 │  28,116.17 │ 28,110.66 │ 32,341.83 │ 33,583.76 │ 36,051.07 │ 38,847.89 │
+│     1,038 │ add       │       128 │     2,048 │           1 │   4,891.30 │  4,741.76 │  7,081.66 │  8,026.68 │ 10,923.60 │ 17,005.71 │
+│     1,038 │ archive   │       128 │     2,048 │           1 │  10,718.30 │ 10,518.72 │ 15,517.76 │ 16,769.48 │ 18,854.50 │ 20,523.07 │
+│     1,038 │ process   │       128 │     2,048 │           1 │  12,406.43 │ 12,354.42 │ 16,327.43 │ 17,693.94 │ 20,130.97 │ 22,613.52 │
+└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴───────────┴───────────┴───────────┴───────────┘
+
+Parameter      Value
+-------------  ------------------------------------------------------------------------------------------------------------------------------------------
+workload_path  /work/transactionsManual.py
+conn_params    {'conninfo': 'postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer&application_name=Transactionsmanual', 'autocommit': True}
+conn_extras    {}
+concurrency    128
+duration
+iterations     2048
+ramp           0
+args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': True}
+```
+
 **Versus Text Fields**
 ```
->>> Worker 2 (logs/results_pooling_text_20251202_130844_w2.log)
-run_name       Transactionstext.20251202_181644
-start_time     2025-12-02 18:16:44
-end_time       2025-12-02 18:26:29
-test_duration  585
+>>> Worker 2 (logs/results_pooling_text_20251205_171253_w2.log)
+run_name       Transactionstext.20251206_031550
+start_time     2025-12-06 03:15:50
+end_time       2025-12-06 03:23:14
+test_duration  444
 -------------  --------------------------------
 
 ┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬───────────┬───────────┬───────────┬───────────┐
 │   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │   p90(ms) │   p95(ms) │   p99(ms) │   max(ms) │
 ├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼───────────┼───────────┼───────────┼───────────┤
-│       585 │ __cycle__ │       128 │     2,048 │           3 │  34,344.72 │ 35,350.35 │ 44,850.78 │ 46,681.42 │ 51,327.14 │ 55,677.71 │
-│       585 │ add       │       128 │     2,048 │           3 │  10,997.23 │ 10,828.93 │ 14,706.88 │ 15,723.68 │ 19,642.67 │ 23,032.99 │
-│       585 │ archive   │       128 │     2,048 │           3 │  10,810.96 │ 10,684.68 │ 16,598.57 │ 18,180.35 │ 20,161.36 │ 24,008.58 │
-│       585 │ process   │       128 │     2,048 │           3 │  12,436.07 │ 12,669.71 │ 16,789.01 │ 17,953.65 │ 20,663.01 │ 24,225.55 │
+│       444 │ __cycle__ │       128 │     2,048 │           4 │  25,978.44 │ 27,711.76 │ 34,419.31 │ 36,271.11 │ 40,399.79 │ 50,658.46 │
+│       444 │ add       │       128 │     2,048 │           4 │   7,051.76 │  6,871.03 │ 11,928.27 │ 13,341.34 │ 16,424.42 │ 19,118.48 │
+│       444 │ archive   │       128 │     2,048 │           4 │   8,393.76 │  8,083.32 │ 13,856.32 │ 15,753.56 │ 18,525.14 │ 19,966.52 │
+│       444 │ process   │       128 │     2,048 │           4 │  10,432.22 │ 10,413.02 │ 15,619.18 │ 17,436.47 │ 20,112.72 │ 28,476.41 │
 └───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴───────────┴───────────┴───────────┴───────────┘
 
 Parameter      Value
@@ -1358,17 +1499,17 @@ args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_
 
 **<ins>PART 1 - JSONB vs TEXT DATA TYPES</ins>**
 
-The output from our testing shows that JSONB is not a good match for a high-throughput event queue with heavy writes and no nested JSON querying.  TEXT is absolutely the right approach for this workload.
+The output from our testing shows that JSONB with inverted indexes is not a good match for a high-throughput event queue with heavy writes and no nested JSON querying.  JSONB without inverted indexes or TEXT (without the generated fields) is absolutely the right approach for this workload.
 
 **Mean Latency Comparison (per operation)**
-| Operation | JSONB Mean (ms) | TEXT Mean (ms) | Improvement When Using TEXT |
-| ------------- | ------------- | ------------- | ------------- |
-| add | 68,135 ms | 19,684 ms | ~71% faster |
-| process | 1,082,500 ms | 130,594 ms | ~88% faster |
-| archive | 31,205 ms | 17,618 ms | ~44% faster |
-| cycle | 1,181,943 ms | 167,998 ms | ~86% faster |
+| Operation | JSONB Mean (ms) | Manual Mean (ms) | Improvement Without Inverted Index | TEXT Mean (ms) | Improvement When Using TEXT |
+| ------------- | ------------- | ------------- | ------------- | ------------- | ------------- |
+| add | 26,336 ms | 2,911 ms | ~89% faster | 2,239 ms | ~23% faster |
+| process | 197,110 ms | 41,873 ms | ~79% faster | 30,754 ms | ~27% faster |
+| archive | 11,692 ms | 1,728 ms | ~85% faster | 3,700 ms | ~53% slower |
+| cycle | 235,245 ms | 46,614 ms | ~80% faster | 36,799 ms | ~21% faster |
 
-TEXT is *40–90%* faster depending on the phase, with the largest gains in the high-contention process stage.
+TEXT is *20-30%* faster depending on the phase, with the largest gains in the high-contention process stage.
 
 **Why is JSONB so much slower?**
 

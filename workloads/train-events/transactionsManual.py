@@ -3,7 +3,7 @@ from psycopg.errors import SerializationFailure, OperationalError
 import random
 import time
 
-class Transactionsjsonb:
+class Transactionsmanual:
 
     def __init__(self, args: dict):
         # args is a dict of string passed with the --args flag
@@ -133,62 +133,50 @@ class Transactionsjsonb:
     def _add_once(self, conn: psycopg.Connection):
         original_autocommit = conn.autocommit
 
-        # Batched insert: create N events in one statement and return their ids
+        # Batched insert: create N events in one statement and return their ids.
+        # We explicitly populate event_type, authority_id, train_id columns, and
+        # also embed those values inside the JSON payload so it stays in sync.
         insert_batch_sql = """
             WITH new_events AS (
-              INSERT INTO events_jsonb (payload)
-              SELECT jsonb_build_object(
-                  'eventType',
-                    (
-                      ARRAY[
-                        'ROUTE_AUTHORIZATION',
-                        'SIGNAL_CLEAR',
-                        'SPEED_RESTRICTION',
-                        'TRACK_OUT_OF_SERVICE',
-                        'TRAIN_POSITION_UPDATE',
-                        'SWITCH_POSITION_CHANGE',
-                        'WORK_ZONE_PROTECTION',
-                        'CROSSING_FAILURE',
-                        'POWER_OUTAGE',
-                        'DISPATCH_NOTE'
-                      ]
-                    )[(1 + floor(random()*10))::INT],
-
-                  'authorityId', gen_random_uuid()::STRING,
-                  'deviceKey',   gen_random_uuid()::STRING,
+              INSERT INTO events_jsonb_manual (payload, event_type, authority_id, train_id)
+              SELECT
+                jsonb_build_object(
+                  'eventType', seed.event_type,
+                  'authorityId', seed.authority_id,
+                  'deviceKey',   seed.device_key,
                   'state',       'NEW',
-                  'createdAt',   (clock_timestamp() - (random()*interval '21 days'))::STRING,
+                  'createdAt',   seed.created_at_text,
 
                   'route', jsonb_build_object(
                     'segments',
                       (
                         SELECT jsonb_agg(
-                                jsonb_build_object(
-                                  'id', 1000 + (floor(random()*500))::INT,
-                                  'direction',
-                                    (
-                                      ARRAY['NORTHBOUND','SOUTHBOUND','EASTBOUND','WESTBOUND']
-                                    )[(1 + floor(random()*4))::INT],
-                                  'trackSections',
-                                    (
-                                      SELECT jsonb_agg(2000 + (floor(random()*200))::INT)
-                                      FROM generate_series(1, 3)
-                                    )
-                                )
-                              )
+                                 jsonb_build_object(
+                                   'id', 1000 + (floor(random()*500))::INT,
+                                   'direction',
+                                     (
+                                       ARRAY['NORTHBOUND','SOUTHBOUND','EASTBOUND','WESTBOUND']
+                                     )[(1 + floor(random()*4))::INT],
+                                   'trackSections',
+                                     (
+                                       SELECT jsonb_agg(2000 + (floor(random()*200))::INT)
+                                       FROM generate_series(1, 3)
+                                     )
+                                 )
+                               )
                         FROM generate_series(1, 3)
                       ),
                     'switches',
                       (
                         SELECT jsonb_agg(
-                                jsonb_build_object(
-                                  'id', 3000 + (floor(random()*500))::INT,
-                                  'position',
-                                    (
-                                      ARRAY['NORMAL','REVERSE']
-                                    )[(1 + floor(random()*2))::INT]
-                                )
-                              )
+                                 jsonb_build_object(
+                                   'id', 3000 + (floor(random()*500))::INT,
+                                   'position',
+                                     (
+                                       ARRAY['NORMAL','REVERSE']
+                                     )[(1 + floor(random()*2))::INT]
+                                 )
+                               )
                         FROM generate_series(1, 2)
                       ),
                     'attributes', jsonb_build_object(
@@ -213,10 +201,7 @@ class Transactionsjsonb:
                   ),
 
                   'train', jsonb_build_object(
-                    'trainId',
-                      'RR-' || (1 + floor(random()*99))::INT || '-' ||
-                      (10000 + floor(random()*90000))::INT || '-' ||
-                      to_char(current_date - (floor(random()*30))::INT, 'YYYYMMDD'),
+                    'trainId',      seed.train_id,
                     'withinLimits', (random() < 0.5),
                     'direction',
                       (
@@ -229,8 +214,34 @@ class Transactionsjsonb:
                     'logicalPos',   'SYS01',
                     'sourceSystem', 'SIMULATOR'
                   )
-              )
-              FROM generate_series(1, %s)
+                ),
+                seed.event_type,
+                seed.authority_id,
+                seed.train_id
+              FROM (
+                SELECT
+                  (
+                    ARRAY[
+                      'ROUTE_AUTHORIZATION',
+                      'SIGNAL_CLEAR',
+                      'SPEED_RESTRICTION',
+                      'TRACK_OUT_OF_SERVICE',
+                      'TRAIN_POSITION_UPDATE',
+                      'SWITCH_POSITION_CHANGE',
+                      'WORK_ZONE_PROTECTION',
+                      'CROSSING_FAILURE',
+                      'POWER_OUTAGE',
+                      'DISPATCH_NOTE'
+                    ]
+                  )[(1 + floor(random()*10))::INT]::event_type_enum AS event_type,
+                  gen_random_uuid()::STRING AS authority_id,
+                  gen_random_uuid()::STRING AS device_key,
+                  (clock_timestamp() - (random()*interval '21 days'))::STRING AS created_at_text,
+                  'RR-' || (1 + floor(random()*99))::INT || '-' ||
+                    (10000 + floor(random()*90000))::INT || '-' ||
+                    to_char(current_date - (floor(random()*30))::INT, 'YYYYMMDD') AS train_id
+                FROM generate_series(1, %s)
+              ) AS seed
               RETURNING id
             )
             SELECT id FROM new_events;
@@ -238,7 +249,7 @@ class Transactionsjsonb:
 
         # Second statement: insert one status row per new id
         insert_status_sql = """
-            INSERT INTO events_jsonb_status (event_id, status)
+            INSERT INTO events_jsonb_manual_status (event_id, status)
             SELECT unnest(%s::uuid[]), 'PENDING';
         """
 
@@ -264,7 +275,7 @@ class Transactionsjsonb:
 
             conn.commit()
         except Exception as e:
-            print(f"Error occurred in add: {e}")
+            print(f"Error occurred in add(manual): {e}")
             conn.rollback()
             raise
         finally:
@@ -286,7 +297,7 @@ class Transactionsjsonb:
                 batch_size = self._random_batch_size()
                 select_sql = """
                     SELECT event_id
-                    FROM events_jsonb_status
+                    FROM events_jsonb_manual_status
                     WHERE status IN ('PENDING','PROCESSING')
                     ORDER BY updated_at
                     LIMIT %s
@@ -303,7 +314,7 @@ class Transactionsjsonb:
 
                 # 2) Update statuses for those candidates
                 status_sql = """
-                    UPDATE events_jsonb_status AS s
+                    UPDATE events_jsonb_manual_status AS s
                     SET status = CASE
                                    WHEN random() < 0.6 THEN 'PROCESSING'
                                    WHEN random() < 0.9 THEN 'COMPLETE'
@@ -319,7 +330,7 @@ class Transactionsjsonb:
 
                 # 3) Update event payloads for those same candidates
                 events_sql = """
-                    UPDATE events_jsonb AS e
+                    UPDATE events_jsonb_manual AS e
                     SET payload = jsonb_set(
                                     jsonb_set(
                                       payload,
@@ -362,7 +373,7 @@ class Transactionsjsonb:
                 # 1) Pick COMPLETE candidates
                 select_sql = """
                     SELECT event_id
-                    FROM events_jsonb_status
+                    FROM events_jsonb_manual_status
                     WHERE status = 'COMPLETE'
                     ORDER BY updated_at
                     LIMIT %s
@@ -378,9 +389,9 @@ class Transactionsjsonb:
 
                 # 2) Insert into archive
                 insert_archive_sql = """
-                    INSERT INTO events_jsonb_archive (id, payload, event_type, authority_id, created_at, train_id)
+                    INSERT INTO events_jsonb_manual_archive (id, payload, event_type, authority_id, created_at, train_id)
                     SELECT id, payload, event_type, authority_id, created_at, train_id
-                    FROM events_jsonb
+                    FROM events_jsonb_manual
                     WHERE id = ANY(%s)
                 """
                 self._exec(cur, insert_archive_sql, (candidate_ids,))
@@ -390,14 +401,14 @@ class Transactionsjsonb:
 
                 # 3) Delete from main table
                 delete_events_sql = """
-                    DELETE FROM events_jsonb
+                    DELETE FROM events_jsonb_manual
                     WHERE id = ANY(%s)
                 """
                 self._exec(cur, delete_events_sql, (candidate_ids,))
 
                 # 4) Delete from status table
                 delete_status_sql = """
-                    DELETE FROM events_jsonb_status
+                    DELETE FROM events_jsonb_manual_status
                     WHERE event_id = ANY(%s)
                 """
                 self._exec(cur, delete_status_sql, (candidate_ids,))

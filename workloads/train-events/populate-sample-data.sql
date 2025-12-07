@@ -116,6 +116,32 @@ FROM
     FROM generate_series(1, 4) AS c(idx)
   ) AS cir;
 
+-- -------------------------------------------------------------------
+-- Mirror JSONB docs into manual-JSONB table
+--   - keep id / created_at
+--   - copy payload as-is
+--   - derive event_type / authority_id / train_id from payload
+-- -------------------------------------------------------------------
+INSERT INTO events_jsonb_manual (
+  id,
+  created_at,
+  payload,
+  event_type,
+  authority_id,
+  train_id
+)
+SELECT
+  e.id,
+  e.created_at,
+  e.payload,
+  (e.payload->>'eventType')::event_type_enum        AS event_type,
+  e.payload->>'authorityId'                         AS authority_id,
+  e.payload->'train'->>'trainId'                    AS train_id
+FROM events_jsonb AS e
+LEFT JOIN events_jsonb_manual AS m
+  ON m.id = e.id
+WHERE m.id IS NULL;
+
 -- Mirror JSONB docs into TEXT table
 INSERT INTO events_text (payload)
 SELECT payload::STRING FROM events_jsonb;
@@ -125,6 +151,13 @@ INSERT INTO events_jsonb_status (event_id, status)
 SELECT e.id, 'PENDING'
 FROM events_jsonb e
 LEFT JOIN events_jsonb_status s ON s.event_id = e.id
+WHERE s.event_id IS NULL;
+
+-- JSONB manual
+INSERT INTO events_jsonb_manual_status (event_id, status)
+SELECT e.id, 'PENDING'
+FROM events_jsonb_manual e
+LEFT JOIN events_jsonb_manual_status s ON s.event_id = e.id
 WHERE s.event_id IS NULL;
 
 -- TEXT side
