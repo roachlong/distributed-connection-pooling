@@ -3,6 +3,7 @@
 PROG="$(basename "${0}")"
 SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
 PGBOUNCER_CLIENT="postgres"
+AUTH_MODE="password"
 CLIENT_PASSWORD="secret"
 PGBOUNCER_SERVER="root"
 PGBOUNCER_CONNECTIONS=10
@@ -13,6 +14,7 @@ DATABASE="postgres"
 usage() {
     echo "USAGE: ${PROG}
     [--client-account <PGBOUNCER_CLIENT>
+    [--auth-mode <AUTH_MODE>]
     [--client-password <CLIENT_PASSWORD>
     [--server-account <PGBOUNCER_SERVER>]
     [--num-connections <PGBOUNCER_CONNECTIONS>]
@@ -28,6 +30,8 @@ help_exit() {
 Options:
     -c, --client-account PGBOUNCER_CLIENT
         the username we expect to authenticate from the frontend client application, defaults to postgres
+    -a, --auth-mode AUTH_MODE
+        the authentication mode used by pgbouncer to connect to the backend database server, either cert or password, defaults to password
     -p, --client-password CLIENT_PASSWORD
         the password used to authenticate the frontend client application, defaults to secret
     -s, --server-account PGBOUNCER_SERVER
@@ -57,7 +61,7 @@ assign() {
         echo "${2}"
         return 2
     else
-        output "Required parameter for '-${key}' not specified.\n"
+        echo "Required parameter for '-${key}' not specified.\n"
         usage
         exit 1
     fi
@@ -74,6 +78,11 @@ while [[ $# -ge 1 ]]; do
                 case ${key:${keypos}} in
                     c|-client-account)
                         PGBOUNCER_CLIENT=$(assign "${key:${keypos}}" "${2}")
+                        if [[ $? -eq 2 ]]; then shift; fi
+                        keypos=$keylen
+                    ;;
+                    a|-auth-mode)
+                        AUTH_MODE=$(assign "${key:${keypos}}" "${2}")
                         if [[ $? -eq 2 ]]; then shift; fi
                         keypos=$keylen
                     ;;
@@ -111,7 +120,7 @@ while [[ $# -ge 1 ]]; do
                         help_exit
                     ;;
                     *)
-                        output "Unknown option '${key:${keypos}}'.\n"
+                        echo "Unknown option '${key:${keypos}}'.\n"
                         usage
                         exit 1
                     ;;
@@ -125,6 +134,7 @@ done
 
 echo "executing ${PROG} from ${SCRIPT_DIR} with:
     PGBOUNCER_CLIENT=${PGBOUNCER_CLIENT}
+    AUTH_MODE=${AUTH_MODE}
     CLIENT_PASSWORD=******
     PGBOUNCER_SERVER=${PGBOUNCER_SERVER}
     PGBOUNCER_CONNECTIONS=${PGBOUNCER_CONNECTIONS}
@@ -138,15 +148,28 @@ mkdir -p "${SCRIPT_DIR}"
 touch "${userlist}"
 chmod 600 "${userlist}"
 
-# Add or replace the user entry
-if grep -qE "^\"${PGBOUNCER_CLIENT}\" " "${userlist}"; then
-  tmp="$(mktemp)"
-  awk -v u="${PGBOUNCER_CLIENT}" -v s="${CLIENT_PASSWORD}" \
-    'BEGIN{q="\""} $0 ~ "^" q u q " " {print q u q " " q s q; next} {print}' \
-    "${userlist}" > "${tmp}"
-  mv "${tmp}" "${userlist}"
+if [[ "${AUTH_MODE}" == "cert" ]]; then
+    # Add or replace the user entry WITHOUT a password
+    if grep -qE "^\"${PGBOUNCER_CLIENT}\" " "${userlist}"; then
+        tmp="$(mktemp)"
+        awk -v u="${PGBOUNCER_CLIENT}" -v s="" \
+            'BEGIN{q="\""} $0 ~ "^" q u q " " {print q u q " " q s q; next} {print}' \
+            "${userlist}" > "${tmp}"
+        mv "${tmp}" "${userlist}"
+    else
+        printf "\"%s\" \"%s\"\n" "${PGBOUNCER_CLIENT}" "" >> "${userlist}"
+    fi
 else
-  printf "\"%s\" \"%s\"\n" "${PGBOUNCER_CLIENT}" "${CLIENT_PASSWORD}" >> "${userlist}"
+    # Add or replace the user entry WITH a password
+    if grep -qE "^\"${PGBOUNCER_CLIENT}\" " "${userlist}"; then
+        tmp="$(mktemp)"
+        awk -v u="${PGBOUNCER_CLIENT}" -v s="${CLIENT_PASSWORD}" \
+            'BEGIN{q="\""} $0 ~ "^" q u q " " {print q u q " " q s q; next} {print}' \
+            "${userlist}" > "${tmp}"
+        mv "${tmp}" "${userlist}"
+    else
+        printf "\"%s\" \"%s\"\n" "${PGBOUNCER_CLIENT}" "${CLIENT_PASSWORD}" >> "${userlist}"
+    fi
 fi
 
 num_files=$(( (${PGBOUNCER_CONNECTIONS} / 64) + (${PGBOUNCER_CONNECTIONS} % 64 > 0) ))
@@ -156,13 +179,26 @@ echo "creating ${num_files} instances with ${pool_size} connections each"
 for (( i=1; i<=${num_files}; i++ )); do
     PGID=${i}
     cp ${SCRIPT_DIR}/pgbouncer.template ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
-    sed -i "s/%PGID%/${PGID}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
-    sed -i "s/%CLIENT%/${PGBOUNCER_CLIENT}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
-    sed -i "s/%SERVER%/${PGBOUNCER_SERVER}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
-    sed -i "s/%SIZE%/${pool_size}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+    sed -i "s/%DATABASE%/${DATABASE}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
     sed -i "s/%HOST_IP%/${HOST_IP}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
     sed -i "s/%HOST_PORT%/${HOST_PORT}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
-    sed -i "s/%DATABASE%/${DATABASE}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+    sed -i "s/%CLIENT%/${PGBOUNCER_CLIENT}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+    sed -i "s/%PGID%/${PGID}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+    sed -i "s/%SIZE%/${pool_size}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+    sed -i "s/%SERVER%/${PGBOUNCER_SERVER}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+
+    if [[ "${AUTH_MODE}" == "cert" ]]; then
+        sed -i "s/^auth_type =.*/auth_type = cert/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+        sed -i "s/^client_tls_sslmode =.*/client_tls_sslmode = verify-full/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+        sed -i "s/^; client_tls_ca_file =.*/client_tls_ca_file = \/etc\/pgbouncer\/certs\/ca.crt/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+        sed -i "s/^; client_tls_key_file =.*/client_tls_key_file = \/etc\/pgbouncer\/certs\/server.${PGBOUNCER_CLIENT}.key/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+        sed -i "s/^; client_tls_cert_file =.*/client_tls_cert_file = \/etc\/pgbouncer\/certs\/server.${PGBOUNCER_CLIENT}.crt/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+        sed -i "s/^server_tls_sslmode =.*/server_tls_sslmode = verify-full/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+        sed -i "s/^; server_tls_ca_file =.*/server_tls_ca_file = \/etc\/pgbouncer\/certs\/ca.crt/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+        sed -i "s/^; server_tls_key_file =.*/server_tls_key_file = \/etc\/pgbouncer\/certs\/client.${PGBOUNCER_SERVER}.key/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+        sed -i "s/^; server_tls_cert_file =.*/server_tls_cert_file = \/etc\/pgbouncer\/certs\/client.${PGBOUNCER_SERVER}.crt/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+    fi
+
     script_dir_esc=$(eval echo ${SCRIPT_DIR} | sed 's/\//\\\//g')
     sed -i "s/%SCRIPT_DIR%/${script_dir_esc}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
     mkdir -p ${SCRIPT_DIR}/../run/${PGID}

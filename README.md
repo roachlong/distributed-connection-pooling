@@ -6,8 +6,9 @@
 1. [CockroachDB](#cockroachdb)
 1. [PgBouncer](#pgbouncer)
 1. [High Availability](#high-availability)
-1. [Flight Schedules Workload](#flight-schedules)
-1. [Train Events Workload](#train-events)
+1. [Event Logs Workload](./workloads/event-logs/README.md)
+1. [Flight Schedules Workload](./workloads/flight-schedules/README.md)
+1. [Train Events Workload](./workloads/train-events/README.md)
 
 ## Overview
 
@@ -18,9 +19,6 @@ Modern distributed databases like CockroachDB can handle large volumes of concur
 By **centralizing and externalizing connection pooling**, we decouple connection lifecycle management from the application tier — allowing each service to use lightweight, short-lived database sessions while still maintaining consistent access to a shared pool of open connections.
 
 ### Why External Connection Pooling?
-<details>
-<summary>more info...</summary>
-
 **External connection pooling** (using PgBouncer or similar) provides several operational and architectural benefits:
 
 1. Reduced Database Load
@@ -50,7 +48,6 @@ By **centralizing and externalizing connection pooling**, we decouple connection
     Connection metrics, session reuse rates, and transaction throughput can be monitored independently of application code.
 
     Connection-level policies (e.g., limits, timeouts, user mapping) can be tuned dynamically.
-</details>
 
 ## Solution Architecture
 
@@ -65,9 +62,6 @@ This demo uses a **Docker-based local cluster** that emulates a full high-availa
 | **CockroachDB** | Target database backend to validate connection routing and failover behaviors |
 
 ### Architecture (Problem): Direct Connections → Connection Swarm / Starvation
-<details>
-<summary>more info...</summary>
-
 When many microservices each maintain their own pools, the database sees a “fan-out” of sessions. Spiky traffic and idle-but-open sessions waste resources and can starve active work.
 
 [<img src="https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/connection-swarm.svg">](https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/connection-swarm.svg)
@@ -77,12 +71,8 @@ When many microservices each maintain their own pools, the database sees a “fa
 - **Starvation / head-of-line blocking**: Busy services grab connections while others sit idle; spikes cause thrash.
 - **High session churn & metadata overhead**: DB spends cycles managing sessions instead of executing queries.
 - **Operational sprawl**: Auth, timeouts, and limits duplicated across every app.
-</details>
 
 ### Architecture (Solution): Distributed Connection Pooling with HA
-<details>
-<summary>more info...</summary>
-
 Centralize connection lifecycle management behind a **stable VIP**. HAProxy handles frontend health/routing; PgBouncer multiplexes many client sessions onto a compact backend pool; Pacemaker/Corosync orchestrates failover and fencing.
 
 [<img src="https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/distributed-connection-pooling.svg">](https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/distributed-connection-pooling.svg)
@@ -92,12 +82,8 @@ Centralize connection lifecycle management behind a **stable VIP**. HAProxy hand
 - **Fewer idle drains**: PgBouncer reuses backends across sessions/transactions; HAProxy evens out spikes.
 - **Fast, clean failover**: Pacemaker moves the VIP + services; fencing prevents split-brain.
 - **Centralized control**: One place to tune auth, timeouts, pool sizes, and limits.
-</details>
 
 ### Key Attributes of This Solution
-<details>
-<summary>more info...</summary>
-
 - **Highly Available**: Automatic failover of the PgBouncer + HAProxy stack through Pacemaker-managed floating IPs.
 
 - **Fault Tolerant**: Node failures are isolated via STONITH fencing, ensuring data safety and service continuity.
@@ -109,7 +95,6 @@ Centralize connection lifecycle management behind a **stable VIP**. HAProxy hand
 - **Configurable Topology**: Supports both session and transaction pooling modes, adjustable via PgBouncer configuration.
 
 - **Demonstrable Locally**: The full HA setup (including Corosync, Pacemaker, HAProxy, and PgBouncer) runs in containers for experimentation and reproducibility.
-</details>
 
 ## Test Results
 
@@ -129,21 +114,17 @@ This shift in resource allocation led to higher throughput and lower latency—*
 SQL activity logs show a 97 % reduction in average statement execution time when PgBouncer was used, highlighting how efficient connection multiplexing improves utilization and minimizes internal contention in the database.
 
 ### SQL Activity
-<details>
-<summary>more info...</summary>
-
 **Direct Connections**
 [<img src="https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/direct-sql-activity.png">](https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/direct-sql-activity.png)
 
 **Managed Connections**
 [<img src="https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/pooling-sql-activity.png">](https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/images/pooling-sql-activity.png)
-</details>
 
 ### Side-by-Side Metrics
-<details>
-<summary>more info...</summary>
-
 Metrics collected from the database during both executions reveal significant differences in **internal transaction management and resource utilization**. The following charts present the two runs side by side.
+
+<details>
+<summary>expand to see metrics...</summary>
 
 | Metric | Direct Connections | Managed Connections |
 | ------------- | ------------- | ------------- |
@@ -168,9 +149,6 @@ Metrics collected from the database during both executions reveal significant di
 </details>
 
 ### Interpretation
-<details>
-<summary>more info...</summary>
-
 In both configurations, client sessions were reused and issued the same mix of SQL statements.
 The key difference was **where** connection management occurred.
 
@@ -193,7 +171,6 @@ In essence, **PgBouncer amplified throughput per backend connection**—doing mo
 This is consistent with the principle that connection pooling not only stabilizes workloads but also lets distributed databases like CockroachDB dedicate more of their resources to actual query execution rather than connection lifecycle management.
 
 See below for more details on how to setup and run the workload with distributed connection pooling.
-</details>
 
 ## CockroachDB
 
@@ -204,30 +181,24 @@ Unlike traditional databases that rely on a single primary node, CockroachDB dis
 In this demo, CockroachDB serves as the **backend database** behind PgBouncer. While the example uses a single-node secure cluster for simplicity, the same principles apply to multi-node and multi-region deployments. The focus here is on the **connection management layer** — showing how PgBouncer can efficiently manage database sessions and reduce load on CockroachDB in high-concurrency environments.
 
 ### Why CockroachDB Benefits from Connection Pooling
-<details>
-<summary>more info...</summary>
-
 Each connection to CockroachDB represents an active **SQL session** with its own memory context, transaction state, and session-level metadata. In busy application environments — particularly those with many microservices or short-lived requests — rapidly opening and closing connections can create overhead that limits scalability and increases latency.
 
 Using **PgBouncer** as an intermediary allows applications to reuse a smaller set of persistent backend sessions while still handling thousands of concurrent client requests. This reduces pressure on CockroachDB’s session management layer, minimizes transaction contention, and ensures that the database remains focused on executing queries rather than maintaining idle connections.
 
 Together, CockroachDB and PgBouncer form a robust foundation for **distributed, fault-tolerant connection management**, where scaling the application tier doesn’t compromise database performance or stability.
-</details>
 
 ### CockroachDB Setup
-<details>
-<summary>more info...</summary>
+We'll start by configuring a local secure database database cluster that will provide the backend for testing connections through pgbouncer.  We'll use a secure cluster so we can insert connection management between the application components and our database using PgBouncer.  This demo is not meant to demonstrate the reliability and throughput capabilities of CockroachDB.  It will primarily focus on the performance of connection management to the backend.  We can run cockroach as a single-node for simple use cases, or use docker to simulate a multi-region scenario.
 
-We'll start by configuring a local secure single-node database that will provide the backend for testing connections through pgbouncer.  This demo is not meant to demonstrate the reliability and throughput capabilities of CockroachDB.  It will primarily focus on the performance of connection management to the backend.
-
-We'll use a secure cluster so we can insert connection management between the application components and our database using PgBouncer.
-
+**<ins>CERTS</ins>**
 1) Create a directory to hold our self-signed certificate ```mkdir -p certs my-safe-directory```
 1) Then run the cockroach commands to generate the certs.
 ```
 cockroach cert create-ca --certs-dir=certs --ca-key=my-safe-directory/ca.key
-cockroach cert create-node localhost 127.0.0.1 $(hostname) --certs-dir=certs --ca-key=my-safe-directory/ca.key
+cockroach cert create-node localhost us-east us-central us-west 127.0.0.1 $(hostname -f) --certs-dir=certs --ca-key=my-safe-directory/ca.key
 cockroach cert create-client root --certs-dir=certs --ca-key=my-safe-directory/ca.key
+chmod 600 ./certs/node.key
+chmod 600 ./certs/client.root.key
 ```
 
 Copy the client certs into the default location for postgres on Mac
@@ -241,11 +212,42 @@ cp certs\client.root.crt $env:APPDATA\.postgresql\root.crt
 cp certs\client.root.key $env:APPDATA\.postgresql\postgresql.key
 ```
 
+**<ins>CLUSTER</ins>**
+
+<details>
+<summary>expand for single-node...</summary>
+
 Then check your cockroach version and start your single node instance with the new certs.
 ```
 cockroach --version
 cockroach start-single-node --certs-dir=./certs --store=./data --advertise-addr=localhost:26257 --background
 ```
+</details>
+
+<br/>
+
+<details>
+<summary>expand for multi-region...</summary>
+
+**Note**: make sure you start colima with ```--network-address``` and include extra resource capacity
+```
+colima start --network-address --memory 8 --cpu 4 --disk 100
+export CRDB_VERSION=$(cockroach --version | grep "Build Tag" | awk '{print $3}')
+docker-compose up -d
+```
+
+Next we'll need to configure our multi-region cluster
+```
+cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb?sslmode=verify-full" -e """
+ALTER DATABASE defaultdb SET PRIMARY REGION 'us-east';
+ALTER DATABASE defaultdb ADD REGION 'us-central';
+ALTER DATABASE defaultdb ADD REGION 'us-west';
+ALTER DATABASE defaultdb SURVIVE REGION FAILURE;
+"""
+```
+</details>
+
+<br/>**<ins>USERS</ins>**
 
 And create a new admin user for your cluster.  **Note**: with Windows PowerShell use two pairs of double quotes around me, i.e. ``` ""me"" ```
 ```
@@ -267,7 +269,6 @@ And test the connection
 ```
 cockroach sql --url "postgresql://pgb:secret@localhost:26257/defaultdb?sslmode=prefer" -e "show databases;"
 ```
-</details>
 
 ## PgBouncer
 
@@ -291,10 +292,11 @@ In this demo, PgBouncer acts as the **connection management layer** between your
 - A consistent connection endpoint for HAProxy and Pacemaker to manage
 
 ### Scale the Network
+Before we get started we'll need to increase the capacity of our docker network to handle 2048 connections
+
 <details>
 <summary>more info...</summary>
 
-Before we get started we'll need to increase the capacity of our docker network to handle 2048 connections
 ```
 colima stop
 colima start --network-address --memory 8 --cpu 4 --disk 100
@@ -347,16 +349,17 @@ colima restart
 
 Next stop and remove any containers that we may have created previously
 ```
-docker stop pgbouncer1 pgbouncer2 ha-node1 ha-node2 vip-proxy
-docker rm pgbouncer1 pgbouncer2 ha-node1 ha-node2 vip-proxy
+docker stop $(docker ps -aq --filter "name=^pgbouncer") $(docker ps -aq --filter "name=^ha-node") vip-proxy
+docker rm $(docker ps -aq --filter "name=^pgbouncer") $(docker ps -aq --filter "name=^ha-node") vip-proxy
 ```
 </details>
 
 ### PgBouncer Setup
-<details>
-<summary>more info...</summary>
+Next we'll build our pgbouncer docker image and spin up two pgbouncer instances for a single node, or per region
 
-Next we'll build our pgbouncer docker image and spin up two pgbouncer instances
+<details>
+<summary>expand for single-node...</summary>
+
 ```
 docker network create dcp-net
 
@@ -407,6 +410,119 @@ cockroach sql --url "postgresql://pgb:secret@localhost:5432/defaultdb?sslmode=pr
 ```
 </details>
 
+<br/>
+
+<details>
+<summary>expand for multi-region...</summary>
+
+First we'll need to create a client certificate for our multi-region cluster and a server-side certificate for pgbouncer
+```
+cockroach cert create-client pgb --certs-dir=./certs --ca-key=./my-safe-directory/ca.key
+chmod 600 ./certs/client.pgb.key
+
+# generate the config file used for CSR and signing
+cat > "./certs/server.pgb.cnf" <<EOF
+[ req ]
+default_bits        = 4096
+prompt              = no
+default_md          = sha256
+distinguished_name  = req_distinguished_name
+req_extensions      = v3_req
+
+[ req_distinguished_name ]
+CN = pgbouncer
+
+[ v3_req ]
+subjectAltName = @alt_names
+
+[ alt_names ]
+DNS.1 = localhost
+DNS.2 = pgbouncer-us-east-1
+DNS.3 = pgbouncer-us-east-2
+DNS.4 = pgbouncer-us-central-1
+DNS.5 = pgbouncer-us-central-2
+DNS.6 = pgbouncer-us-west-1
+DNS.7 = pgbouncer-us-west-2
+IP.1  = 127.0.0.1
+IP.2  = 172.18.0.251
+IP.3  = 172.18.0.252
+IP.4  = 172.18.0.253
+EOF
+
+# generate a private key for PgBouncer (server key)
+openssl genrsa -out ./certs/server.pgb.key 4096
+chmod 600 ./certs/server.pgb.key
+
+# create a CSR using that key + config
+openssl req \
+  -new \
+  -key ./certs/server.pgb.key \
+  -out ./certs/server.pgb.csr \
+  -config ./certs/server.pgb.cnf
+
+# sign the CSR with existing cockroach CA
+openssl x509 \
+  -req \
+  -in ./certs/server.pgb.csr \
+  -CA ./certs/ca.crt \
+  -CAkey ./my-safe-directory/ca.key \
+  -CAcreateserial \
+  -out ./certs/server.pgb.crt \
+  -days 365 \
+  -sha256 \
+  -extensions v3_req \
+  -extfile ./certs/server.pgb.cnf
+
+# verify the SANs look correct
+openssl x509 -in ./certs/server.pgb.crt -noout -text | grep -A1 "Subject Alternative Name"
+```
+
+And then build the image and deploy the instances
+```
+docker network create dcp-net
+
+docker build -t pgbouncer --build-arg PGBOUNCER_VERSION=1.17.0 pgbouncer
+
+REGIONS=("us-east" "us-west" "us-central")
+NODES_PER_REGION=2
+
+for region in "${REGIONS[@]}"; do
+  for idx in $(seq 1 $NODES_PER_REGION); do
+    
+    NAME="pgbouncer-${region}-${idx}"      # e.g., pgbouncer-us-east-1
+    echo "🚀 Starting ${NAME}, targeting ${region}"
+
+    docker container run \
+      --name "${NAME}" \
+      --network dcp-net \
+      --ulimit nofile=262144:262144 \
+      -v ./certs:/etc/pgbouncer/certs \
+      -d pgbouncer \
+      --client-account pgb \
+      --server-account pgb \
+      --auth-mode cert \
+      --num-connections 24 \
+      --host-ip "${region}" \
+      --host-port 26257 \
+      --database defaultdb
+
+  done
+done
+```
+
+Then to test the connection pool we can go inside the container
+```
+docker exec -it pgbouncer-us-east-1 /bin/bash
+wget https://binaries.cockroachdb.com/cockroach-latest.linux-arm64.tgz
+tar -xvzf cockroach-latest.linux-arm64.tgz
+cp cockroach-*/cockroach /usr/local/bin/
+cockroach version
+cockroach sql --certs-dir /etc/pgbouncer/certs --url "postgresql://pgb@localhost:5432/defaultdb?sslmode=verify-full" -e "show databases;"
+exit
+```
+</details>
+
+
 ## High Availability
 
 **HAProxy** is a high-performance **TCP/HTTP load balancer** and reverse proxy. In this demo, it terminates **no** database protocol; instead it operates in **TCP passthrough** mode to balance PostgreSQL-compatible traffic across **PgBouncer** instances. HAProxy provides:
@@ -418,9 +534,6 @@ cockroach sql --url "postgresql://pgb:secret@localhost:5432/defaultdb?sslmode=pr
 By fronting PgBouncer with HAProxy, clients use a **single stable endpoint**, while PgBouncer handles **connection multiplexing** to CockroachDB — reducing backend session pressure and smoothing traffic spikes.
 
 ### What are Corosync and Pacemaker?
-<details>
-<summary>more info...</summary>
-
 **Corosync** and **Pacemaker** together form the **high-availability cluster stack** that keeps services like HAProxy and the VIP running on exactly one healthy node at a time.
 
 - **Corosync** provides the **cluster communication layer** — it handles membership, heartbeats, and quorum. It ensures each node knows who’s alive, who’s failed, and when it’s safe to take over shared resources.
@@ -430,12 +543,8 @@ By fronting PgBouncer with HAProxy, clients use a **single stable endpoint**, wh
 In this demo, Corosync and Pacemaker coordinate between two HAProxy nodes. Only one node at a time “owns” the virtual IP and serves traffic. If that node fails, Pacemaker moves the VIP (and HAProxy) to the other node within seconds, ensuring uninterrupted client access.
 
 Together they form the brains of the HA cluster — Corosync detects failure, Pacemaker makes recovery decisions, and fencing ensures safety.
-</details>
 
 ### What is STONITH / Fencing?
-<details>
-<summary>more info...</summary>
-
 **STONITH** stands for “**Shoot The Other Node In The Head**.” It’s Pacemaker’s fencing mechanism — the ultimate safeguard against **split-brain** conditions in a cluster.
 
 When a node stops responding or loses quorum, Pacemaker doesn’t immediately assume it’s truly dead. To avoid two nodes simultaneously taking ownership of shared resources (like a VIP or database), the cluster first performs **fencing**: it forcibly isolates or powers off the suspect node so that it cannot corrupt data or conflict with the survivor.
@@ -449,12 +558,12 @@ Common fencing methods include:
 In this Docker-based demo, we use the lightweight fence_dummy agent — it doesn’t actually power off containers, but it lets us see how Pacemaker would trigger fencing in a real deployment.
 
 Fencing guarantees that at any given time, only one node controls critical resources — the key to maintaining **data consistency** and **cluster integrity** in any high-availability design.
-</details>
 
 ### HA Setup
 <details>
-<summary>more info...</summary>
+<summary>expand for single-node...</summary>
 
+<br/>
 <details>
 <summary>1. Start by creating two containers using the host network so they can manipulate an IP on the host interface:</summary>
 
@@ -819,759 +928,562 @@ Also check the stats pages at http://localhost:8404/stats
 </details>
 </details>
 
-## Flight Schedules
-This workload simulates the day-to-day lifecycle of airline flight schedules: generating flight plans, updating operational details, and serving read traffic that represents downstream planning, monitoring, and customer-facing systems.
-It focuses on **high-frequency, lightweight read/write transactions** that stress indexing, row-level updates, and concurrent access to time-based operational data.
+<br/>
 
-It is a **simple, high-velocity transactional workload** designed to model the core interactions of systems responsible for schedule publication, flight status updates, and operational synchronization across airline services.
-
-The workload exercises three primary interaction patterns:
-
-### 1. Schedule Generation Transactions
 <details>
-<summary>more info...</summary>
+<summary>expand for multi-region...</summary>
 
-These transactions create new flight schedule entries, representing upstream schedule-planning systems that continuously publish changes.
-
-Each insert models a single flight with structured attributes such as:
-- Airline and flight number
-- Origin / destination
-- Planned departure and arrival times
-- Equipment type
-- Operational metadata (status, gate, terminal, etc.)
-
-These operations simulate steady-state introduction of new flights into the operational window for a given day or period.
-</details>
-
-### 2. Schedule Update Transactions
+<br/>
 <details>
-<summary>more info...</summary>
+<summary>1. Start by creating two containers per region using the host network so they can manipulate an IP on the host interface:</summary>
 
-Existing schedule records are selected and updated in place, simulating the frequent minor changes that occur throughout the day:
-- Departure time adjustments
-- Gate reassignments
-- Equipment swaps
-- Status changes (e.g., SCHEDULED → BOARDING → DEPARTED → ARRIVED)
-
-These are **small, implicit read-modify-write** transactions:
-1. Read the current schedule row
-1. Apply a deterministic or randomized update
-1. Write the updated row back atomically
-
-They represent load patterns from real-world operational control centers, partner data feeds, and automated synchronization services.
-</details>
-
-### 3. Schedule Lookup Transactions
-<details>
-<summary>more info...</summary>
-
-These transactions issue low-latency point reads or small range scans—queries commonly used by:
-- Customer-facing flight-status APIs
-- Gate/terminal display systems
-- Mobile apps polling for updates
-- Operational dashboards or planning tools
-
-These reads stress index usage and concurrent access patterns across “hot” rows (near-term departure windows) without modifying data.
-</details>
-
-### What This Workload Demonstrates
-<details>
-<summary>more info...</summary>
-
-- **Concurrent read/write behavior** on time-partitioned data such as upcoming flight legs
-- **Update-heavy vs read-heavy balance**, reflecting real operational systems
-- **Impact of concurrent updates** on single-row transactions and hot partitions
-- **Index and storage efficiency** for schedule lookup patterns (origin/destination + time)
-- **Real-world stress characteristics** of systems that must ingest updates continuously while serving high-volume read queries
-- **Predictable ACID behavior** for small, frequent transactions
-- **Throughput and latency characteristics** under mixed operational load
-</details>
-
-### Initial Schema
-<details>
-<summary>more info...</summary>
-
-First we'll execute the sql to create a sample schema and load some data into it.
 ```
-cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -f ./workloads/flight-schedules/initial-schema.sql
-cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -f ./workloads/flight-schedules/populate-sample-data.sql
-```
+docker build -t ha-node ha-node
 
-Then permission access to the tables for our pgbouncer client.
-```
-cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -e """
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE defaultdb.* TO pgb;
-"""
+REGIONS=("us-east" "us-west" "us-central")
+NODES_PER_REGION=2
+
+for region in "${REGIONS[@]}"; do
+  for idx in $(seq 1 $NODES_PER_REGION); do
+
+    NAME="ha-node-${region}-${idx}"      # e.g., ha-node-us-east-1
+    echo "🚀 Starting ${NAME}, targeting ${region}"
+
+    docker container run \
+        --name "${NAME}" \
+        --hostname "${NAME}" \
+        --network dcp-net \
+        --ulimit nofile=262144:262144 \
+        --privileged \
+        --cgroupns=host \
+        --security-opt seccomp=unconfined \
+        --cap-add SYS_ADMIN \
+        --tmpfs /run --tmpfs /run/lock \
+        -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+        -d ha-node
+
+  done
+done
 ```
 </details>
 
-### dbworkload
 <details>
-<summary>more info...</summary>
+<summary>2. And confirm that systemd is running inside each node</summary>
 
-This is a tool we use to simulate data flowing into cockroach, developed by one of our colleagues with python.  We can install the tool with ```pip3 install "dbworkload[postgres]"```, and then add it to your path.  On Mac or Linux with Bash you can use:
 ```
-echo -e '\nexport PATH=`python3 -m site --user-base`/bin:$PATH' >> ~/.bashrc 
-source ~/.bashrc
-```
-For Windows you can add the location of the dbworkload.exe file (i.e. C:\Users\myname\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.9_abcdefghijk99\LocalCache\local-packages\Python39\Scripts) to your Windows Path environment variable.  The pip command above should provide the exact path to your local python executables.
-
-We can control the velocity and volume of the workload with a few properties described below.
-* num_connections: we'll simulate the workload across a number of processes
-* duration: the number of minutes for which we want to run the simulation
-* iterations: or use the number of executions for each loop of the simulation
-* schedule_freq: the percentage of cycles we want to make updates to the flight schedule
-* status_freq: the percentage of cycles we want to make updates to flight status
-* inventory_freq: the percentage of cycles we want to make updates to the available seating
-* price_freq: the percentage of cycles we want to make updates to the ticket prices
-* batch_size: the number of records we want to update in a single cycle
-* delay: the number of milliseconds we should pause between transactions, so we don't overload admission controls
-
-These parameters are set in the run_workloads.sh script.  We'll run multiple workers to simulate client apps (from a docker container) that run concurrently to process the total workload, each with a proportion of the total connection pool.  We'll pass the following parameters to the workload script.
-* connection string: this is the uri we'll used to connect to the database
-* test name: identifies the name of the test in the logs, i.e. direct
-* txn poolimg: true if connections should be bound to the transaction, false for session
-* total connections: the total number of connections we want to simulate across all workers
-* num workers: the number of instances we want to spread the workload across
-
-To execute the tests in docker we'll need to publish our python dependencies
-```
-cd ./workloads/flight-schedules
-pip freeze > requirements.txt
-sed -E '/^(pyobjc-core|pyobjc-framework-Cocoa|py2app|rumps|macholib|tensorflow-macos|tensorflow-metal)(=|==)/d' \
-  requirements.txt > requirements-runner.txt
-cd ../../
+for region in "${REGIONS[@]}"; do
+  for idx in $(seq 1 $NODES_PER_REGION); do
+    docker exec -it "ha-node-${region}-${idx}" bash -lc 'systemctl is-system-running --wait || true; hostname -f'
+  done
+done
 ```
 </details>
 
-### Direct Connections
 <details>
-<summary>more info...</summary>
+<summary>3. Next enable pcsd and set the hacluster password on both nodes</summary>
 
-Then we can use our workload script to simulate the workload going directly against the database running on our host machine.
 ```
-cd ./workloads/flight-schedules
-export TEST_URI="postgresql://pgb:secret@host.docker.internal:26257/defaultdb?sslmode=prefer"
-export TEST_NAME="direct"
-export TXN_POOLONG="false"
-./run_workloads.sh 1024 4
-cd ../../
-```
-You can tail the files in the logs directory or open another terminal and run ```docker logs -f dbw-1```
-
-A summary of the test results for one of the workers is outlined below...
-```
->>> Worker 2 (logs/results_direct_20251124_081158_w2.log)
-run_name       Transactions.20251124_131951
-start_time     2025-11-24 13:19:51
-end_time       2025-11-24 13:36:32
-test_duration  1001
--------------  ----------------------------
-
-┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬───────────┬───────────┬───────────┬────────────┐
-│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │   p90(ms) │   p95(ms) │   p99(ms) │    max(ms) │
-├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼───────────┼───────────┼───────────┼────────────┤
-│     1,001 │ __cycle__ │       256 │     8,192 │           8 │  27,418.33 │ 25,233.66 │ 48,900.82 │ 57,079.37 │ 73,237.60 │ 135,899.16 │
-│     1,001 │ inventory │       256 │     8,192 │           8 │  10,100.36 │  9,058.83 │ 22,061.79 │ 25,814.86 │ 36,782.19 │  52,089.72 │
-│     1,001 │ price     │       256 │     8,192 │           8 │   3,302.30 │      0.02 │ 13,612.77 │ 19,371.13 │ 28,394.78 │  49,571.70 │
-│     1,001 │ schedule  │       256 │     8,192 │           8 │   1,375.15 │      0.03 │  1,739.33 │ 12,267.97 │ 24,721.06 │  63,367.84 │
-│     1,001 │ status    │       256 │     8,192 │           8 │  12,525.96 │ 11,044.13 │ 24,193.88 │ 28,637.84 │ 42,020.49 │  85,503.72 │
-└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴───────────┴───────────┴───────────┴────────────┘
-
-Parameter      Value
--------------  ---------------------------------------------------------------------------------------------------------------------------------------------
-workload_path  /work/transactions.py
-conn_params    {'conninfo': 'postgresql://pgb:secret@host.docker.internal:26257/defaultdb?sslmode=prefer&application_name=Transactions', 'autocommit': True}
-conn_extras    {}
-concurrency    256
-duration
-iterations     8192
-ramp           0
-args           {'schedule_freq': 10, 'status_freq': 90, 'inventory_freq': 75, 'price_freq': 25, 'batch_size': 64, 'delay': 100, 'txn_pooling': False}
+for region in "${REGIONS[@]}"; do
+  for idx in $(seq 1 $NODES_PER_REGION); do
+    docker exec -it "ha-node-${region}-${idx}" bash -lc '
+    systemctl enable --now pcsd &&
+    echo -e "secret\nsecret" | passwd hacluster
+    '
+  done
+done
 ```
 </details>
 
-### Managed Connections
 <details>
-<summary>more info...</summary>
+<summary>4. Get each HA node’s IP (on dcp-net) and ensure node name resolution</summary>
 
-We can simulate the workload again, this time using our PgBouncer HA cluster with transaction pooling, but we'll have to disable prepared statements due to connection multiplexing between clients.
+First create a map of the IPs for each node
 ```
-cd ./workloads/flight-schedules
-export TEST_URI="postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer"
-export TEST_NAME="pooling"
-export TXN_POOLONG="true"
-./run_workloads.sh 1024 4
-cd ../../
+declare -A HA_NODE_IP
+
+for region in "${REGIONS[@]}"; do
+  for idx in $(seq 1 "$NODES_PER_REGION"); do
+    NODE="ha-node-${region}-${idx}"
+
+    IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$NODE")
+
+    echo "$NODE → $IP"
+    HA_NODE_IP["$region-$idx"]="$IP"
+  done
+done
+
+echo "IP of us-east-2 = ${HA_NODE_IP["us-east-2"]}"
 ```
-You can tail the files in the logs directory or open another terminal and run ```docker logs -f dbw-1```
 
-And a summary of the test results for one of the workers is outlined below...
+Then store the lines for /etc/hosts in each region
 ```
->>> Worker 2 (logs/results_pooling_20251124_112750_w2.log)
-run_name       Transactions.20251124_163632
-start_time     2025-11-24 16:36:32
-end_time       2025-11-24 16:52:15
-test_duration  943
--------------  ----------------------------
+declare -A REGION_HOST_LINES
 
-┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬───────────┬───────────┬───────────┬───────────┐
-│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │   p90(ms) │   p95(ms) │   p99(ms) │   max(ms) │
-├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼───────────┼───────────┼───────────┼───────────┤
-│       943 │ __cycle__ │       256 │     8,192 │           8 │  11,414.60 │ 12,042.02 │ 18,588.54 │ 19,930.02 │ 23,604.97 │ 30,338.06 │
-│       943 │ inventory │       256 │     8,192 │           8 │   4,229.09 │  5,523.68 │  6,920.91 │  7,306.32 │  8,271.57 │  9,794.34 │
-│       943 │ price     │       256 │     8,192 │           8 │   1,392.88 │      0.17 │  6,174.45 │  6,699.51 │  7,639.12 │  9,421.30 │
-│       943 │ schedule  │       256 │     8,192 │           8 │     587.61 │      0.02 │  2,184.39 │  5,941.49 │  7,115.41 │  9,360.13 │
-│       943 │ status    │       256 │     8,192 │           8 │   5,097.94 │  5,863.56 │  7,019.48 │  7,412.84 │  8,445.82 │  9,534.36 │
-└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴───────────┴───────────┴───────────┴───────────┘
+for region in "${REGIONS[@]}"; do
+  lines=""
+  for idx in $(seq 1 "$NODES_PER_REGION"); do
+    key="${region}-${idx}"
+    node="ha-node-${region}-${idx}"
+    ip="${HA_NODE_IP[$key]}"
+    lines+="${ip} ${node}\n"
+  done
+  REGION_HOST_LINES["$region"]="$lines"
+done
 
-Parameter      Value
--------------  -------------------------------------------------------------------------------------------------------------------------------------
-workload_path  /work/transactions.py
-conn_params    {'conninfo': 'postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer&application_name=Transactions', 'autocommit': True}
-conn_extras    {}
-concurrency    256
-duration
-iterations     8192
-ramp           0
-args           {'schedule_freq': 10, 'status_freq': 90, 'inventory_freq': 75, 'price_freq': 25, 'batch_size': 64, 'delay': 100, 'txn_pooling': True}
+echo "etc hosts for us-east = ${REGION_HOST_LINES["us-east"]}"
+```
+
+And finally update the nodes in each region with their sibling hosts
+```
+for region in "${REGIONS[@]}"; do
+  host_lines="${REGION_HOST_LINES[$region]}"
+
+  for idx in $(seq 1 "$NODES_PER_REGION"); do
+    NODE="ha-node-${region}-${idx}"
+
+    echo "Updating /etc/hosts inside ${NODE} for region ${region}..."
+
+    docker exec -i "${NODE}" bash -lc "
+      set -e
+      cp /etc/hosts /etc/hosts.bak
+
+      # Remove existing entries for THIS region's ha-nodes
+      awk '!/\bha-node-${region}-/' /etc/hosts > /tmp/hosts
+
+      # Prepend fresh mappings for this region's nodes
+      printf '${host_lines}' | cat - /tmp/hosts > /etc/hosts
+
+      echo 'Resolution for regional nodes now:'
+      $(for i in $(seq 1 "$NODES_PER_REGION"); do
+          echo "getent hosts ha-node-${region}-${i} || true"
+        done)
+
+      echo 'HEAD of /etc/hosts:'
+      sed -n '1,10p' /etc/hosts
+    "
+  done
+done
+
+docker exec -it ha-node-us-east-1 bash -lc 'hostname -f; getent hosts ha-node-us-east-2'
 ```
 </details>
 
-### Interpretation
 <details>
-<summary>more info...</summary>
+<summary>5. Configure Corosync with UDPU instead of multi-cast</summary>
 
-From the client’s perspective, both the direct-connection and managed-connection (PgBouncer) executions completed the same total number of operations:
-- **8192 operations per worker**
-- **256 concurrent threads**
-- **4 workers**
-- **~1024 total concurrency**
+**Why UDPU?**
+Docker/Colima often block multicast; UDPU (unicast) avoids that and stabilizes the Corosync ring.
 
-But the client-side latency profile inside those fixed iterations is dramatically different:
-
-**1. Mean latency per operation drops substantially with PgBouncer**
-
-For example:
-
-| Operation | Direct Mean (ms) | Pooled Mean (ms) | Improvement |
-| ------------- | ------------- | ------------- | ------------- |
-| cycle | 27,418 ms | 11,414 ms | ~58% faster |
-| inventory | 10,100 ms | 4,229 ms | ~58% faster |
-| price | 3,302 ms | 1,392 ms | ~58% faster |
-| schedule | 1,375 ms | 587 ms | ~57% faster |
-| status | 12,526 ms | 5,098 ms | ~59% faster |
-
-That pattern is consistent across **all** event types:<br/>
-client-side work is ~50–60% faster under pooled connections.
-
-**2. Tail latencies (p90–p99) shrink even more dramatically**
-
-Direct connections exhibit very large long-tail behavior:
-- **p95 up to ~57 seconds**
-- **p99 up to ~73 seconds**
- - **max > 2 minutes**
-
-Under managed connections:
-- **p95 typically under 8 seconds**
-- **p99 under 10 seconds**
-- **max ~9 seconds**
-
-This is a **10×–20×** reduction in tail latency.
-
-Why?
-
-Because CockroachDB is handling far fewer active backend sessions, so:
-- fewer competing goroutines
-- fewer pgwire buffers
-- fewer session-level memory contexts
-- less scheduler pressure
-- far fewer concurrent KV requests
-- fewer write queues forming
-
-The client sees more predictable, more stable response times as a direct result.
-</details>
-
-## Train Events
-This workload simulates the ingestion, processing, state-transition, and archival lifecycle of train and track-management events using realistic multi-event ACID transactions that stress both concurrency control and JSON-heavy data paths.
-
-It is a **multi-event transactional workload** designed to simulate the operational data flow of a modern railway control, dispatching, and track-management system.
-It exercises a realistic mix of **read**, **write**, and **state-transition** operations that occur as trains move across a network, infrastructure states change, and control systems emit telemetry or directives.
-
-The workload models three primary interaction patterns:
-
-### 1. Event Ingestion Transactions
-<details>
-<summary>more info...</summary>
-
-Each transaction inserts a **batch of 10–100 synthetic railway events**, such as route authorizations, signal clearances, speed restrictions, switch position changes, position updates, and infrastructure condition reports.
-Every event is written atomically alongside a corresponding status record, simulating upstream publish or capture systems generating operational messages.
-</details>
-
-### 2. Event Processing Transactions
-<details>
-<summary>more info...</summary>
-
-Batches of events in PENDING or PROCESSING states are selected with **row-level locking**, updated, and advanced through their lifecycle.
-
-The workload includes:
-- **FOR UPDATE** row locking
-- Application of business logic modifications to the event payload
-- State machine transitions (e.g., PENDING → PROCESSING → COMPLETE)
-
-This represents downstream consumers such as dispatch systems, safety logic, or orchestration services that process operational rail messages concurrently.
-</details>
-
-### 3. Archival Transactions
-<details>
-<summary>more info...</summary>
-
-Events that reach a terminal state are **bulk-archived** into a history table and then removed from the primary tables as part of a single ACID transaction.
-This simulates data movement pipelines—ETL, retention policies, or system rollups—that extract completed operational events to long-term storage.
-</details>
-
-### What This Workload Demonstrates
-<details>
-<summary>more info...</summary>
-
-- **Contention behavior** under multi-row, multi-statement transactions
-- **Impact of JSONB vs TEXT** for storing and processing nested operational documents
-- **Concurrency control patterns** (locks, retries, write–write conflicts)
-- **End-to-end lifecycle simulation** of operational messages in a real dispatching or control system
-- **Mixed read/write access** across hot rows and rolling windows of recent events
-- **Batch-oriented transactional throughput** similar to real event-driven systems
-</details>
-
-### Option 1: JSONB (generated columns + inverted index)
-<details>
-<summary>more info...</summary>
-
-**Best for**: Flexible schema, deep JSON querying, analytics on nested structures.
-
-**Benefits**
-- Automatic extraction of important fields via **generated columns** (event_type, authority_id, train_id).
-- **Inverted index** enables fast, ad-hoc filtering on arbitrary JSON paths.
-- Ideal when downstream systems need to query or filter deeply within the JSON payload.
-- Schema changes require no DDL — the payload can evolve naturally.
-
-**Trade-offs**
-- **Highest write amplification**: inserting/updating a JSONB document touches many KV keys.
-- **Most contention** under concurrency because the inverted index widens each transaction’s “footprint.”
-- **Slowest throughput** and longest latency in write-heavy workloads.
-- Payload updates require JSON tree rewrites rather than simple string replacement.
-
-In write-heavy queue-style systems, JSONB provides powerful read/query features, but those features come with real performance cost.
-</details>
-
-### Option 2: JSONB-Manual (explicit columns, no inverted index)
-<details>
-<summary>more info...</summary>
-
-**Best for**: Keeping structured JSON payloads while dramatically reducing write cost and contention.
-
-**Benefits**
-- Still stores payload as **JSONB**, preserving structure and downstream flexibility.
-- Removes the inverted index, eliminating the largest source of write amplification.
-- Flat columns (event_type, authority_id, train_id) are populated explicitly, leading to predictable indexing & performance.
-- Faster than full JSONB on inserts/updates; lower contention footprint.
-
-**Trade-offs**
-- Application must **extract and populate flat columns manually**, adding logic complexity.
-- No inverted index, therefore you cannot efficiently query arbitrary nested fields.
-- JSON structure is preserved, but now acts mostly as a storage envelope, not an indexed query surface.
-- And we're still encoding and decoding JSON, incurring additional overhead on every read and write operation.
-
-JSONB-Manual gives you the shape and flexibility of JSONB, but you're paying the storage costs without the benefit of .
-</details>
-
-### Option 3: TEXT (string payload + generated columns)
-<details>
-<summary>more info...</summary>
-
-**Best for**: High-throughput OLTP, event queues, ingestion scenarios, heavy write workloads.
-
-**Benefits**
-- **Fastest** of all three workloads by a large margin in high-concurrency environments.
-- Almost no write amplification; replacing a string is cheap.
-- Minimal contention footprint; best throughput under load.
-- Generated columns still allow simple field extraction without touching the JSON payload structure.
-
-**Trade-offs**
-- Payload is stored as a raw string, CRDB will not understand the internal structure.
-- No JSON operators or path-based filtering unless you cast to JSONB ad-hoc.
-- No inverted index, therefore you must index fields explicitly (via generated columns or application logic).
-
-TEXT is ideal when payloads are treated as **opaque blobs** and write throughput matters more than JSON queryability.
-</details>
-
-### Summary of Options
-<details>
-<summary>more info...</summary>
-
-| Feature / Concern | JSONB (full) | JSONB-Manual | TEXT |
-| ------------- | ------------- | ------------- | ------------- |
-| Write speed | Slowest | Medium | Fastest |
-| Contention footprint | Highest | Medium-Low | Lowest |
-| Inverted index | Yes | No | No |
-| Deep JSON querying | Best | None (unless manually added) | None (unless cast to JSONB) |
-| Schema flexibility | High | Medium-High | Medium |
-| App logic complexity | Lowest | Higher (manual extraction) | Lowest |
-| Best use case | Analytics / deep filtering / JSON-native storage | Structured JSON storage without index overhead | High-throughput ingestion / queue workloads |
-
-**JSONB** is the most flexible but the most expensive for writes.
-**JSONB-Manual** is a balanced choice: structured payloads, lower write cost, predictable indexing.
-**TEXT** is the clear winner for raw throughput and minimal contention in write-heavy pipelines.
-</details>
-
-### Initial Schema
-<details>
-<summary>more info...</summary>
-
-First we'll execute the sql to create a sample schema and load some data into it.
+First generate and distribute an authkey for each region:
 ```
-cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -f ./workloads/train-events/initial-schema.sql
-cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -f ./workloads/train-events/populate-sample-data.sql
+for region in "${REGIONS[@]}"; do
+  SEED_NODE="ha-node-${region}-1"
+
+  echo "Generating authkey on seed node ${SEED_NODE} for region ${region}..."
+  docker exec -it "${SEED_NODE}" bash -lc '
+    corosync-keygen -l
+    chmod 400 /etc/corosync/authkey
+  '
+
+  KEY64=$(docker exec "${SEED_NODE}" bash -lc "base64 -w0 /etc/corosync/authkey")
+
+  for idx in $(seq 1 "$NODES_PER_REGION"); do
+    NODE="ha-node-${region}-${idx}"
+    if [[ "${NODE}" == "${SEED_NODE}" ]]; then
+      continue
+    fi
+
+    echo "Copying authkey for region ${region} to ${NODE}..."
+    docker exec -i "${NODE}" bash -lc "
+      umask 177
+      echo '${KEY64}' | base64 -d > /etc/corosync/authkey
+      chmod 400 /etc/corosync/authkey
+    "
+  done
+done
 ```
 
-Then permission access to the tables for our pgbouncer client.
+Then write the following config on both nodes for two-node quorum tuning in each region:
 ```
-cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -e """
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE defaultdb.* TO pgb;
-"""
+for region in "${REGIONS[@]}"; do
+  # For a 2-node cluster per region
+  IP1="${HA_NODE_IP["${region}-1"]}"
+  IP2="${HA_NODE_IP["${region}-2"]}"
+
+  NODE1="ha-node-${region}-1"
+  NODE2="ha-node-${region}-2"
+
+  echo "Configuring corosync for region ${region}:"
+  echo "  ${NODE1} → ${IP1}"
+  echo "  ${NODE2} → ${IP2}"
+
+  CONF=$(cat <<EOF
+totem {
+    version: 2
+    cluster_name: ha-cluster-${region}
+    transport: knet
+    token: 5000
+    token_retransmits_before_loss_const: 10
+    join: 60
+    max_messages: 20
+    secauth: on
+    crypto_cipher: aes256
+    crypto_hash: sha256
+}
+
+nodelist {
+    node {
+        nodeid: 1
+        name: ${NODE1}
+        ring0_addr: ${IP1}
+        link {
+            addr: ${IP1}
+        }
+    }
+    node {
+        nodeid: 2
+        name: ${NODE2}
+        ring0_addr: ${IP2}
+        link {
+            addr: ${IP2}
+        }
+    }
+}
+
+quorum {
+    provider: corosync_votequorum
+    two_node: 1
+    wait_for_all: 1
+    auto_tie_breaker: 1
+    last_man_standing: 1
+}
+
+logging {
+    to_stderr: no
+    to_logfile: yes
+    logfile: /var/log/corosync/corosync.log
+    to_syslog: yes
+    debug: off
+    timestamp: on
+}
+EOF
+)
+
+  # Copy the same config to both nodes in this region
+  for NODE in "${NODE1}" "${NODE2}"; do
+    echo "  → writing /etc/corosync/corosync.conf on ${NODE}"
+    docker exec -i "${NODE}" bash -lc 'cat > /etc/corosync/corosync.conf' <<<"$CONF"
+  done
+
+  # Validate config on each node
+  for NODE in "${NODE1}" "${NODE2}"; do
+    echo "  → validating corosync config on ${NODE}"
+    docker exec -it "${NODE}" bash -lc 'corosync -f -t && echo "Config OK on $(hostname -f)"'
+  done
+
+done
+```
+
+Then start the cluster stack in each region:
+```
+for region in "${REGIONS[@]}"; do
+  echo "=== Starting Corosync/Pacemaker in region ${region} ==="
+
+  for idx in $(seq 1 "$NODES_PER_REGION"); do
+    NODE="ha-node-${region}-${idx}"
+
+    echo "Configuring corosync service override on ${NODE}..."
+
+    docker exec -it "$NODE" bash -lc '
+      mkdir -p /etc/systemd/system/corosync.service.d &&
+      cat > /etc/systemd/system/corosync.service.d/override.conf <<EOF
+[Service]
+# wipe packaged ExecStart, then set ours explicitly
+ExecStart=
+ExecStart=/usr/sbin/corosync -f -c /etc/corosync/corosync.conf
+EnvironmentFile=
+EOF
+      systemctl daemon-reload
+      systemctl restart corosync
+    '
+  done
+
+  echo "Enabling corosync + pacemaker on region ${region} nodes..."
+  for idx in $(seq 1 "$NODES_PER_REGION"); do
+    NODE="ha-node-${region}-${idx}"
+
+    docker exec -it "$NODE" bash -lc '
+      systemctl enable --now corosync pacemaker
+    '
+  done
+done
+```
+
+And check the cluster status per region:
+```
+for region in "${REGIONS[@]}"; do
+  echo "=== Corosync status for region ${region} ==="
+
+  for idx in $(seq 1 "$NODES_PER_REGION"); do
+    NODE="ha-node-${region}-${idx}"
+    echo "--- ${NODE} ---"
+    docker exec -it "$NODE" bash -lc '
+      echo "# corosync-cfgtool -s"
+      corosync-cfgtool -s || echo "corosync-cfgtool failed"
+
+      echo
+      echo "# tail corosync.log (last 50 lines)"
+      tail -n 50 /var/log/corosync/corosync.log || true
+
+      echo
+      echo "# pcs status (if pcs is installed/configured)"
+      pcs status || echo "pcs not yet configured or not installed"
+    '
+  done
+done
 ```
 </details>
 
-### dbworkload
 <details>
-<summary>more info...</summary>
+<summary>6. Bootstrap pacemaker properties but temporarily relax fencing/quorum across the regions</summary>
 
-This is a tool we use to simulate data flowing into cockroach, developed by one of our colleagues with python.  We can install the tool with ```pip3 install "dbworkload[postgres]"```, and then add it to your path.  On Mac or Linux with Bash you can use:
 ```
-echo -e '\nexport PATH=`python3 -m site --user-base`/bin:$PATH' >> ~/.bashrc 
-source ~/.bashrc
+for region in "${REGIONS[@]}"; do
+  SEED_NODE="ha-node-${region}-1"
+
+  echo "=== Setting Pacemaker properties in region ${region} (via ${SEED_NODE}) ==="
+
+  docker exec -it "${SEED_NODE}" bash -lc '
+    # Disable STONITH (fencing) for now
+    pcs property set stonith-enabled=false
+
+    # Ignore quorum loss (OK for 2-node lab/demo, not for prod)
+    pcs property set no-quorum-policy=ignore
+
+    echo
+    echo "Cluster properties:"
+    pcs property show
+
+    echo
+    echo "Cluster status:"
+    pcs status
+  '
+done
 ```
-For Windows you can add the location of the dbworkload.exe file (i.e. C:\Users\myname\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.9_abcdefghijk99\LocalCache\local-packages\Python39\Scripts) to your Windows Path environment variable.  The pip command above should provide the exact path to your local python executables.
+Should report both nodes Online in each region: i.e. [ ha-node-us-east-1 ha-node-us-east-2 ].
+</details>
 
-We can control the velocity and volume of the workload with a few properties described below.
-* num_connections: we'll simulate the workload across a number of processes
-* duration: the number of minutes for which we want to run the simulation
-* iterations: or use the number of executions for each loop of the simulation
-* min_batch_size: the minimum number of events we want to process in a single transaction
-* max_batch_size: the maximum number of events we want to process in a single transaction
-* delay: the number of milliseconds we should pause between transactions, so we don't overload admission controls
+<details>
+<summary>7. Create the VIP inside the Docker network for each region</summary>
 
-These parameters are set in the run_workloads.sh script.  We'll run multiple workers to simulate client apps (from a docker container) that run concurrently to process the total workload, each with a proportion of the total connection pool.  We'll pass the following parameters to the workload script.
-* connection string: this is the uri we'll used to connect to the database
-* test name: identifies the name of the test in the logs, i.e. direct
-* txn poolimg: true if connections should be bound to the transaction, false for session
-* total connections: the total number of connections we want to simulate across all workers
-* num workers: the number of instances we want to spread the workload across
-
-To execute the tests in docker we'll need to publish our python dependencies
+We picked 172.18.0.251|2|3/24; NIC is eth0 inside these containers:
 ```
-cd ./workloads/train-events
-pip freeze > requirements.txt
-sed -E '/^(pyobjc-core|pyobjc-framework-Cocoa|py2app|rumps|macholib|tensorflow-macos|tensorflow-metal)(=|==)/d' \
-  requirements.txt > requirements-runner.txt
-cd ../../
+declare -A REGION_VIP
+REGION_VIP["us-east"]="172.18.0.251"
+REGION_VIP["us-central"]="172.18.0.252"
+REGION_VIP["us-west"]="172.18.0.253"
+
+for region in "${REGIONS[@]}"; do
+  SEED_NODE="ha-node-${region}-1"
+  VIP="${REGION_VIP[$region]}"
+
+  echo "=== Creating VIP for region ${region}: ${VIP} on ${SEED_NODE} ==="
+
+  docker exec -it "${SEED_NODE}" bash -lc "
+    pcs resource create vip-${region} ocf:heartbeat:IPaddr2 \
+      ip=${VIP} cidr_netmask=24 nic=eth0 \
+      op monitor interval=30s
+
+    echo
+    echo 'Resources in region ${region}:'
+    pcs status resources
+  "
+done
 ```
 </details>
 
-### Direct Connections
 <details>
-<summary>more info...</summary>
+<summary>8. Configure HAProxy and colocate it with the VIP</summary>
 
-Then we can use our workload script to simulate the workload going directly against the database running on our host machine.
+Push a simple pgsql TCP LB config to both nodes:
 ```
-cd ./workloads/train-events
-export TEST_URI="postgresql://pgb:secret@host.docker.internal:26257/defaultdb?sslmode=prefer"
-export TEST_NAME="direct"
-export TXN_POOLONG="false"
-./run_workloads.sh 512 4
-cd ../../
-```
-You can tail the files in the logs directory or open another terminal and run ```docker logs -f dbw-1```
+for region in "${REGIONS[@]}"; do
+  echo "=== Configuring HAProxy for region ${region} ==="
 
-A summary of the test results for one of the workers is outlined below...
+  # HAProxy sees the PgBouncer containers by name on the dcp-net
+  PGB1="pgbouncer-${region}-1"
+  PGB2="pgbouncer-${region}-2"
 
-**Using JSONB Fields**
-```
->>> Worker 2 (logs/results_direct_jsonb_20251205_145706_w2.log)
-run_name       Transactionsjsonb.20251205_200518
-start_time     2025-12-05 20:05:18
-end_time       2025-12-05 21:20:07
-test_duration  4489
--------------  ---------------------------------
+  # Build a region-specific haproxy.cfg in /tmp
+  CFG_FILE="/tmp/haproxy-${region}.cfg"
 
-┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬────────────┬────────────┬────────────┬──────────────┬──────────────┐
-│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │    p50(ms) │    p90(ms) │    p95(ms) │      p99(ms) │      max(ms) │
-├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼────────────┼────────────┼────────────┼──────────────┼──────────────┤
-│     4,489 │ __cycle__ │       128 │     2,048 │           0 │ 235,245.13 │ 113,206.62 │ 604,262.01 │ 908,883.74 │ 1,528,382.15 │ 3,570,055.79 │
-│     4,489 │ add       │       128 │     2,048 │           0 │  26,336.08 │  14,481.14 │  67,278.95 │ 104,525.78 │   137,686.78 │   187,292.17 │
-│     4,489 │ archive   │       128 │     2,048 │           0 │  11,692.34 │   2,589.12 │  23,553.94 │  45,738.02 │   104,572.07 │   765,235.72 │
-│     4,489 │ process   │       128 │     2,048 │           0 │ 197,110.51 │  81,868.00 │ 547,268.41 │ 848,393.07 │ 1,481,179.72 │ 3,389,565.89 │
-└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴────────────┴────────────┴────────────┴──────────────┴──────────────┘
+  cat > "${CFG_FILE}" <<CFG
+global
+    log stdout format raw daemon
+    maxconn 200000
+    nbthread 4
+    tune.maxaccept 100
 
-Parameter      Value
--------------  --------------------------------------------------------------------------------------------------------------------------------------------------
-workload_path  /work/transactionsJsonb.py
-conn_params    {'conninfo': 'postgresql://pgb:secret@host.docker.internal:26257/defaultdb?sslmode=prefer&application_name=Transactionsjsonb', 'autocommit': True}
-conn_extras    {}
-concurrency    128
-duration
-iterations     2048
-ramp           0
-args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': False}
-```
+defaults
+    log     global
+    mode    tcp
+    option  tcplog
+    maxconn 100000
+    timeout connect 5s
+    timeout client  180s
+    timeout server  180s
+    option  tcpka
 
-**Versus Manual JSONB**
-```
->>> Worker 2 (logs/results_direct_manual_20251205_145706_w2.log)
-run_name       Transactionsmanual.20251205_213022
-start_time     2025-12-05 21:30:22
-end_time       2025-12-05 21:44:21
-test_duration  839
--------------  ----------------------------------
+listen stats
+    bind *:8404
+    mode http
+    stats enable
+    stats uri /stats
+    stats refresh 5s
 
-┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬────────────┬────────────┬────────────┬────────────┐
-│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │    p90(ms) │    p95(ms) │    p99(ms) │    max(ms) │
-├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼────────────┼────────────┼────────────┼────────────┤
-│       839 │ __cycle__ │       128 │     2,048 │           2 │  46,614.11 │ 25,231.53 │ 116,763.49 │ 158,155.35 │ 250,885.12 │ 412,646.54 │
-│       839 │ add       │       128 │     2,048 │           2 │   2,911.16 │  1,645.64 │   7,452.17 │   9,401.98 │  16,640.97 │  19,200.30 │
-│       839 │ archive   │       128 │     2,048 │           2 │   1,728.39 │    402.20 │   5,001.33 │   8,154.21 │  13,622.89 │  87,210.63 │
-│       839 │ process   │       128 │     2,048 │           2 │  41,873.37 │ 20,207.13 │ 110,347.16 │ 148,431.61 │ 241,987.39 │ 412,164.05 │
-└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴────────────┴────────────┴────────────┴────────────┘
+frontend pgsql_in
+    bind *:5432
+    default_backend pgb_pool
 
-Parameter      Value
--------------  ---------------------------------------------------------------------------------------------------------------------------------------------------
-workload_path  /work/transactionsManual.py
-conn_params    {'conninfo': 'postgresql://pgb:secret@host.docker.internal:26257/defaultdb?sslmode=prefer&application_name=Transactionsmanual', 'autocommit': True}
-conn_extras    {}
-concurrency    128
-duration
-iterations     2048
-ramp           0
-args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': False}
+backend pgb_pool
+    mode tcp
+    balance leastconn
+    option  tcp-check
+    default-server init-addr libc,none inter 2s fall 3 rise 2 fastinter 1s
+    # regional PgBouncer endpoints
+    server pgb1 ${PGB1}:5432 check
+    server pgb2 ${PGB2}:5432 check
+CFG
+
+  # Copy this config into both HA nodes in the region
+  for idx in $(seq 1 "$NODES_PER_REGION"); do
+    NODE="ha-node-${region}-${idx}"
+    echo "  → pushing haproxy.cfg to ${NODE}"
+    docker cp "${CFG_FILE}" "${NODE}:/etc/haproxy/haproxy.cfg"
+  done
+
+  # Enable and start HAProxy on both nodes
+  for idx in $(seq 1 "$NODES_PER_REGION"); do
+    NODE="ha-node-${region}-${idx}"
+    echo "  → enabling and starting haproxy on ${NODE}"
+    docker exec -it "${NODE}" bash -lc 'systemctl enable --now haproxy && systemctl is-active haproxy'
+  done
+
+done
 ```
 
-**Versus Text Fields**
+Add HAProxy as a Pacemaker resource and colocate with VIP in each region:
 ```
->>> Worker 2 (logs/results_direct_text_20251205_145706_w2.log)
-run_name       Transactionstext.20251205_215423
-start_time     2025-12-05 21:54:23
-end_time       2025-12-05 22:05:47
-test_duration  684
--------------  --------------------------------
+for region in "${REGIONS[@]}"; do
+  SEED_NODE="ha-node-${region}-1"
 
-┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬───────────┬────────────┬────────────┬────────────┐
-│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │   p90(ms) │    p95(ms) │    p99(ms) │    max(ms) │
-├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼───────────┼────────────┼────────────┼────────────┤
-│       684 │ __cycle__ │       128 │     2,048 │           2 │  36,799.64 │ 21,470.48 │ 92,092.69 │ 128,059.77 │ 211,407.33 │ 365,707.04 │
-│       684 │ add       │       128 │     2,048 │           2 │   2,239.95 │    929.97 │  6,626.54 │   8,106.83 │  12,630.61 │  14,414.35 │
-│       684 │ archive   │       128 │     2,048 │           2 │   3,700.88 │    677.17 │ 11,227.06 │  19,723.95 │  33,162.44 │ 110,019.48 │
-│       684 │ process   │       128 │     2,048 │           2 │  30,754.82 │ 13,636.28 │ 82,801.00 │ 119,674.83 │ 208,971.75 │ 354,919.80 │
-└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴───────────┴────────────┴────────────┴────────────┘
+  echo "=== Creating HAProxy resource and constraints for region ${region} ==="
 
-Parameter      Value
--------------  -------------------------------------------------------------------------------------------------------------------------------------------------
-workload_path  /work/transactionsText.py
-conn_params    {'conninfo': 'postgresql://pgb:secret@host.docker.internal:26257/defaultdb?sslmode=prefer&application_name=Transactionstext', 'autocommit': True}
-conn_extras    {}
-concurrency    128
-duration
-iterations     2048
-ramp           0
-args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': False}
+  docker exec -it "${SEED_NODE}" bash -lc "
+    # Create HAProxy as a systemd resource
+    pcs resource create haproxy-${region} systemd:haproxy op monitor interval=10s
+
+    # Ensure VIP starts before HAProxy
+    pcs constraint order start vip-${region} then haproxy-${region}
+
+    # Ensure HAProxy always runs on the node that owns the VIP
+    pcs constraint colocation add haproxy-${region} with vip-${region} INFINITY
+
+    echo
+    echo 'Cluster resources for region ${region}:'
+    pcs status resources
+  "
+done
 ```
 </details>
 
-### Managed Connections
 <details>
-<summary>more info...</summary>
+<summary>9. Test from a client container on the same network</summary>
 
-We can simulate the workload again, this time using our PgBouncer HA cluster with transaction pooling, but we'll have to disable prepared statements due to connection multiplexing between clients.
+Your host can’t reach the VIP so we'll test from another container inside dcp-net.
 ```
-cd ./workloads/train-events
-export TEST_URI="postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer"
-export TEST_NAME="pooling"
-export TXN_POOLONG="true"
-./run_workloads.sh 512 4
-cd ../../
-```
-You can tail the files in the logs directory or open another terminal and run ```docker logs -f dbw-1```
+for region in "${REGIONS[@]}"; do
+  VIP="${REGION_VIP[$region]}"
 
-And a summary of the test results for one of the workers is outlined below...
+  echo "=== Testing region ${region} via VIP ${VIP} ==="
 
-**Using JSONB Fields**
-```
->>> Worker 2 (logs/results_pooling_jsonb_20251205_171253_w2.log)
-run_name       Transactionsjsonb.20251205_222037
-start_time     2025-12-05 22:20:37
-end_time       2025-12-05 23:38:12
-test_duration  4655
--------------  ---------------------------------
-
-┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬────────────┬────────────┬────────────┬────────────┬────────────┐
-│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │    p50(ms) │    p90(ms) │    p95(ms) │    p99(ms) │    max(ms) │
-├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼────────────┼────────────┼────────────┼────────────┼────────────┤
-│     4,655 │ __cycle__ │       128 │     2,048 │           0 │ 288,712.61 │ 286,967.91 │ 350,116.72 │ 359,988.52 │ 375,841.83 │ 475,557.90 │
-│     4,655 │ add       │       128 │     2,048 │           0 │  84,617.07 │  81,069.30 │ 130,454.07 │ 144,062.69 │ 157,494.96 │ 168,891.45 │
-│     4,655 │ archive   │       128 │     2,048 │           0 │  91,835.67 │  91,520.36 │ 116,591.05 │ 122,029.38 │ 132,162.56 │ 237,160.00 │
-│     4,655 │ process   │       128 │     2,048 │           0 │ 112,159.25 │ 108,681.20 │ 147,030.65 │ 156,819.09 │ 167,366.98 │ 216,535.58 │
-└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴────────────┴────────────┴────────────┴────────────┴────────────┘
-
-Parameter      Value
--------------  -----------------------------------------------------------------------------------------------------------------------------------------
-workload_path  /work/transactionsJsonb.py
-conn_params    {'conninfo': 'postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer&application_name=Transactionsjsonb', 'autocommit': True}
-conn_extras    {}
-concurrency    128
-duration
-iterations     2048
-ramp           0
-args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': True}
-```
-
-**Versus Manual JSONB**
-```
->>> Worker 2 (logs/results_pooling_manual_20251205_171253_w2.log)
-run_name       Transactionsmanual.20251205_234809
-start_time     2025-12-05 23:48:09
-end_time       2025-12-06 00:05:27
-test_duration  1038
--------------  ----------------------------------
-
-┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬───────────┬───────────┬───────────┬───────────┐
-│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │   p90(ms) │   p95(ms) │   p99(ms) │   max(ms) │
-├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼───────────┼───────────┼───────────┼───────────┤
-│     1,038 │ __cycle__ │       128 │     2,048 │           1 │  28,116.17 │ 28,110.66 │ 32,341.83 │ 33,583.76 │ 36,051.07 │ 38,847.89 │
-│     1,038 │ add       │       128 │     2,048 │           1 │   4,891.30 │  4,741.76 │  7,081.66 │  8,026.68 │ 10,923.60 │ 17,005.71 │
-│     1,038 │ archive   │       128 │     2,048 │           1 │  10,718.30 │ 10,518.72 │ 15,517.76 │ 16,769.48 │ 18,854.50 │ 20,523.07 │
-│     1,038 │ process   │       128 │     2,048 │           1 │  12,406.43 │ 12,354.42 │ 16,327.43 │ 17,693.94 │ 20,130.97 │ 22,613.52 │
-└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴───────────┴───────────┴───────────┴───────────┘
-
-Parameter      Value
--------------  ------------------------------------------------------------------------------------------------------------------------------------------
-workload_path  /work/transactionsManual.py
-conn_params    {'conninfo': 'postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer&application_name=Transactionsmanual', 'autocommit': True}
-conn_extras    {}
-concurrency    128
-duration
-iterations     2048
-ramp           0
-args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': True}
-```
-
-**Versus Text Fields**
-```
->>> Worker 2 (logs/results_pooling_text_20251205_171253_w2.log)
-run_name       Transactionstext.20251206_031550
-start_time     2025-12-06 03:15:50
-end_time       2025-12-06 03:23:14
-test_duration  444
--------------  --------------------------------
-
-┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬───────────┬───────────┬───────────┬───────────┐
-│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │   p90(ms) │   p95(ms) │   p99(ms) │   max(ms) │
-├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼───────────┼───────────┼───────────┼───────────┤
-│       444 │ __cycle__ │       128 │     2,048 │           4 │  25,978.44 │ 27,711.76 │ 34,419.31 │ 36,271.11 │ 40,399.79 │ 50,658.46 │
-│       444 │ add       │       128 │     2,048 │           4 │   7,051.76 │  6,871.03 │ 11,928.27 │ 13,341.34 │ 16,424.42 │ 19,118.48 │
-│       444 │ archive   │       128 │     2,048 │           4 │   8,393.76 │  8,083.32 │ 13,856.32 │ 15,753.56 │ 18,525.14 │ 19,966.52 │
-│       444 │ process   │       128 │     2,048 │           4 │  10,432.22 │ 10,413.02 │ 15,619.18 │ 17,436.47 │ 20,112.72 │ 28,476.41 │
-└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴───────────┴───────────┴───────────┴───────────┘
-
-Parameter      Value
--------------  ----------------------------------------------------------------------------------------------------------------------------------------
-workload_path  /work/transactionsText.py
-conn_params    {'conninfo': 'postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer&application_name=Transactionstext', 'autocommit': True}
-conn_extras    {}
-concurrency    128
-duration
-iterations     2048
-ramp           0
-args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': True}
+  docker run --rm -it \
+    --network dcp-net \
+    -v ./certs:/etc/pgbouncer/certs \
+    alpine sh -c "
+      apk add --no-cache postgresql15-client curl >/dev/null && \
+      echo 'Stats page:' && curl -s http://${VIP}:8404/stats | head -n 3 || true && \
+      echo && echo 'psql via VIP with TLS + client cert:' && \
+      psql \"postgresql://pgb@${VIP}:5432/defaultdb?sslmode=require&sslrootcert=/etc/pgbouncer/certs/ca.crt&sslcert=/etc/pgbouncer/certs/client.pgb.crt&sslkey=/etc/pgbouncer/certs/client.pgb.key\" -c 'show databases;' \
+    "
+done
 ```
 </details>
 
-### Interpretation
 <details>
-<summary>more info...</summary>
+<summary>10. Prove failover for the us-east region</summary>
+Move resources to node2
+```
+docker exec -it ha-node-us-east-1 bash -lc 'pcs resource move vip-us-east ha-node-us-east-2 && sleep 2 && pcs status'
+```
 
-**<ins>PART 1 - JSONB vs TEXT DATA TYPES</ins>**
+Check which node holds the VIP
+```
+VIP="${REGION_VIP[us-east]}"
+docker exec -it ha-node-us-east-1 bash -lc "ip addr show eth0 | grep ${VIP} || true"
+docker exec -it ha-node-us-east-2 bash -lc "ip addr show eth0 | grep ${VIP} || true"
+```
 
-The output from our testing shows that JSONB with inverted indexes is not a good match for a high-throughput event queue with heavy writes and no nested JSON querying.  JSONB without inverted indexes or TEXT (without the generated fields) is absolutely the right approach for this workload.
+Hit the VIP again (should still work)
+```
+docker run --rm -it \
+  --network dcp-net \
+  -v ./certs:/etc/pgbouncer/certs \
+  alpine sh -c "
+    apk add --no-cache postgresql15-client curl >/dev/null && \
+    psql \"postgresql://pgb@${VIP}:5432/defaultdb?sslmode=require&sslrootcert=/etc/pgbouncer/certs/ca.crt&sslcert=/etc/pgbouncer/certs/client.pgb.crt&sslkey=/etc/pgbouncer/certs/client.pgb.key\" -c 'show databases;' \
+  "
+```
+</details>
 
-**Mean Latency Comparison (per operation)**
-| Operation | JSONB Mean (ms) | Manual Mean (ms) | Improvement Without Inverted Index | TEXT Mean (ms) | Improvement When Using TEXT |
-| ------------- | ------------- | ------------- | ------------- | ------------- | ------------- |
-| add | 26,336 ms | 2,911 ms | ~89% faster | 2,239 ms | ~23% faster |
-| process | 197,110 ms | 41,873 ms | ~79% faster | 30,754 ms | ~27% faster |
-| archive | 11,692 ms | 1,728 ms | ~85% faster | 3,700 ms | ~53% slower |
-| cycle | 235,245 ms | 46,614 ms | ~80% faster | 36,799 ms | ~21% faster |
+<details>
+<summary>11. Enable dummy fencing for demonstration in each region.</summary>
 
-TEXT is *20-30%* faster depending on the phase, with the largest gains in the high-contention process stage.
+```
+for region in "${REGIONS[@]}"; do
+  SEED_NODE="ha-node-${region}-1"
+  HOST1="ha-node-${region}-1"
+  HOST2="ha-node-${region}-2"
 
-**Why is JSONB so much slower?**
+  echo "=== Configuring dummy fencing in region ${region} via ${SEED_NODE} ==="
 
-Using the CRDB metrics (statement activity & txn activity), several major factors become obvious:
-- JSONB updates rewrite **large structured documents**, whereas TEXT just replaces a blob
-- JSONB inverted indexes generate much higher **write amplification** (many more KV keys per write)
-- JSONB transactions create significantly **more contention** and **longer lock hold times**
-- JSONB ‘process’ operations often run ~1 second to multiple seconds per statement, while TEXT runs them in **tens of milliseconds**
+  docker exec -it "${SEED_NODE}" bash -lc "
+    # Turn STONITH back on (cluster-wide)
+    pcs property set stonith-enabled=true
 
-From the database metrics:
-- JSONB transactions show multi-minute average latencies in some cases, and heavy retry behavior (p99 5–10 seconds+)
-- TEXT transactions remain sub-second to low-second even under load
+    # Create a region-specific dummy fence device
+    pcs stonith create fence-demo-${region} fence_dummy pcmk_host_list='${HOST1} ${HOST2}'
 
-**<ins>PART 2 - DIRECT vs MANAGED CONNECTIONS</ins>**
+    echo
+    echo 'STONITH devices in region ${region}:'
+    pcs stonith show
 
-The output from our testing shows that we get much better throughput with managed connections, even with the larger payloads.  However, longer transaction times will tie up 
-those shared connections and you will see some latency while the client waits for a pooled connection to become available.  But it's far better to block at the client than to throttle performance on the database.  And we can always increase capacity if we need more connections.
+    echo
+    echo 'Cluster status:'
+    pcs status
+  "
+done
+```
+In real VMs/hardware, replace fence_dummy with IPMI/libvirt/cloud agents.
+</details>
 
-**Mean Latencies (per operation)**
-| Operation | Direct Cxn Mean | Managed Cxn Mean | Client Experience |
-| ------------- | ------------- | ------------- | ------------- |
-| add | 19,684 ms | 10,997 ms | ~44% faster |
-| process | 130,594 ms | 12,436 ms | ~90% faster |
-| archive | 17,618 ms | 10,810 ms | ~38% faster |
-| cycle | 167,998 ms | 34,344 ms | ~80% faster |
+<details>
+<summary>12. Some commands to verify status of HA cluster</summary>
 
-If we had more capacity in the dababase we could increase our connection pool size to meet demand and would see sub-second response times in the client for most of these transactions.  But even without that, **managed pooling reduces client-perceived mean latency by ~40–90%**, depending on the operation.
-
-The database behaves dramatically better when concurrency is controlled by PgBouncer, and the client sees faster completion of its total workload.  Here we did 2048 cycles in less than 10 minutes with managed transaction connections versus almost 52 minutes with session based connections.
-
-**Why is pooling so effective here?**
-
-Under Direct Connections:
-- High KV execution latency
-- High admission queue delays
-- Spiky WAL fsync latency
-- Many concurrent backends running expensive JSONB/TEXT updates
-- Significant retry behavior even with TEXT
-
-Under Managed Connections:
-- Database sees only ~64 active sessions (instead of 512)
-- Fewer active KV requests = **less contention**
-- Shorter lock durations = **fewer restarts**
-- Lower CPU scheduling pressure
-
-**External pooling protects the database from the client’s concurrency**, so fewer queries overlap, causing fewer RB conflicts and much lower overall latency.
-
-**<ins>SUMMARY OF WORKLOAD TESTING</ins>**
-
-A. JSONB vs TEXT Data Types:
-- TEXT is **40–90%** faster across all operations
-- JSONB’s write amplification, inverted-index maintenance, and structural costs significantly degrade throughput
-- JSONB workloads show much higher contention and long-tail latency
-- TEXT workloads show stable, predictable performance
-
-**JSONB is not appropriate for a write-heavy OLTP queue workload.**
-
-B. Direct vs Managed Connections:
-- Managed pooling makes client operations **40–90%** faster on average
-- Tail latency (p95/p99) improves **5–10×**
-- Database metrics show smoother CPU usage, lower contention, higher throughput
-- Client waits longer for pooled connections, but benefits from dramatically faster DB execution
-
-**Managed pooling is the superior deployment model for this workload.**
+```
+docker exec -it ha-node-us-east-1 bash -lc "pcs status"
+docker exec -it ha-node-us-east-1 bash -lc "corosync-cfgtool -s"
+docker exec -it ha-node-us-east-1 bash -lc "tail -n 100 /var/log/corosync/corosync.log"
+```
+</details>
 </details>
