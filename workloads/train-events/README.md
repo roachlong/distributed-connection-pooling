@@ -1,4 +1,13 @@
 # Train Events
+
+1. [Overview](#overview)
+1. [What This Workload Demonstrates](#what-this-workload-demonstrates)
+1. [Initial Setup](#initial-setup)
+1. [Direct Connections](#direct-connections)
+1. [Managed Connections](#managed-connections)
+1. [Interpretation](#interpretation)
+
+## Overview
 This workload simulates the ingestion, processing, state-transition, and archival lifecycle of train and track-management events using realistic multi-event ACID transactions that stress both concurrency control and JSON-heavy data paths.
 
 It is a **multi-event transactional workload** designed to simulate the operational data flow of a modern railway control, dispatching, and track-management system.
@@ -6,11 +15,11 @@ It exercises a realistic mix of **read**, **write**, and **state-transition** op
 
 The workload models three primary interaction patterns:
 
-## 1. Event Ingestion Transactions
+### 1. Event Ingestion Transactions
 Each transaction inserts a **batch of 10–100 synthetic railway events**, such as route authorizations, signal clearances, speed restrictions, switch position changes, position updates, and infrastructure condition reports.
 Every event is written atomically alongside a corresponding status record, simulating upstream publish or capture systems generating operational messages.
 
-## 2. Event Processing Transactions
+### 2. Event Processing Transactions
 Batches of events in PENDING or PROCESSING states are selected with **row-level locking**, updated, and advanced through their lifecycle.
 
 The workload includes:
@@ -20,7 +29,7 @@ The workload includes:
 
 This represents downstream consumers such as dispatch systems, safety logic, or orchestration services that process operational rail messages concurrently.
 
-## 3. Archival Transactions
+### 3. Archival Transactions
 Events that reach a terminal state are **bulk-archived** into a history table and then removed from the primary tables as part of a single ACID transaction.
 This simulates data movement pipelines—ETL, retention policies, or system rollups—that extract completed operational events to long-term storage.
 
@@ -32,7 +41,7 @@ This simulates data movement pipelines—ETL, retention policies, or system roll
 - **Mixed read/write access** across hot rows and rolling windows of recent events
 - **Batch-oriented transactional throughput** similar to real event-driven systems
 
-## Option 1: JSONB (generated columns + inverted index)
+### Option 1: JSONB (generated columns + inverted index)
 **Best for**: Flexible schema, deep JSON querying, analytics on nested structures.
 
 **Benefits**
@@ -49,7 +58,7 @@ This simulates data movement pipelines—ETL, retention policies, or system roll
 
 In write-heavy queue-style systems, JSONB provides powerful read/query features, but those features come with real performance cost.
 
-## Option 2: JSONB-Manual (explicit columns, no inverted index)
+### Option 2: JSONB-Manual (explicit columns, no inverted index)
 **Best for**: Keeping structured JSON payloads while dramatically reducing write cost and contention.
 
 **Benefits**
@@ -66,7 +75,7 @@ In write-heavy queue-style systems, JSONB provides powerful read/query features,
 
 JSONB-Manual gives you the shape and flexibility of JSONB, but you're paying the storage costs without the benefit of .
 
-## Option 3: TEXT (string payload + generated columns)
+### Option 3: TEXT (string payload + generated columns)
 **Best for**: High-throughput OLTP, event queues, ingestion scenarios, heavy write workloads.
 
 **Benefits**
@@ -82,7 +91,7 @@ JSONB-Manual gives you the shape and flexibility of JSONB, but you're paying the
 
 TEXT is ideal when payloads are treated as **opaque blobs** and write throughput matters more than JSON queryability.
 
-## Summary of Options
+### Summary of Options
 | Feature / Concern | JSONB (full) | JSONB-Manual | TEXT |
 | ------------- | ------------- | ------------- | ------------- |
 | Write speed | Slowest | Medium | Fastest |
@@ -97,7 +106,7 @@ TEXT is ideal when payloads are treated as **opaque blobs** and write throughput
 **JSONB-Manual** is a balanced choice: structured payloads, lower write cost, predictable indexing.
 **TEXT** is the clear winner for raw throughput and minimal contention in write-heavy pipelines.
 
-## Initial Schema
+## Initial Setup
 First we'll execute the sql to create a sample schema and load some data into it.
 ```
 cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -f ./workloads/train-events/initial-schema.sql
@@ -111,7 +120,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE defaultdb.* TO pgb;
 """
 ```
 
-## dbworkload
+### dbworkload
 This is a tool we use to simulate data flowing into cockroach, developed by one of our colleagues with python.  We can install the tool with ```pip3 install "dbworkload[postgres]"```, and then add it to your path.  On Mac or Linux with Bash you can use:
 ```
 echo -e '\nexport PATH=`python3 -m site --user-base`/bin:$PATH' >> ~/.bashrc 

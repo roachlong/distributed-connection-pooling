@@ -1,4 +1,13 @@
 # Flight Schedules
+
+1. [Overview](#overview)
+1. [What This Workload Demonstrates](#what-this-workload-demonstrates)
+1. [Initial Schema](#initial-setup)
+1. [Direct Connections](#direct-connections)
+1. [Managed Connections](#managed-connections)
+1. [Interpretation](#interpretation)
+
+## Overview
 This workload simulates the day-to-day lifecycle of airline flight schedules: generating flight plans, updating operational details, and serving read traffic that represents downstream planning, monitoring, and customer-facing systems.
 It focuses on **high-frequency, lightweight read/write transactions** that stress indexing, row-level updates, and concurrent access to time-based operational data.
 
@@ -6,7 +15,7 @@ It is a **simple, high-velocity transactional workload** designed to model the c
 
 The workload exercises three primary interaction patterns:
 
-## 1. Schedule Generation Transactions
+### 1. Schedule Generation Transactions
 These transactions create new flight schedule entries, representing upstream schedule-planning systems that continuously publish changes.
 
 Each insert models a single flight with structured attributes such as:
@@ -18,7 +27,7 @@ Each insert models a single flight with structured attributes such as:
 
 These operations simulate steady-state introduction of new flights into the operational window for a given day or period.
 
-## 2. Schedule Update Transactions
+### 2. Schedule Update Transactions
 Existing schedule records are selected and updated in place, simulating the frequent minor changes that occur throughout the day:
 - Departure time adjustments
 - Gate reassignments
@@ -32,7 +41,7 @@ These are **small, implicit read-modify-write** transactions:
 
 They represent load patterns from real-world operational control centers, partner data feeds, and automated synchronization services.
 
-## 3. Schedule Lookup Transactions
+### 3. Schedule Lookup Transactions
 These transactions issue low-latency point reads or small range scans—queries commonly used by:
 - Customer-facing flight-status APIs
 - Gate/terminal display systems
@@ -50,7 +59,7 @@ These reads stress index usage and concurrent access patterns across “hot” r
 - **Predictable ACID behavior** for small, frequent transactions
 - **Throughput and latency characteristics** under mixed operational load
 
-## Initial Schema
+## Initial Setup
 First we'll execute the sql to create a sample schema and load some data into it.
 ```
 cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -f ./workloads/flight-schedules/initial-schema.sql
@@ -64,7 +73,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE defaultdb.* TO pgb;
 """
 ```
 
-## dbworkload
+### dbworkload
 This is a tool we use to simulate data flowing into cockroach, developed by one of our colleagues with python.  We can install the tool with ```pip3 install "dbworkload[postgres]"```, and then add it to your path.  On Mac or Linux with Bash you can use:
 ```
 echo -e '\nexport PATH=`python3 -m site --user-base`/bin:$PATH' >> ~/.bashrc 

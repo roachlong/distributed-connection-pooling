@@ -1,0 +1,49 @@
+services:
+  # existing cockroach + pgbouncer + kafka definitions here...
+
+  request-generator:
+    build:
+      context: .
+      dockerfile: EventLogs.RequestGenerator/Dockerfile
+    environment:
+      EVENTLOGS_DB: "Host=pgbouncer;Port=6543;Database=optima;Username=app_user;Password=secret"
+      KAFKA_BOOTSTRAP: "kafka:9093"
+    depends_on:
+      - kafka
+      - pgbouncer
+
+  request-processor-us-east:
+    build:
+      context: .
+      dockerfile: EventLogs.RequestProcessor/Dockerfile
+    environment:
+      REGION: "us-east"
+      EVENTLOGS_DB: "Host=pgbouncer-us-east;Port=6543;Database=optima;Username=app_user;Password=secret"
+      KAFKA_BOOTSTRAP: "kafka:9093"
+    depends_on:
+      - kafka
+      - pgbouncer-us-east
+
+  request-processor-us-central:
+    build:
+      context: .
+      dockerfile: EventLogs.RequestProcessor/Dockerfile
+    environment:
+      REGION: "us-central"
+      EVENTLOGS_DB: "Host=pgbouncer-us-central;Port=6543;Database=optima;Username=app_user;Password=secret"
+      KAFKA_BOOTSTRAP: "kafka:9093"
+    depends_on:
+      - kafka
+      - pgbouncer-us-central
+
+  request-processor-us-west:
+    build:
+      context: .
+      dockerfile: EventLogs.RequestProcessor/Dockerfile
+    environment:
+      REGION: "us-west"
+      EVENTLOGS_DB: "Host=pgbouncer-us-west;Port=6543;Database=optima;Username=app_user;Password=secret"
+      KAFKA_BOOTSTRAP: "kafka:9093"
+    depends_on:
+      - kafka
+      - pgbouncer-us-west

@@ -233,7 +233,9 @@ cockroach start-single-node --certs-dir=./certs --store=./data --advertise-addr=
 ```
 colima start --network-address --memory 8 --cpu 4 --disk 100
 export CRDB_VERSION=$(cockroach --version | grep "Build Tag" | awk '{print $3}')
-docker-compose up -d
+cd cockroachdb
+docker-compose up --detach
+cd ..
 ```
 
 Next we'll need to configure our multi-region cluster
@@ -268,6 +270,28 @@ CREATE ROLE "pgb" WITH LOGIN PASSWORD 'secret';
 And test the connection
 ```
 cockroach sql --url "postgresql://pgb:secret@localhost:26257/defaultdb?sslmode=prefer" -e "show databases;"
+```
+
+<br/>**<ins>KAFKA</ins>**
+We'll setup a sink with Kafka in case we want to test workloads that require change data capture.  We'll deploy in dcoker but we may also want to use the client tools to set things up.  On Mac we can install them with ```brew install kafka``` and on Windows we can download and extract the tar file from [here](https://kafka.apache.org/downloads), then add the location of the Kafka .bat files (i.e. C:\Users\myname\kafka\bin\Windows) to your Windows Path environment variable.
+
+There's a docker compose file in the kafka folder that we can use to launch our local instance of kafka, which will configure a single replica with 10 partitions.
+```
+cd kafka
+docker-compose up --detach
+cd ..
+```
+Once launched you can confirm the containers are up and running with ```docker ps```.  Then we can create our topics and you can investigate your Kafka cluster at h
+
+To create change feeds in cockroachdb we'll need to provide an organization with a temporary license.  We'll store this information as variables in the terminal shell window.  On Mac variables are assigned like ```my_var="example"``` and on Windows we proceed the variable assignment with a $ symbol ```$my_var="example"```.
+```
+organization="Workshop"
+license="willBeProvided"
+cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb?sslmode=verify-full" -e """
+SET CLUSTER SETTING cluster.organization = '$organization';
+SET CLUSTER SETTING enterprise.license = '$license';
+SET CLUSTER SETTING kv.rangefeed.enabled = true;
+"""
 ```
 
 ## PgBouncer
