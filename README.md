@@ -534,6 +534,11 @@ for region in "${REGIONS[@]}"; do
 done
 ```
 
+Or to restart all pgbouncer containers
+```
+docker restart $(docker ps -a --filter "name=^pgbouncer")
+```
+
 Then to test the connection pool we can go inside the container
 ```
 docker exec -it pgbouncer-us-east-1 /bin/bash
@@ -988,6 +993,11 @@ for region in "${REGIONS[@]}"; do
 
   done
 done
+```
+
+Or to restart all ha-node containers
+```
+docker restart $(docker ps -a --filter "name=^ha-node")
 ```
 </details>
 

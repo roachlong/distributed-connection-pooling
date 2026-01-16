@@ -216,6 +216,8 @@ build/
 certs/
 data/
 logs/
+**/bin/
+**/obj/
 my-safe-directory/
 settings
 .DS_Store
