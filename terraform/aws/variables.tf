@@ -155,6 +155,30 @@ variable "ui_port"  {
   type = number
   default = 8080
 }
+variable "pgb_client" {
+  type = string
+  default = "postgres"
+}
+variable "auth_mode" {
+  type = string
+  default = "password"
+}
+variable "client_pwd" {
+  type = string
+  default = "secret"
+}
+variable "pgb_server" {
+  type = string
+  default = "root"
+}
+variable "num_conn_per_region" {
+  type = number
+  default = 10
+}
+variable "database" {
+  type = string
+  default = "postgres"
+}
 
 ############################
 # AMI / access

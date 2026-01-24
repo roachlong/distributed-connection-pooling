@@ -2,20 +2,19 @@
 import argparse
 import json
 import subprocess
-import time
 import tempfile
+import time
 from pathlib import Path
-from typing import Dict, List, Any, Tuple
-
+from typing import Any, Dict, List, Optional, Tuple
 
 
 # ----------------------------
-# Helpers
+# Shell helpers
 # ----------------------------
 
-def run(cmd: str, cwd: str | None = None, check: bool = True) -> str:
+def run(cmd: str, cwd: Optional[str] = None, check: bool = True) -> str:
     print(f"\n>>> {cmd}")
-    result = subprocess.run(
+    p = subprocess.run(
         cmd,
         shell=True,
         cwd=cwd,
@@ -23,15 +22,15 @@ def run(cmd: str, cwd: str | None = None, check: bool = True) -> str:
         stderr=subprocess.STDOUT,
         text=True,
     )
-    print(result.stdout)
-    if check and result.returncode != 0:
+    print(p.stdout)
+    if check and p.returncode != 0:
         raise RuntimeError(f"Command failed: {cmd}")
-    return result.stdout.strip()
+    return p.stdout.strip()
 
 
-def terraform_apply(tf_dir: str, tf_vars: str) -> None:
+def terraform_apply(tf_dir: str, tfvars: str) -> None:
     run(f"terraform -chdir={tf_dir} init")
-    run(f"terraform -chdir={tf_dir} apply -var-file={tf_vars} -auto-approve")
+    run(f"terraform -chdir={tf_dir} apply -var-file={tfvars} -auto-approve")
 
 
 def terraform_output(tf_dir: str) -> Dict[str, Any]:
@@ -39,66 +38,102 @@ def terraform_output(tf_dir: str) -> Dict[str, Any]:
     return json.loads(out)
 
 
-def scp_text(host: str, ssh_user: str, ssh_key: str, remote_path: str, content: str) -> None:
-    with tempfile.TemporaryDirectory() as td:
-        local = Path(td) / Path(remote_path).name
-        local.write_text(content)
-        run(f"scp -i {ssh_key} {local} {ssh_user}@{host}:/tmp/{local.name}")
-        run(f"""
-ssh -i {ssh_key} {ssh_user}@{host} <<'EOF'
-sudo mv /tmp/{local.name} {remote_path}
-EOF
-""")
+def ssh(host: str, ssh_user: str, ssh_key: str, remote_cmd: str, check: bool = True) -> str:
+    return run(f"ssh -i {ssh_key} {ssh_user}@{host} {json.dumps(remote_cmd)}", check=check)
 
 
 def scp_file(host: str, ssh_user: str, ssh_key: str, local_path: Path, remote_path: str) -> None:
     run(f"scp -i {ssh_key} {local_path} {ssh_user}@{host}:/tmp/{local_path.name}")
-    run(f"""
-ssh -i {ssh_key} {ssh_user}@{host} <<'EOF'
-sudo mv /tmp/{local_path.name} {remote_path}
-EOF
-""")
+    ssh(host, ssh_user, ssh_key, f"sudo mv /tmp/{local_path.name} {remote_path}")
 
 
-def ssh(host: str, ssh_user: str, ssh_key: str, remote_cmd: str, check: bool = True) -> str:
-    return run(f"ssh -i {ssh_key} {ssh_user}@{host} {json.dumps(remote_cmd)}", check=check)
+def scp_text(host: str, ssh_user: str, ssh_key: str, remote_path: str, content: str) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / Path(remote_path).name
+        p.write_text(content)
+        scp_file(host, ssh_user, ssh_key, p, remote_path)
+
+
+def pick_dcp_ssh_host(dcp_record: Dict[str, Any]) -> str:
+    # Prefer EIP/public_ip; never rely on instance public_dns when EIP is in play.
+    return dcp_record.get("public_ip") or dcp_record.get("private_ip")
+
+
+# ----------------------------
+# Wait helpers
+# ----------------------------
+
+def wait_for_ssh(host: str, ssh_user: str, ssh_key: str, timeout: int = 300) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        out = ssh(host, ssh_user, ssh_key, "echo ok", check=False)
+        if "ok" in out:
+            return
+        time.sleep(5)
+    raise RuntimeError(f"Timed out waiting for SSH on {host}")
+
+
+def wait_for_expected_nodes(
+    seed_host: str,
+    ssh_user: str,
+    ssh_key: str,
+    expected_nodes: int,
+    timeout: int = 600,
+) -> None:
+    print(f"⏳ Waiting for {expected_nodes} Cockroach nodes to be live...")
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        out = ssh(
+            seed_host,
+            ssh_user,
+            ssh_key,
+            "cockroach node status --certs-dir=/var/lib/cockroach/certs --format=tsv",
+            check=False,
+        )
+
+        lines = [l for l in out.splitlines() if l.strip() and not l.startswith("id")]
+        live = [l for l in lines if "\tlive\t" in l]
+
+        print(f"   seen={len(lines)} live={len(live)}")
+
+        if len(live) >= expected_nodes:
+            print("✅ All expected nodes are live")
+            return
+
+        time.sleep(5)
+
+    raise RuntimeError("Timed out waiting for all Cockroach nodes to be live")
 
 
 # ----------------------------
 # Cert generation
 # ----------------------------
 
-def ensure_ca_and_clients(certs_dir: Path, ca_key: Path, create_client_users: List[str]) -> None:
+def ensure_ca(certs_dir: Path, ca_key: Path) -> None:
     certs_dir.mkdir(parents=True, exist_ok=True)
     ca_crt = certs_dir / "ca.crt"
-
-    # Create CA only if it does not already exist
-    if not ca_key.exists() or not ca_crt.exists():
-        print("🔐 Creating new CA")
-        run(
-            f"cockroach cert create-ca "
-            f"--certs-dir={certs_dir} "
-            f"--ca-key={ca_key}"
-        )
-    else:
+    if ca_key.exists() and ca_crt.exists():
         print("🔐 Reusing existing CA")
-
-    # Always (re)create client certs (safe; distribute as needed)
-    for user in create_client_users:
-        (certs_dir / f"client.{user}.crt").unlink(missing_ok=True)
-        (certs_dir / f"client.{user}.key").unlink(missing_ok=True)
-        run(f"cockroach cert create-client {user} "
-            f"--certs-dir={certs_dir} "
-            f"--ca-key={ca_key}"
-        )
+        return
+    print("🔐 Creating new CA")
+    run(f"cockroach cert create-ca --certs-dir={certs_dir} --ca-key={ca_key}")
 
 
-def generate_crdb_node_cert(node: Dict[str, Any], dns_zone: str, certs_dir: Path, ca_key: Path) -> None:
-    # Cockroach tool writes node.crt/node.key
+def create_client_cert(certs_dir: Path, ca_key: Path, username: str) -> None:
+    (certs_dir / f"client.{username}.crt").unlink(missing_ok=True)
+    (certs_dir / f"client.{username}.key").unlink(missing_ok=True)
+    run(f"cockroach cert create-client {username} --certs-dir={certs_dir} --ca-key={ca_key}")
+
+
+def create_crdb_node_cert(node: Dict[str, Any], dns_zone: str, certs_dir: Path, ca_key: Path) -> None:
+    """
+    Writes certs_dir/node.crt and certs_dir/node.key for this node.
+    Include db.<region>.<zone> SAN so clients can verify-full against the VIP DNS name.
+    """
     (certs_dir / "node.crt").unlink(missing_ok=True)
     (certs_dir / "node.key").unlink(missing_ok=True)
 
-    # Ensure SAN includes db.<region>.<zone> so clients can connect via VIP DNS name
     run(
         "cockroach cert create-node "
         f"{node['name']} "
@@ -109,11 +144,10 @@ def generate_crdb_node_cert(node: Dict[str, Any], dns_zone: str, certs_dir: Path
     )
 
 
-def generate_pgb_server_cert(region: str, dns_zone: str, certs_dir: Path, ca_key: Path, client_user: str) -> Tuple[Path, Path]:
+def create_pgb_server_cert(region: str, dns_zone: str, certs_dir: Path, ca_key: Path, pgb_client_user: str) -> tuple[Path, Path]:
     """
     Create a server certificate for PgBouncer endpoint pgb.<region>.<zone>.
-    Rename it to match start-pgbouncer.sh expectations:
-      /etc/pgbouncer/certs/server.<client_user>.crt|key
+    Rename to server.<pgb_client_user>.crt/key to match the start-pgbouncer.sh expectations.
     """
     (certs_dir / "node.crt").unlink(missing_ok=True)
     (certs_dir / "node.key").unlink(missing_ok=True)
@@ -126,11 +160,10 @@ def generate_pgb_server_cert(region: str, dns_zone: str, certs_dir: Path, ca_key
         f"--ca-key={ca_key}"
     )
 
-    server_crt = certs_dir / f"server.{client_user}.crt"
-    server_key = certs_dir / f"server.{client_user}.key"
+    server_crt = certs_dir / f"server.{pgb_client_user}.crt"
+    server_key = certs_dir / f"server.{pgb_client_user}.key"
     server_crt.unlink(missing_ok=True)
     server_key.unlink(missing_ok=True)
-
     (certs_dir / "node.crt").replace(server_crt)
     (certs_dir / "node.key").replace(server_key)
     return server_crt, server_key
@@ -142,14 +175,14 @@ def generate_pgb_server_cert(region: str, dns_zone: str, certs_dir: Path, ca_key
 
 def install_crdb_certs(node: Dict[str, Any], ssh_user: str, ssh_key: str, certs_dir: Path) -> None:
     host = node["public_dns"]
-    # Push CA and node certs
-    run(f"scp -i {ssh_key} {certs_dir}/ca.crt {ssh_user}@{host}:/tmp/ca.crt")
-    run(f"scp -i {ssh_key} {certs_dir}/node.crt {ssh_user}@{host}:/tmp/node.crt")
-    run(f"scp -i {ssh_key} {certs_dir}/node.key {ssh_user}@{host}:/tmp/node.key")
+    # Copy CA + node.* to node, then move into /var/lib/cockroach/certs
+    run(f"scp -i {ssh_key} {certs_dir/'ca.crt'} {ssh_user}@{host}:/tmp/ca.crt")
+    run(f"scp -i {ssh_key} {certs_dir/'node.crt'} {ssh_user}@{host}:/tmp/node.crt")
+    run(f"scp -i {ssh_key} {certs_dir/'node.key'} {ssh_user}@{host}:/tmp/node.key")
     run(f"""
 ssh -i {ssh_key} {ssh_user}@{host} <<'EOF'
 sudo mkdir -p /var/lib/cockroach/certs
-sudo mv /tmp/ca.crt /tmp/node.crt /tmp/node.key /var/lib/cockroach/certs
+sudo mv /tmp/ca.crt /tmp/node.crt /tmp/node.key /var/lib/cockroach/certs/
 sudo chown -R cockroach:cockroach /var/lib/cockroach
 sudo chmod 0644 /var/lib/cockroach/certs/*.crt
 sudo chmod 0600 /var/lib/cockroach/certs/node.key
@@ -157,11 +190,151 @@ EOF
 """)
 
 
+def install_and_start_crdb_service(nodes: List[Dict[str, Any]], ssh_user: str, ssh_key: str) -> None:
+    """
+    Creates /etc/systemd/system/cockroach.service on each node and starts it.
+    Uses DNS names (node['name']) for advertise/join since Route53 A records exist for those names.
+    """
+    join = ",".join(f"{n['name']}:26257" for n in nodes)
+    total_nodes = len(nodes)
+
+    for node in nodes:
+        host = node["public_dns"]
+        name = node["name"]
+        region = node.get("region", "unknown")
+        az = node.get("az", "") or node.get("availability_zone", "")
+
+        if total_nodes == 1:
+            exec_start = (
+                "/usr/local/bin/cockroach start-single-node "
+                "--certs-dir=/var/lib/cockroach/certs "
+                "--store=/mnt/cockroach-data "
+                "--listen-addr=0.0.0.0:26257 "
+                f"--advertise-addr={name}:26257 "
+                "--http-addr=0.0.0.0:8080 "
+                f"--locality=region={region},zone={az}"
+            )
+        else:
+            exec_start = (
+                "/usr/local/bin/cockroach start "
+                "--certs-dir=/var/lib/cockroach/certs "
+                "--store=/mnt/cockroach-data "
+                "--listen-addr=0.0.0.0:26257 "
+                f"--advertise-addr={name}:26257 "
+                "--http-addr=0.0.0.0:8080 "
+                f"--join={join} "
+                f"--locality=region={region},zone={az}"
+            )
+
+        run(f"""
+ssh -i {ssh_key} {ssh_user}@{host} <<'EOF'
+sudo tee /etc/systemd/system/cockroach.service > /dev/null <<SERVICE
+[Unit]
+Description=CockroachDB
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=cockroach
+ExecStart={exec_start}
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+sudo systemctl daemon-reload
+sudo systemctl enable cockroach
+sudo systemctl restart cockroach
+EOF
+""")
+
+
+def init_cluster(seed_node: Dict[str, Any], certs_dir: Path) -> None:
+    """
+    Idempotent init: if already initialized, ignore the error.
+    We use certs_dir client certs locally (typically client.root.*).
+    """
+    seed = f"{seed_node['name']}:26257"
+    out = run(f"cockroach init --certs-dir={certs_dir} --host={seed}", check=False)
+    if "already initialized" in out.lower() or "cluster has already been initialized" in out.lower():
+        print("ℹ️ Cluster already initialized, continuing")
+    elif "successfully initialized" in out.lower() or "initialized" in out.lower():
+        print("✅ Cluster initialized")
+    else:
+        # Cockroach init can be chatty; only fail if nonzero and not the known message
+        # run(..., check=False) already; keep conservative:
+        pass
+
+
 # ----------------------------
-# HAProxy rendering + deploy
+# SQL bootstrap
 # ----------------------------
 
-def render_haproxy_cfg(pgbouncer_ips: List[str], backend_ips: List[str], pgb_port: int = 5432, db_port: int = 26257) -> str:
+def sql_exec_on_seed(seed_host: str, ssh_user: str, ssh_key: str, sql: str) -> None:
+    cmd = (
+        "cockroach sql "
+        "--certs-dir=/var/lib/cockroach/certs "
+        "--host=localhost:26257 "
+        f"-e {json.dumps(sql)}"
+    )
+    ssh(seed_host, ssh_user, ssh_key, cmd)
+
+
+def ensure_db_and_user(seed_host: str, ssh_user: str, ssh_key: str, dbname: str, username: str,
+                       password: Optional[str], make_admin: bool) -> None:
+    stmts = [
+        f"CREATE DATABASE IF NOT EXISTS {dbname};",
+        f"CREATE USER IF NOT EXISTS {username};",
+    ]
+    if password is not None:
+        # password mode convenience
+        stmts.append(f"ALTER USER {username} WITH PASSWORD {json.dumps(password)};")
+    if make_admin:
+        stmts.append(f"GRANT admin TO {username};")
+    sql_exec_on_seed(seed_host, ssh_user, ssh_key, " ".join(stmts))
+
+
+# ----------------------------
+# PgBouncer + HAProxy
+# ----------------------------
+
+def install_pgb_certs_on_dcp(
+    dcp_host: str,
+    ssh_user: str,
+    ssh_key: str,
+    certs_dir: Path,
+    pgb_client_user: str,
+    pgb_server_user: str,
+) -> None:
+    """
+    Copy:
+      - ca.crt
+      - server.<pgb_client_user>.crt/key  (PgBouncer server identity)
+      - client.<pgb_server_user>.crt/key  (PgBouncer backend client identity for CRDB)
+    Into /etc/pgbouncer/certs on each DCP node.
+    """
+    ssh(dcp_host, ssh_user, ssh_key,
+        "sudo mkdir -p /etc/pgbouncer/certs && sudo chown -R postgres:postgres /etc/pgbouncer && sudo chmod 700 /etc/pgbouncer/certs")
+
+    for f in [
+        certs_dir / "ca.crt",
+        certs_dir / f"server.{pgb_client_user}.crt",
+        certs_dir / f"server.{pgb_client_user}.key",
+        certs_dir / f"client.{pgb_server_user}.crt",
+        certs_dir / f"client.{pgb_server_user}.key",
+    ]:
+        scp_file(dcp_host, ssh_user, ssh_key, f, f"/etc/pgbouncer/certs/{f.name}")
+
+    ssh(dcp_host, ssh_user, ssh_key,
+        "sudo chown -R postgres:postgres /etc/pgbouncer && "
+        "sudo chmod 0644 /etc/pgbouncer/certs/*.crt && "
+        "sudo chmod 0600 /etc/pgbouncer/certs/*.key")
+
+
+def render_haproxy_cfg(pgbouncer_ips: List[str], backend_ips: List[str], pgb_port: int, db_port: int) -> str:
     lines: List[str] = []
     lines += [
         "global",
@@ -207,131 +380,43 @@ def render_haproxy_cfg(pgbouncer_ips: List[str], backend_ips: List[str], pgb_por
     return "\n".join(lines)
 
 
-def push_haproxy_cfg(host: str, ssh_user: str, ssh_key: str, cfg: str) -> None:
-    with tempfile.TemporaryDirectory() as td:
-        local = Path(td) / "haproxy.cfg"
-        local.write_text(cfg)
-        run(f"scp -i {ssh_key} {local} {ssh_user}@{host}:/tmp/haproxy.cfg")
-        run(f"""
-ssh -i {ssh_key} {ssh_user}@{host} <<'EOF'
-sudo mv /tmp/haproxy.cfg /etc/haproxy/haproxy.cfg
-sudo haproxy -c -f /etc/haproxy/haproxy.cfg
-sudo systemctl restart haproxy
-EOF
-""")
+def push_haproxy_cfg(dcp_host: str, ssh_user: str, ssh_key: str, cfg: str) -> None:
+    scp_text(dcp_host, ssh_user, ssh_key, "/etc/haproxy/haproxy.cfg", cfg)
+    ssh(dcp_host, ssh_user, ssh_key, "sudo haproxy -c -f /etc/haproxy/haproxy.cfg")
+    ssh(dcp_host, ssh_user, ssh_key, "sudo systemctl restart haproxy")
 
 
-# ----------------------------
-# Cockroach start / init
-# ----------------------------
-
-def install_and_start_crdb_service(nodes: List[Dict[str, Any]], ssh_user: str, ssh_key: str) -> None:
-    total_nodes = len(nodes)
-    join = ",".join(f"{n['name']}:26257" for n in nodes)
-
-    for node in nodes:
-        host = node["public_dns"]
-        name = node["name"]
-        region = node.get("region", "unknown")
-        az = node.get("az", "")
-
-        if total_nodes == 1:
-            exec_start = (
-                "/usr/local/bin/cockroach start-single-node "
-                "--certs-dir=/var/lib/cockroach/certs "
-                "--store=/mnt/cockroach-data "
-                "--listen-addr=0.0.0.0:26257 "
-                f"--advertise-addr={name}:26257 "
-                "--http-addr=0.0.0.0:8080 "
-                f"--locality=region={region},zone={az}"
-            )
-        else:
-            exec_start = (
-                "/usr/local/bin/cockroach start "
-                "--certs-dir=/var/lib/cockroach/certs "
-                "--store=/mnt/cockroach-data "
-                "--listen-addr=0.0.0.0:26257 "
-                f"--advertise-addr={name}:26257 "
-                "--http-addr=0.0.0.0:8080 "
-                f"--join={join} "
-                f"--locality=region={region},zone={az}"
-            )
-
-        run(f"""
-ssh -i {ssh_key} {ssh_user}@{host} <<'EOF'
-sudo tee /etc/systemd/system/cockroach.service > /dev/null <<SERVICE
-[Unit]
-Description=CockroachDB
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-User=cockroach
-ExecStart={exec_start}
-Restart=always
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
-
-sudo systemctl daemon-reload
-sudo systemctl enable cockroach
-sudo systemctl restart cockroach
-EOF
-""")
-
-
-def wait_for_crdb(nodes: List[Dict[str, Any]], ssh_user: str, ssh_key: str, timeout: int = 300) -> None:
-    deadline = time.time() + timeout
-    print("⏳ Waiting for Cockroach nodes to become ready...")
-
-    while time.time() < deadline:
-        seed = nodes[0]
-        host = seed["public_dns"]
-        try:
-            run(f"""
-ssh -i {ssh_key} {ssh_user}@{host} <<'EOF'
-cockroach node status \
-  --certs-dir=/var/lib/cockroach/certs \
-  --host=localhost:26257
-EOF
-""", check=False)
-
-            print("✅ Nodes are responding")
-            return
-
-        except Exception:
-            pass
-
-        time.sleep(5)
-
-    raise RuntimeError("Timed out waiting for Cockroach nodes")
-
-
-def init_cluster(seed_node: Dict[str, Any], clients_dir: Path) -> None:
-    seed = f"{seed_node['name']}:26257"
-    run(f"cockroach init --certs-dir={clients_dir} --host={seed}")
+def start_pgbouncer_runner(dcp_host: str, ssh_user: str, ssh_key: str) -> None:
+    ssh(dcp_host, ssh_user, ssh_key, "sudo systemctl restart pgbouncer-runner")
 
 
 # ----------------------------
 # Validation
 # ----------------------------
 
-def validate_region(region: str, dns_zone: str, certs_dir: Path, pgb_client_user: str) -> None:
-    # Direct Cockroach (VIP DNS)
+def validate_region_cert(region: str, dns_zone: str, certs_dir: Path, pgb_client_user: str, database: str, pgb_port: int) -> None:
+    # Direct DB via VIP DNS
     db_host = f"db.{region}.{dns_zone}:26257"
     run(f"cockroach sql --certs-dir={certs_dir} --host={db_host} -e 'SELECT 1;'")
 
-    # PgBouncer (VIP DNS) with client cert auth
-    # Requires client.<pgb_client_user>.crt/key created locally
+    # Through PgBouncer via VIP DNS (client cert)
     pgb_host = f"pgb.{region}.{dns_zone}"
     run(
         "psql "
-        f"\"host={pgb_host} port=5432 dbname=defaultdb sslmode=verify-full "
+        f"\"host={pgb_host} port={pgb_port} dbname={database} sslmode=verify-full "
         f"sslrootcert={certs_dir/'ca.crt'} "
         f"sslcert={certs_dir/f'client.{pgb_client_user}.crt'} "
         f"sslkey={certs_dir/f'client.{pgb_client_user}.key'}\" "
+        "-c 'SELECT 1;'"
+    )
+
+
+def validate_region_password(region: str, dns_zone: str, username: str, password: str, database: str, pgb_port: int) -> None:
+    pgb_host = f"pgb.{region}.{dns_zone}"
+    # sslmode=require is enough for TLS-on; switch to verify-full for strict hostname checks
+    run(
+        "psql "
+        f"\"host={pgb_host} port={pgb_port} dbname={database} user={username} password={password} sslmode=require\" "
         "-c 'SELECT 1;'"
     )
 
@@ -340,21 +425,36 @@ def validate_region(region: str, dns_zone: str, certs_dir: Path, pgb_client_user
 # Main
 # ----------------------------
 
-if __name__ == "__main__":
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--terraform-dir", required=True)
     parser.add_argument("--tfvars-file", required=True)
-    parser.add_argument("--certs-dir", required=True)
-    parser.add_argument("--ca-key", default="./my-safe-directory/ca.key")
+    parser.add_argument("--apply", action="store_true")
+
     parser.add_argument("--ssh-user", default="debian")
     parser.add_argument("--ssh-key", required=True)
+
     parser.add_argument("--dns-zone", required=True)
-    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--certs-dir", required=True)
+    parser.add_argument("--ca-key", default="./my-safe-directory/ca.key")
+
+    parser.add_argument("--auth-mode", choices=["password", "cert"], required=True)
+
+    # PgBouncer identity (cert mode) and default client identity
+    parser.add_argument("--pgb-client-user", default="postgres")  # client CN (cert mode), or a convenience test user
+    parser.add_argument("--pgb-server-user", default="pgb")       # PgBouncer -> CRDB (cert mode)
+
+    # Password mode: a single test user to create/validate (extend later)
+    parser.add_argument("--password-user", default="appuser")
+    parser.add_argument("--password", default="appuser-password")
+
+    parser.add_argument("--database", default="defaultdb")
+    parser.add_argument("--pgb-port", type=int, default=5432)
+    parser.add_argument("--db-port", type=int, default=26257)
+
     parser.add_argument("--skip-init", action="store_true")
     parser.add_argument("--skip-haproxy", action="store_true")
-    parser.add_argument("--skip-pgb-certs", action="store_true")
-    parser.add_argument("--pgb-client-user", default="postgres")
-    parser.add_argument("--pgb-server-user", default="root")
+    parser.add_argument("--skip-validation", action="store_true")
     args = parser.parse_args()
 
     if args.apply:
@@ -372,14 +472,14 @@ if __name__ == "__main__":
             n["region"] = region
             nodes.append(n)
 
-    # Flatten proxies (dcp nodes)
+    # Flatten dcp nodes
     proxies: List[Dict[str, Any]] = []
     for region, region_proxies in dcp_endpoints_by_region.items():
         for p in region_proxies:
             p["region"] = region
             proxies.append(p)
 
-    # Group by region
+    # Group
     crdb_by_region: Dict[str, List[Dict[str, Any]]] = {}
     for n in nodes:
         crdb_by_region.setdefault(n["region"], []).append(n)
@@ -391,71 +491,84 @@ if __name__ == "__main__":
     certs_dir = Path(args.certs_dir).expanduser().resolve()
     ca_key = Path(args.ca_key).expanduser().resolve()
 
-    # CA + client certs
-    # root: for CRDB admin and for PgBouncer->CRDB client cert (client.root.*)
-    # postgres: for app clients connecting to PgBouncer in cert mode
-    ensure_ca_and_clients(certs_dir, ca_key, create_client_users=["root", args.pgb_client_user])
+    # 1) Ensure CA (both modes, harmless; needed for direct cockroach verify-full and cert mode)
+    ensure_ca(certs_dir, ca_key)
 
-    # Cockroach node certs + install
+    # 2) Client certs (cert mode needs both client identities; password mode typically uses root locally for validation)
+    # Always create root client for local admin operations (init/validate convenience)
+    create_client_cert(certs_dir, ca_key, "root")
+
+    if args.auth_mode == "cert":
+        create_client_cert(certs_dir, ca_key, args.pgb_server_user)  # pgb -> crdb
+        create_client_cert(certs_dir, ca_key, args.pgb_client_user)  # client -> pgb
+
+    # 3) Generate + install node certs, then install/start cockroach service
     for node in nodes:
-        generate_crdb_node_cert(node, args.dns_zone, certs_dir, ca_key)
+        wait_for_ssh(node["public_dns"], args.ssh_user, args.ssh_key, timeout=300)
+        create_crdb_node_cert(node, args.dns_zone, certs_dir, ca_key)
         install_crdb_certs(node, args.ssh_user, args.ssh_key, certs_dir)
 
     install_and_start_crdb_service(nodes, args.ssh_user, args.ssh_key)
-    wait_for_crdb(nodes, args.ssh_user, args.ssh_key)
 
+    # 4) Wait for cluster SQL to respond
+    seed = nodes[0]
+    wait_for_expected_nodes(seed["public_dns"], args.ssh_user, args.ssh_key, expected_nodes=len(nodes))
+
+    # 5) Init cluster (multi-node)
     if not args.skip_init and len(nodes) > 1:
-        init_cluster(nodes[0], certs_dir)
+        init_cluster(seed, certs_dir)
 
-    # PgBouncer certs install on every DCP node (per region)
-    if not args.skip_pgb_certs:
+    # 6) Create DB/users (both modes)
+    if args.auth_mode == "cert":
+        # Both identities must exist in SQL namespace (CN mapping)
+        ensure_db_and_user(seed["public_dns"], args.ssh_user, args.ssh_key, args.database, args.pgb_server_user, password=None, make_admin=True)
+        ensure_db_and_user(seed["public_dns"], args.ssh_user, args.ssh_key, args.database, args.pgb_client_user, password=None, make_admin=False)
+    else:
+        # Create at least one test/expected app user with password
+        ensure_db_and_user(seed["public_dns"], args.ssh_user, args.ssh_key, args.database, args.password_user, password=args.password, make_admin=False)
+
+    # 7) PgBouncer (cert mode: create per-region server cert & distribute; password mode: just start)
+    if args.auth_mode == "cert":
         for region, region_proxies in dcp_by_region.items():
-            # Generate server cert for pgb.<region>.<zone> and push to all proxies in that region
-            # NOTE: generate_pgb_server_cert uses ca_key; we call it per region and then scp the generated files.
-            # We do the generation once, then reuse the file copies.
-            generate_pgb_server_cert(region, args.dns_zone, certs_dir, ca_key, args.pgb_client_user)
+            # Generate server cert once per region (pgb.<region>.<zone>)
+            create_pgb_server_cert(region, args.dns_zone, certs_dir, ca_key, args.pgb_client_user)
 
+            # Push certs + start runner on every DCP node
             for p in region_proxies:
-                host = p["public_dns"] or p.get("public_ip") or p["private_ip"]
+                dcp_host = pick_dcp_ssh_host(p)
+                wait_for_ssh(dcp_host, args.ssh_user, args.ssh_key, timeout=300)
+                install_pgb_certs_on_dcp(dcp_host, args.ssh_user, args.ssh_key, certs_dir, args.pgb_client_user, args.pgb_server_user)
+                start_pgbouncer_runner(dcp_host, args.ssh_user, args.ssh_key)
+    else:
+        for region, region_proxies in dcp_by_region.items():
+            for p in region_proxies:
+                dcp_host = pick_dcp_ssh_host(p)
+                wait_for_ssh(dcp_host, args.ssh_user, args.ssh_key, timeout=300)
+                start_pgbouncer_runner(dcp_host, args.ssh_user, args.ssh_key)
 
-                # Copy: ca.crt, server.<pgb_client_user>.*, client.<pgb_server_user>.*
-                run(f"scp -i {args.ssh_key} {certs_dir/'ca.crt'} {args.ssh_user}@{host}:/tmp/ca.crt")
-                run(f"scp -i {args.ssh_key} {certs_dir/f'server.{args.pgb_client_user}.crt'} {args.ssh_user}@{host}:/tmp/server.{args.pgb_client_user}.crt")
-                run(f"scp -i {args.ssh_key} {certs_dir/f'server.{args.pgb_client_user}.key'} {args.ssh_user}@{host}:/tmp/server.{args.pgb_client_user}.key")
-                run(f"scp -i {args.ssh_key} {certs_dir/f'client.{args.pgb_server_user}.crt'} {args.ssh_user}@{host}:/tmp/client.{args.pgb_server_user}.crt")
-                run(f"scp -i {args.ssh_key} {certs_dir/f'client.{args.pgb_server_user}.key'} {args.ssh_user}@{host}:/tmp/client.{args.pgb_server_user}.key")
-
-                run(f"""
-ssh -i {args.ssh_key} {args.ssh_user}@{host} <<'EOF'
-sudo mkdir -p /etc/pgbouncer/certs
-sudo mv /tmp/ca.crt /etc/pgbouncer/certs/ca.crt
-sudo mv /tmp/server.*.crt /etc/pgbouncer/certs/
-sudo mv /tmp/server.*.key /etc/pgbouncer/certs/
-sudo mv /tmp/client.*.crt /etc/pgbouncer/certs/
-sudo mv /tmp/client.*.key /etc/pgbouncer/certs/
-sudo chown -R postgres:postgres /etc/pgbouncer
-sudo chmod 0644 /etc/pgbouncer/certs/*.crt
-sudo chmod 0600 /etc/pgbouncer/certs/*.key
-sudo systemctl restart pgbouncer-runner || sudo systemctl restart pgbouncer-launcher || true
-EOF
-""")
-
-    # HAProxy config per region (PgBouncer pool = all DCP nodes in region)
+    # 8) HAProxy render/push/restart (per region: pgb pool = all DCP nodes in region; db pool = CRDB nodes in region)
     if not args.skip_haproxy:
         for region, region_proxies in dcp_by_region.items():
-            pgbouncer_ips = [p["private_ip"] for p in region_proxies]
-            backend_ips = [n["private_ip"] for n in crdb_by_region.get(region, [])]
-            if not backend_ips:
+            pgb_ips = [p["private_ip"] for p in region_proxies]
+            db_ips = [n["private_ip"] for n in crdb_by_region.get(region, [])]
+            if not db_ips:
                 raise RuntimeError(f"No Cockroach nodes found for region {region}")
 
-            cfg = render_haproxy_cfg(pgbouncer_ips, backend_ips)
-
+            cfg = render_haproxy_cfg(pgb_ips, db_ips, pgb_port=args.pgb_port, db_port=args.db_port)
             for p in region_proxies:
-                host = p["public_dns"] or p.get("public_ip") or p["private_ip"]
-                push_haproxy_cfg(host, args.ssh_user, args.ssh_key, cfg)
+                dcp_host = pick_dcp_ssh_host(p)
+                push_haproxy_cfg(dcp_host, args.ssh_user, args.ssh_key, cfg)
 
-    # Validate endpoints (local machine -> DNS)
-    for region in sorted(dcp_by_region.keys()):
-        validate_region(region, args.dns_zone, certs_dir, args.pgb_client_user)
+    # 9) Validate
+    if not args.skip_validation:
+        for region in sorted(dcp_by_region.keys()):
+            if args.auth_mode == "cert":
+                validate_region_cert(region, args.dns_zone, certs_dir, args.pgb_client_user, args.database, args.pgb_port)
+            else:
+                validate_region_password(region, args.dns_zone, args.password_user, args.password, args.database, args.pgb_port)
 
-    print("\n✅ Bootstrap complete (Cockroach + DCP + HAProxy configured)")
+    print("\n✅ Bootstrap complete: Cockroach + PgBouncer + HAProxy configured and validated")
+
+
+if __name__ == "__main__":
+    main()

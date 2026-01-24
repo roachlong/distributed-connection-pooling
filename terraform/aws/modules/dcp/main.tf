@@ -84,13 +84,22 @@ resource "aws_instance" "dcp_node" {
     dns_zone           = var.dns_zone
     db_port            = var.db_port
     pgb_port           = var.pgb_port
+    pgb_client         = var.pgb_client
+    auth_mode          = var.auth_mode
+    client_pwd         = var.client_pwd
+    pgb_server         = var.pgb_server
+    num_connections    = ceil(var.num_conn_per_region / var.ha_node_count)
+    database           = var.database
     vip_private_ip     = aws_network_interface.vip_eni.private_ip
     eip_allocation_id  = aws_eip.dcp.id
-
-    claim_eip_sh         = file("${path.module}/files/claim-eip.sh")
-    start_pgbouncer_sh   = file("${path.module}/files/start-pgbouncer.sh")
-    pgbouncer_template   = file("${path.module}/files/pgbouncer.template")
   })
 
-  tags = merge(var.tags, { Name = "${var.name}-${var.region}-dcp-${count.index+1}" })
+  tags = merge(
+    var.tags,
+    {
+      Name   = "${var.name}-${var.region}-dcp-${count.index+1}"
+      Region = var.region
+      Role   = "pgbouncer"
+    }
+  )
 }

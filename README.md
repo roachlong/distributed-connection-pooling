@@ -1592,7 +1592,7 @@ project_tags = {
 }
 dns_zone = "dcp-test.crdb.com"
 public_zone_id = "Z09942323KHF5XIP6R8IR"
-enabled_regions = ["us-east-1"]
+enabled_regions = ["us-east-2", "us-west-1", "us-west-2]
 vpc_cidrs = {
     us-east-1 = "10.10.0.0/16"
     us-east-2 = "10.20.0.0/16"
@@ -1617,6 +1617,16 @@ proxy_defaults = {
     instance_architecture = "amd64"
     instance_type = "c6a.large"
 }
+ha_node_count = 2
+pgb_port = 5432
+db_port = 26257
+ui_port = 8080
+pgb_client = "jleelong"
+auth_mode = "cert"
+client_pwd = ""
+pgb_server = "pgb"
+num_conn_per_region = 32
+database = "defaultdb"
 EOF
 ```
 
@@ -1672,12 +1682,19 @@ export TF_VAR_ssh_public_key=$(cat ./my-safe-directory/dev.pub)
 python controller.py \
   --terraform-dir ./terraform/aws \
   --tfvars-file crdb-dcp-test.tfvars \
-  --certs-dir ./certs/crdb-dcp-test \
-  --ca-key ./my-safe-directory/ca.key \
   --ssh-user debian \
   --ssh-key ./my-safe-directory/dev \
+  --certs-dir ./certs/crdb-dcp-test \
+  --ca-key ./my-safe-directory/ca.key \
+  --auth-mode cert \
+  --pgb-client-user pgb \
+  --pgb-server-user pgb \
+  --database defaultdb \
+  --pgb-port 5432 \
+  --db-port 26257
   --dns-zone dcp-test.crdb.com \
   --apply
+
 
 
 
@@ -1690,8 +1707,7 @@ terraform -chdir=terraform/aws apply -var-file=crdb-dcp-test.tfvars
 aws configure set region "us-east-2"
 aws configure get region
 aws ec2 describe-vpcs --filters Name=tag:Project,Values=jsonb-vs-text
-aws ec2 describe-transit-gateways --query "TransitGateways[].TransitGateway
-Id"
+aws ec2 describe-transit-gateways --query "TransitGateways[].TransitGatewayId"
 
 # and check that the instances are up
 aws ec2 describe-instances \
@@ -1705,6 +1721,15 @@ lsblk
 df -h | grep cockroach
 ls -ltrh /var/lib/cockroach/certs
 cockroach --version
+exit
+
+DCPNODE=$(terraform -chdir=terraform/aws output -json dcp_endpoints | jq -r '.["us-east-2"][0]["public_dns"]')
+ssh -i ./my-safe-directory/dev debian@$DCPNODE
+ls -l /opt/dcp
+ls -l /etc/pgbouncer
+ls -l /usr/local/bin/claim-eip.sh
+systemctl status pgbouncer-runner
+systemctl status keepalived
 exit
 ```
 

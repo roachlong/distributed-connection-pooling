@@ -189,6 +189,7 @@ for (( i=1; i<=${num_files}; i++ )); do
 
     if [[ "${AUTH_MODE}" == "cert" ]]; then
         sed -i "s/^auth_type =.*/auth_type = cert/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+        sed -i "s/%SERVER_USER%/user=${PGBOUNCER_SERVER}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
         sed -i "s/^client_tls_sslmode =.*/client_tls_sslmode = verify-full/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
         sed -i "s/^; client_tls_ca_file =.*/client_tls_ca_file = \/etc\/pgbouncer\/certs\/ca.crt/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
         sed -i "s/^; client_tls_key_file =.*/client_tls_key_file = \/etc\/pgbouncer\/certs\/server.${PGBOUNCER_CLIENT}.key/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini

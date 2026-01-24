@@ -4,13 +4,13 @@
 ;   %HOST_IP%     - CRDB node hostname (e.g., us-east, us-central, us-west, or host IP)
 ;   %HOST_PORT%   - CRDB SQL port (usually 26257)
 ;   %DATABASE%    - database name (e.g., defaultdb)
-;   %SERVER_USER% - we removed this so client credentials are passed through to the backend
+;   %SERVER_USER% - for password auth this is blank so client credentials are passed through to the backend
 ;   %SIZE%        - max backend connections for this database, use this to limit the total pool size
 ;
 ; Example:
-;   defaultdb = host=us-east port=26257 dbname=defaultdb user=pgb pool_size=64
+;   defaultdb = host=us-east port=26257 dbname=defaultdb pool_size=64 user=pgb
 ; ------------------------------------------------------------------------------
-%DATABASE% = host=%HOST_IP% port=%HOST_PORT% dbname=%DATABASE% pool_size=%SIZE%
+%DATABASE% = host=%HOST_IP% port=%HOST_PORT% dbname=%DATABASE% pool_size=%SIZE% %SERVER_USER%
 
 [pgbouncer]
 ; ------------------------------------------------------------------------------

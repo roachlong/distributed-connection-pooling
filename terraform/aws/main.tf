@@ -216,8 +216,14 @@ module "dcp_us_east_1" {
   tags          = var.project_tags
 
   ha_node_count = var.ha_node_count
-  pgb_port = var.pgb_port
-  db_port = var.db_port
+  pgb_port      = var.pgb_port
+  db_port       = var.db_port
+  pgb_client    = var.pgb_client
+  auth_mode     = var.auth_mode
+  client_pwd    = var.client_pwd
+  pgb_server    = var.pgb_server
+  num_conn_per_region  = var.num_conn_per_region
+  database      = var.database
 }
 
 module "dcp_us_east_2" {
@@ -246,8 +252,14 @@ module "dcp_us_east_2" {
   tags          = var.project_tags
 
   ha_node_count = var.ha_node_count
-  pgb_port = var.pgb_port
-  db_port = var.db_port
+  pgb_port      = var.pgb_port
+  db_port       = var.db_port
+  pgb_client    = var.pgb_client
+  auth_mode     = var.auth_mode
+  client_pwd    = var.client_pwd
+  pgb_server    = var.pgb_server
+  num_conn_per_region  = var.num_conn_per_region
+  database      = var.database
 }
 
 module "dcp_us_west_1" {
@@ -276,8 +288,14 @@ module "dcp_us_west_1" {
   tags          = var.project_tags
 
   ha_node_count = var.ha_node_count
-  pgb_port = var.pgb_port
-  db_port = var.db_port
+  pgb_port      = var.pgb_port
+  db_port       = var.db_port
+  pgb_client    = var.pgb_client
+  auth_mode     = var.auth_mode
+  client_pwd    = var.client_pwd
+  pgb_server    = var.pgb_server
+  num_conn_per_region  = var.num_conn_per_region
+  database      = var.database
 }
 
 module "dcp_us_west_2" {
@@ -306,6 +324,12 @@ module "dcp_us_west_2" {
   tags          = var.project_tags
 
   ha_node_count = var.ha_node_count
-  pgb_port = var.pgb_port
-  db_port = var.db_port
+  pgb_port      = var.pgb_port
+  db_port       = var.db_port
+  pgb_client    = var.pgb_client
+  auth_mode     = var.auth_mode
+  client_pwd    = var.client_pwd
+  pgb_server    = var.pgb_server
+  num_conn_per_region  = var.num_conn_per_region
+  database      = var.database
 }

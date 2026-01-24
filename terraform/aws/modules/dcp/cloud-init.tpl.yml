@@ -3,7 +3,6 @@
 repo_update: true
 package_upgrade: true
 timezone: UTC
-hostname: ${name}-${region}
 
 write_files:
   #
@@ -24,11 +23,15 @@ write_files:
       Type=simple
       User=postgres
       Group=postgres
-      ExecStart=/opt/dcp/start-pgbouncer.sh \
-        --auth-mode cert \
-        --num-connections 128 \
+      ExecStart=/etc/pgbouncer/start-pgbouncer.sh \
+        --client-account ${pgb_client} \
+        --auth-mode ${auth_mode} \
+        --client-password ${client_pwd} \
+        --server-account ${pgb_server} \
+        --num-connections ${num_connections} \
         --host-ip db.${region}.${dns_zone} \
-        --host-port ${db_port}
+        --host-port ${db_port} \
+        --database ${database}
       Restart=always
       RestartSec=5
 
@@ -69,14 +72,20 @@ write_files:
   # -----------------------------
   # Keepalived (VIP owner only)
   # -----------------------------
-  #
-  - path: /etc/keepalived/keepalived.conf
-    permissions: "0644"
+  #write_files:
+  - path: /usr/local/bin/generate-keepalived-conf.sh
+    permissions: "0755"
     owner: root:root
     content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      IFACE=$(ip -o -4 route show to 0/0 | awk '{print $5; exit}')
+
+      cat > /etc/keepalived/keepalived.conf <<EOF
       vrrp_instance VI_DCP {
         state BACKUP
-        interface eth0
+        interface ${IFACE}
         virtual_router_id 42
         priority 100
         advert_int 1
@@ -89,27 +98,28 @@ write_files:
         virtual_ipaddress {
           ${vip_private_ip}
         }
+
+        # notify_master "/usr/local/bin/claim-eip.sh ${eip_allocation_id}"
       }
-      # notify_master "/usr/local/bin/claim-eip.sh ${eip_allocation_id}"
+      EOF
 
 runcmd:
   #
   # Base directories
   #
-  - mkdir -p /opt/dcp
   - mkdir -p /etc/pgbouncer/certs
 
   #
   # Fetch artifacts from GitHub (public)
   #
-  - curl -fsSL https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/terraform/aws/modules/dcp/files/start-pgbouncer.sh -o /opt/dcp/start-pgbouncer.sh
+  - curl -fsSL https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/terraform/aws/modules/dcp/files/start-pgbouncer.sh -o /etc/pgbouncer/start-pgbouncer.sh
   - curl -fsSL https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/terraform/aws/modules/dcp/files/pgbouncer.template -o /etc/pgbouncer/pgbouncer.template
   - curl -fsSL https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/terraform/aws/modules/dcp/files/claim-eip.sh -o /usr/local/bin/claim-eip.sh
 
   #
   # Permissions
   #
-  - chmod +x /opt/dcp/start-pgbouncer.sh
+  - chmod +x /etc/pgbouncer/start-pgbouncer.sh
   - chmod +x /usr/local/bin/claim-eip.sh
   - chown -R postgres:postgres /etc/pgbouncer
   - chmod 700 /etc/pgbouncer/certs
@@ -117,15 +127,11 @@ runcmd:
   #
   # Enable services (configs pushed later)
   #
+  - /usr/local/bin/generate-keepalived-conf.sh
   - systemctl daemon-reload
   - systemctl enable pgbouncer-runner
   - systemctl enable haproxy
   - systemctl enable keepalived
-
-  #
-  # Start PgBouncer immediately
-  #
-  - systemctl start pgbouncer-runner
 
   #
   # Start HA + VIP last
