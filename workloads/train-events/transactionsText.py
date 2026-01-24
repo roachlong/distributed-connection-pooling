@@ -134,9 +134,92 @@ class Transactionstext:
         # Single event insert SQL (one row per execute) for TEXT payload
         insert_batch_sql = """
             WITH new_events AS (
-                INSERT INTO events_text (payload)
-                SELECT jsonb_build_object(
-                    'eventType',
+                INSERT INTO events_text (
+                    payload,
+                    event_type,
+                    authority_id,
+                    train_id
+                )
+                SELECT
+                    jsonb_build_object(
+                    'eventType', seed.event_type,
+                    'authorityId', seed.authority_id,
+                    'deviceKey', seed.device_key,
+                    'state', 'NEW',
+                    'createdAt', seed.created_at_text,
+
+                    'route', jsonb_build_object(
+                        'segments',
+                        (
+                            SELECT jsonb_agg(
+                                    jsonb_build_object(
+                                    'id', 1000 + (floor(random()*500))::INT,
+                                    'direction',
+                                        (ARRAY['NORTHBOUND','SOUTHBOUND','EASTBOUND','WESTBOUND'])
+                                        [(1 + floor(random()*4))::INT],
+                                    'trackSections',
+                                        (
+                                        SELECT jsonb_agg(2000 + (floor(random()*200))::INT)
+                                        FROM generate_series(1, 3)
+                                        )
+                                    )
+                                )
+                            FROM generate_series(1, 3)
+                        ),
+                        'switches',
+                        (
+                            SELECT jsonb_agg(
+                                    jsonb_build_object(
+                                    'id', 3000 + (floor(random()*500))::INT,
+                                    'position',
+                                        (ARRAY['NORMAL','REVERSE'])
+                                        [(1 + floor(random()*2))::INT]
+                                    )
+                                )
+                            FROM generate_series(1, 2)
+                        ),
+                        'attributes', jsonb_build_object(
+                        'ALLOW_PASS', true,
+                        'REQUIRES_ACK', false,
+                        'SLOW_ORDER', false
+                        ),
+                        'signalId', 9001
+                    ),
+
+                    'metrics', jsonb_build_object(
+                        'flags', jsonb_build_object(
+                        'onTrack', (random() < 0.8),
+                        'fleeted', (random() < 0.2)
+                        ),
+                        'circuitIds',
+                        (
+                            SELECT jsonb_agg(7000 + (floor(random()*1000))::INT)
+                            FROM generate_series(1, 4)
+                        ),
+                        'confidence', 0.5 + random()/2.0
+                    ),
+
+                    'train', jsonb_build_object(
+                        'trainId', seed.train_id,
+                        'withinLimits', (random() < 0.5),
+                        'direction',
+                        (ARRAY['NORTHBOUND','SOUTHBOUND','EASTBOUND','WESTBOUND'])
+                            [(1 + floor(random()*4))::INT]
+                    ),
+
+                    'meta', jsonb_build_object(
+                        'userId', 'operator01',
+                        'logicalPos', 'SYS01',
+                        'sourceSystem', 'SIMULATOR'
+                    )
+                    )::STRING AS payload,
+
+                    seed.event_type,
+                    seed.authority_id,
+                    seed.train_id
+
+                FROM (
+                    SELECT
                     (
                         ARRAY[
                         'ROUTE_AUTHORIZATION',
@@ -150,85 +233,19 @@ class Transactionstext:
                         'POWER_OUTAGE',
                         'DISPATCH_NOTE'
                         ]
-                    )[(1 + floor(random()*10))::INT],
+                    )[(1 + floor(random()*10))::INT]::event_type_enum AS event_type,
 
-                    'authorityId', gen_random_uuid()::STRING,
-                    'deviceKey',   gen_random_uuid()::STRING,
-                    'state',       'NEW',
-                    'createdAt',   (clock_timestamp() - (random()*interval '21 days'))::STRING,
+                    gen_random_uuid()::STRING AS authority_id,
+                    gen_random_uuid()::STRING AS device_key,
 
-                    'route', jsonb_build_object(
-                    'segments',
-                        (
-                        SELECT jsonb_agg(
-                                jsonb_build_object(
-                                    'id', 1000 + (floor(random()*500))::INT,
-                                    'direction',
-                                    (
-                                        ARRAY['NORTHBOUND','SOUTHBOUND','EASTBOUND','WESTBOUND']
-                                    )[(1 + floor(random()*4))::INT],
-                                    'trackSections',
-                                    (
-                                        SELECT jsonb_agg(2000 + (floor(random()*200))::INT)
-                                        FROM generate_series(1, 3)
-                                    )
-                                )
-                              )
-                        FROM generate_series(1, 3)
-                        ),
-                    'switches',
-                        (
-                        SELECT jsonb_agg(
-                                jsonb_build_object(
-                                    'id', 3000 + (floor(random()*500))::INT,
-                                    'position',
-                                    (
-                                        ARRAY['NORMAL','REVERSE']
-                                    )[(1 + floor(random()*2))::INT]
-                                )
-                              )
-                        FROM generate_series(1, 2)
-                        ),
-                    'attributes', jsonb_build_object(
-                        'ALLOW_PASS',   true,
-                        'REQUIRES_ACK', false,
-                        'SLOW_ORDER',   false
-                    ),
-                    'signalId', 9001
-                    ),
+                    (clock_timestamp() - (random()*interval '21 days'))::STRING AS created_at_text,
 
-                    'metrics', jsonb_build_object(
-                    'flags', jsonb_build_object(
-                        'onTrack', (random() < 0.8),
-                        'fleeted', (random() < 0.2)
-                    ),
-                    'circuitIds',
-                        (
-                        SELECT jsonb_agg(7000 + (floor(random()*1000))::INT)
-                        FROM generate_series(1, 4)
-                        ),
-                    'confidence', 0.5 + random()/2.0   -- 0.5–1.0
-                    ),
-
-                    'train', jsonb_build_object(
-                    'trainId',
-                        'RR-' || (1 + floor(random()*99))::INT || '-' ||
+                    'RR-' || (1 + floor(random()*99))::INT || '-' ||
                         (10000 + floor(random()*90000))::INT || '-' ||
-                        to_char(current_date - (floor(random()*30))::INT, 'YYYYMMDD'),
-                    'withinLimits', (random() < 0.5),
-                    'direction',
-                        (
-                        ARRAY['NORTHBOUND','SOUTHBOUND','EASTBOUND','WESTBOUND']
-                        )[(1 + floor(random()*4))::INT]
-                    ),
+                        to_char(current_date - (floor(random()*30))::INT, 'YYYYMMDD') AS train_id
 
-                    'meta', jsonb_build_object(
-                    'userId',       'operator01',
-                    'logicalPos',   'SYS01',
-                    'sourceSystem', 'SIMULATOR'
-                    )
-                )::STRING
-                FROM generate_series(1, %s)
+                    FROM generate_series(1, %s)
+                ) AS seed
                 RETURNING id
             )
             SELECT id FROM new_events;

@@ -76,12 +76,10 @@ CREATE TABLE events_text (
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
   payload      STRING NOT NULL,
 
-  event_type   event_type_enum
-    GENERATED ALWAYS AS (((payload::JSONB)->>'eventType')::event_type_enum) STORED,
-  authority_id STRING
-    GENERATED ALWAYS AS ((payload::JSONB)->>'authorityId') STORED,
-  train_id     STRING
-    GENERATED ALWAYS AS (((payload::JSONB)->'train'->>'trainId')) STORED
+  -- Explicit “flat” columns, NOT generated
+  event_type   event_type_enum NOT NULL,
+  authority_id STRING NOT NULL,
+  train_id     STRING NOT NULL
 );
 
 CREATE INDEX idx_events_text_event_type_created ON events_text (event_type, created_at DESC);

@@ -143,8 +143,25 @@ LEFT JOIN events_jsonb_manual AS m
 WHERE m.id IS NULL;
 
 -- Mirror JSONB docs into TEXT table
-INSERT INTO events_text (payload)
-SELECT payload::STRING FROM events_jsonb;
+INSERT INTO events_text (
+  id,
+  created_at,
+  payload,
+  event_type,
+  authority_id,
+  train_id
+)
+SELECT
+  e.id,
+  e.created_at,
+  e.payload::STRING,
+  (e.payload->>'eventType')::event_type_enum        AS event_type,
+  e.payload->>'authorityId'                         AS authority_id,
+  e.payload->'train'->>'trainId'                    AS train_id
+FROM events_jsonb e
+LEFT JOIN events_text t
+  ON t.id = e.id
+WHERE t.id IS NULL;
 
 -- JSONB side
 INSERT INTO events_jsonb_status (event_id, status)

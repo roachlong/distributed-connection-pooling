@@ -219,6 +219,7 @@ logs/
 **/bin/
 **/obj/
 my-safe-directory/
+obsolette/
 settings
 .DS_Store
 *.log

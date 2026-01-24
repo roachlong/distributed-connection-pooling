@@ -1,0 +1,127 @@
+#cloud-config
+repo_update: true
+package_upgrade: true
+timezone: UTC
+
+write_files:
+  - path: /usr/bin/check-packages.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      packages=$1
+      export IFS=","
+      for package in $${packages}; do
+        name=$(echo $${package} | sed -e 's/^[[:space:]]*//')
+        count=$(dpkg-query -l "$${name}" | grep "$${name}" | wc -l)
+        attempts=0
+        while [[ $${count} -eq 0 && $${attempts} -lt 12 ]]; do
+          ((attempts++))
+          sleep 15
+          sudo apt-get install -y $(echo "$${packages}" | tr ',' ' ')
+          count=$(dpkg-query -l "$${name}" | grep "$${name}" | wc -l)
+        done
+      done
+
+  - path: /var/lib/cockroach/mount-cockroach.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      count=0
+      attempts=0
+      device_name=/dev/sdp
+
+      while [[ $${count} -eq 0 && $${attempts} -lt 24 ]]; do
+        ((attempts++))
+        for candidate in /dev/sdp /dev/xvdp /dev/hdp; do
+          if [[ -b "$${candidate}" ]]; then
+            device_name="$${candidate}"
+            count=1
+            break
+          fi
+        done
+        if [[ $${count} -eq 0 ]]; then
+          sleep 15
+        fi
+      done
+
+      if [[ ! -b "$${device_name}" ]]; then
+        echo "ERROR: block device not found after waiting"
+        exit 1
+      fi
+
+      # Format only if not already formatted
+      if ! sudo blkid "$${device_name}" >/dev/null 2>&1; then
+        sudo mkfs -t xfs "$${device_name}"
+      fi
+
+      sudo mkdir -p /mnt/cockroach-data
+      sudo mount "$${device_name}" /mnt/cockroach-data || true
+      sudo chown -R cockroach:cockroach /mnt/cockroach-data
+      echo "$${device_name} /mnt/cockroach-data xfs defaults,nofail 0 2" | sudo tee -a /etc/fstab > /dev/null
+
+apt:
+  sources_list: |
+    deb http://deb.debian.org/debian/ $(lsb_release -a | grep Codename: | cut -f2 -d: | xargs) main contrib non-free
+    deb http://deb.debian.org/debian/ $(lsb_release -a | grep Codename: | cut -f2 -d: | xargs)-updates main contrib non-free
+    deb http://deb.debian.org/debian-security $(lsb_release -a | grep Codename: | cut -f2 -d: | xargs)-security main
+  conf: |
+    APT {
+      Get {
+        Assume-Yes "true";
+        Fix-Broken "true";
+      };
+    };
+
+packages:
+  - apt-transport-https
+  - bc
+  - build-essential
+  - ca-certificates
+  - curl
+  - debconf-utils
+  - dnsutils
+  - gnupg2
+  - less
+  - net-tools
+  - numactl
+  - rsync
+  - screen
+  - software-properties-common
+  - vim
+  - wget
+  - xfsprogs
+
+runcmd:
+  - /usr/bin/check-packages.sh 'apt-transport-https,bc,build-essential,ca-certificates,curl,debconf-utils,dnsutils,gnupg2,less,net-tools,numactl,rsync,screen,software-properties-common,vim,wget,xfsprogs'
+
+  # Install CockroachDB binary
+  - curl -fsSL https://binaries.cockroachdb.com/cockroach-v${cockroach_version}.linux-${architecture}.tgz | tar -xz
+  - sudo cp -i cockroach-v${cockroach_version}.linux-${architecture}/cockroach /usr/local/bin/
+  - sudo mkdir -p /usr/local/lib/cockroach
+  - sudo cp -i cockroach-v${cockroach_version}.linux-${architecture}/lib/libgeos.so /usr/local/lib/cockroach/ || true
+  - sudo cp -i cockroach-v${cockroach_version}.linux-${architecture}/lib/libgeos_c.so /usr/local/lib/cockroach/ || true
+
+  # Setup cockroach certs directory
+  - install -d -o cockroach -g cockroach -m 0755 /var/lib/cockroach/certs
+
+  # Change ownership of cockroach lib files
+  - sudo chown -R cockroach:cockroach /var/lib/cockroach
+
+  # Mount data disk
+  - /var/lib/cockroach/mount-cockroach.sh
+
+users:
+- default
+- name: cockroach
+  system: true
+  shell: /usr/sbin/nologin
+  lock_passwd: true
+- name: ${vm_user}
+  gecos: Debian User
+  sudo: ALL=(ALL) NOPASSWD:ALL
+  shell: /bin/bash
+  lock_passwd: true
+  ssh_authorized_keys:
+  - ${ssh_key}
+- name: root
+  lock_passwd: true

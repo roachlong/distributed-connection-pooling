@@ -1,0 +1,159 @@
+#cloud-config
+#cloud-config
+repo_update: true
+package_upgrade: true
+timezone: UTC
+hostname: ${name}-${region}
+
+write_files:
+  #
+  # -----------------------------
+  # PgBouncer runner + templates
+  # -----------------------------
+  #
+  - path: /etc/systemd/system/pgbouncer-runner.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=PgBouncer multi-instance runner
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User=postgres
+      Group=postgres
+      ExecStart=/opt/dcp/start-pgbouncer.sh \
+        --auth-mode cert \
+        --num-connections 128 \
+        --host-ip db.${region}.${dns_zone} \
+        --host-port ${db_port}
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+  #
+  # -----------------------------
+  # HAProxy placeholders
+  # (controller will overwrite)
+  # -----------------------------
+  #
+  - path: /etc/haproxy/haproxy.cfg
+    permissions: "0644"
+    owner: root:root
+    content: |
+      global
+        maxconn 200000
+        log /dev/log local0
+
+      defaults
+        mode tcp
+        log global
+        option tcplog
+        timeout connect 5s
+        timeout client  180s
+        timeout server  180s
+
+      # Placeholder frontend (will be replaced by controller)
+      frontend placeholder
+        bind *:${pgb_port}
+        default_backend placeholder
+
+      backend placeholder
+        server blackhole 127.0.0.1:9
+
+  #
+  # -----------------------------
+  # Keepalived (VIP owner only)
+  # -----------------------------
+  #
+  - path: /etc/keepalived/keepalived.conf
+    permissions: "0644"
+    owner: root:root
+    content: |
+      vrrp_instance VI_DCP {
+        state BACKUP
+        interface eth0
+        virtual_router_id 42
+        priority 100
+        advert_int 1
+
+        authentication {
+          auth_type PASS
+          auth_pass dcpsecret
+        }
+
+        virtual_ipaddress {
+          ${vip_private_ip}
+        }
+      }
+      # notify_master "/usr/local/bin/claim-eip.sh ${eip_allocation_id}"
+
+runcmd:
+  #
+  # Base directories
+  #
+  - mkdir -p /opt/dcp
+  - mkdir -p /etc/pgbouncer/certs
+
+  #
+  # Fetch artifacts from GitHub (public)
+  #
+  - curl -fsSL https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/terraform/aws/modules/dcp/files/start-pgbouncer.sh -o /opt/dcp/start-pgbouncer.sh
+  - curl -fsSL https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/terraform/aws/modules/dcp/files/pgbouncer.template -o /etc/pgbouncer/pgbouncer.template
+  - curl -fsSL https://raw.githubusercontent.com/roachlong/distributed-connection-pooling/refs/heads/main/terraform/aws/modules/dcp/files/claim-eip.sh -o /usr/local/bin/claim-eip.sh
+
+  #
+  # Permissions
+  #
+  - chmod +x /opt/dcp/start-pgbouncer.sh
+  - chmod +x /usr/local/bin/claim-eip.sh
+  - chown -R postgres:postgres /etc/pgbouncer
+  - chmod 700 /etc/pgbouncer/certs
+
+  #
+  # Enable services (configs pushed later)
+  #
+  - systemctl daemon-reload
+  - systemctl enable pgbouncer-runner
+  - systemctl enable haproxy
+  - systemctl enable keepalived
+
+  #
+  # Start PgBouncer immediately
+  #
+  - systemctl start pgbouncer-runner
+
+  #
+  # Start HA + VIP last
+  #
+  - systemctl start haproxy
+  - systemctl start keepalived
+
+packages:
+  - awscli
+  - ca-certificates
+  - curl
+  - dnsutils
+  - gnupg2
+  - haproxy
+  - jq
+  - keepalived
+  - net-tools
+  - pgbouncer
+  - postgresql-client
+
+users:
+- default
+- name: ${vm_user}
+  gecos: Debian User
+  sudo: ALL=(ALL) NOPASSWD:ALL
+  shell: /bin/bash
+  lock_passwd: true
+  ssh_authorized_keys:
+  - ${ssh_key}
+- name: root
+  lock_passwd: true

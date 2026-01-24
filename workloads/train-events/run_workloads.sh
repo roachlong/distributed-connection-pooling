@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
 # run_workloads.sh
-# Usage: ./run_workloads.sh <total_conn> <num_workers>
-#   export TEST_URI="postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer"
+# Usage: ./run_workloads.sh <total_conn>
+#   export TEST_URI_LIST="postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer,..."
 #   export TEST_NAME="pooling"
 #   export TXN_POOLONG="true"
-# Example: ./run_workloads.sh 512 2
+# Example: ./run_workloads.sh 512
 
 set -euo pipefail
 
 total_conn=${1:-512}          # total connections target
-num_workers=${2:-2}           # number of workload containers to launch
 duration=${duration:-10}      # test length (minutes)
 loops=${loops:-2048}          # number of executions per worker
 
 # Use env vars or defaults
-TEST_URI=${TEST_URI:-"postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer"}
+IFS=',' read -r -a TEST_URIS <<< "${TEST_URI_LIST}"
 TEST_NAME=${TEST_NAME:-"default"}
 TXN_POOLONG=${TXN_POOLONG:-false}
 
@@ -29,9 +28,15 @@ MANUAL_WORKLOAD=${MANUAL_WORKLOAD:-"transactionsManual.py"}
 TEXT_WORKLOAD=${TEXT_WORKLOAD:-"transactionsText.py"}
 
 # Derived
-conns_per_worker=$(( total_conn / num_workers ))
+num_workers=${#TEST_URIS[@]} # number of workload containers to launch
+conns_per_worker=$(( (total_conn + num_workers - 1) / num_workers ))
 ts="$(date +%Y%m%d_%H%M%S)"
 marker='^run_name[[:space:]]'
+
+if [[ "${num_workers}" -eq 0 ]]; then
+  echo "ERROR: TEST_URI_LIST is empty"
+  exit 1
+fi
 
 mkdir -p logs
 
@@ -52,6 +57,9 @@ run_phase() {
   local -a logs=()
 
   for i in $(seq 1 "$num_workers"); do
+    URI="${TEST_URIS[$((i-1))]}"
+    echo "Starting worker $i using URI: $URI"
+
     local run_name="${TEST_NAME}_${label}_${ts}_w${i}"
     local name="dbw-${label}-${i}"
     names+=("$name")
@@ -63,11 +71,14 @@ run_phase() {
     #       -i ${loops} \
     local id
     id=$(docker run -d --name "$name" --network dcp-net \
+      -v "$(pwd)/../../certs:/certs:ro" \
       --add-host=host.docker.internal:host-gateway \
       -e PYTHONUNBUFFERED=1 \
-      -v "$PWD:/work" -w /work python:3.12.7 bash -lc "
+      -v "$PWD:/work" -w /work python:3.11.6 bash -lc "
         set -euo pipefail
         mkdir -p /work/logs
+        apt-get install -y ca-certificates openssl
+        update-ca-certificates
 
         echo \"[INFO] \$(date) Worker ${i} (${label}): starting pip bootstrap\" | tee -a /work/${log%.log}_build.log
         python -m pip install --upgrade pip setuptools wheel 2>&1 | stdbuf -oL -eL tee -a /work/${log%.log}_build.log
@@ -76,11 +87,12 @@ run_phase() {
         pip install -r requirements-runner.txt 2>&1 | stdbuf -oL -eL tee -a /work/${log%.log}_build.log
 
         echo \"[INFO] \$(date) Worker ${i} (${label}): launching workload\" | tee -a /work/${log}
+        # sleep 600000 &  # prevent container exit for debugging
         stdbuf -oL -eL dbworkload run \
           -w ${workload_file} \
           -c ${conns_per_worker} \
           -i ${loops} \
-          --uri '${TEST_URI}' \
+          --uri '${URI}' \
           --args '{
             \"min_batch_size\": ${min_batch_size},
             \"max_batch_size\": ${max_batch_size},
@@ -121,11 +133,11 @@ run_phase() {
 
 # Run JSONB phase, then MANUAL phase, then TEXT phase
 
-echo "Running JSON workload first..."
-run_phase "${JSONB_WORKLOAD}" "jsonb"
+# echo "Running JSON workload first..."
+# run_phase "${JSONB_WORKLOAD}" "jsonb"
 
-echo "Sleeping two minutes before starting MANUAL workload..."
-sleep 120
+# echo "Sleeping two minutes before starting MANUAL workload..."
+# sleep 120
 
 run_phase "${MANUAL_WORKLOAD}" "manual"
 

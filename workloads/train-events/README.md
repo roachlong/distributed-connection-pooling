@@ -146,7 +146,7 @@ These parameters are set in the run_workloads.sh script.  We'll run multiple wor
 To execute the tests in docker we'll need to publish our python dependencies
 ```
 cd ./workloads/train-events
-pip freeze > requirements.txt
+# if requirements.txt doesn't exist then $ pip freeze > requirements.txt
 sed -E '/^(pyobjc-core|pyobjc-framework-Cocoa|py2app|rumps|macholib|tensorflow-macos|tensorflow-metal)(=|==)/d' \
   requirements.txt > requirements-runner.txt
 cd ../../
@@ -156,114 +156,123 @@ cd ../../
 Then we can use our workload script to simulate the workload going directly against the database running on our host machine.
 ```
 cd ./workloads/train-events
-export TEST_URI="postgresql://pgb:secret@host.docker.internal:26257/defaultdb?sslmode=prefer"
+export TEST_URI_LIST="\
+postgresql://pgb:secret@us-east:26257/defaultdb?sslmode=require&sslrootcert=/certs/ca.crt&sslcert=/certs/client.pgb.crt&sslkey=/certs/client.pgb.key,\
+postgresql://pgb:secret@us-central:26257/defaultdb?sslmode=require&sslrootcert=/certs/ca.crt&sslcert=/certs/client.pgb.crt&sslkey=/certs/client.pgb.key,\
+postgresql://pgb:secret@us-west:26257/defaultdb?sslmode=require&sslrootcert=/certs/ca.crt&sslcert=/certs/client.pgb.crt&sslkey=/certs/client.pgb.key"
 export TEST_NAME="direct"
 export TXN_POOLONG="false"
-./run_workloads.sh 512 4
+./run_workloads.sh 512
 cd ../../
 ```
-You can tail the files in the logs directory or open another terminal and run ```docker logs -f dbw-1```
+You can tail the files in the logs directory or open another terminal and run ```docker logs -f dbw-jsonb-1```
 
 A summary of the test results for one of the workers is outlined below...
 
 ### Using JSONB Fields
 ```
->>> Worker 2 (logs/results_direct_jsonb_20251205_145706_w2.log)
-run_name       Transactionsjsonb.20251205_200518
-start_time     2025-12-05 20:05:18
-end_time       2025-12-05 21:20:07
-test_duration  4489
+>>> Worker 2 (logs/results_direct_jsonb_20260117_203044_w2.log)
+run_name       Transactionsjsonb.20260118_013106
+start_time     2026-01-18 01:31:06
+end_time       2026-01-18 02:18:43
+test_duration  2857
 -------------  ---------------------------------
 
-┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬────────────┬────────────┬────────────┬──────────────┬──────────────┐
-│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │    p50(ms) │    p90(ms) │    p95(ms) │      p99(ms) │      max(ms) │
-├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼────────────┼────────────┼────────────┼──────────────┼──────────────┤
-│     4,489 │ __cycle__ │       128 │     2,048 │           0 │ 235,245.13 │ 113,206.62 │ 604,262.01 │ 908,883.74 │ 1,528,382.15 │ 3,570,055.79 │
-│     4,489 │ add       │       128 │     2,048 │           0 │  26,336.08 │  14,481.14 │  67,278.95 │ 104,525.78 │   137,686.78 │   187,292.17 │
-│     4,489 │ archive   │       128 │     2,048 │           0 │  11,692.34 │   2,589.12 │  23,553.94 │  45,738.02 │   104,572.07 │   765,235.72 │
-│     4,489 │ process   │       128 │     2,048 │           0 │ 197,110.51 │  81,868.00 │ 547,268.41 │ 848,393.07 │ 1,481,179.72 │ 3,389,565.89 │
-└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴────────────┴────────────┴────────────┴──────────────┴──────────────┘
+┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬────────────┬────────────┬──────────────┬──────────────┐
+│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │    p90(ms) │    p95(ms) │      p99(ms) │      max(ms) │
+├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼────────────┼────────────┼──────────────┼──────────────┤
+│     2,857 │ __cycle__ │       171 │     1,881 │           0 │ 207,417.21 │ 89,857.89 │ 547,900.13 │ 852,206.93 │ 1,395,698.37 │ 2,087,824.38 │
+│     2,857 │ add       │       171 │     1,881 │           0 │  13,709.75 │  8,791.41 │  29,656.86 │  43,898.90 │    86,013.51 │   102,154.67 │
+│     2,857 │ archive   │       171 │     1,881 │           0 │  11,405.73 │  3,546.12 │  23,695.40 │  32,912.71 │    87,569.24 │   659,528.86 │
+│     2,857 │ process   │       171 │     1,881 │           0 │ 182,201.12 │ 70,059.69 │ 500,098.56 │ 831,664.49 │ 1,366,170.97 │ 2,061,857.49 │
+└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴────────────┴────────────┴──────────────┴──────────────┘
 
 Parameter      Value
--------------  --------------------------------------------------------------------------------------------------------------------------------------------------
+-------------  ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 workload_path  /work/transactionsJsonb.py
-conn_params    {'conninfo': 'postgresql://pgb:secret@host.docker.internal:26257/defaultdb?sslmode=prefer&application_name=Transactionsjsonb', 'autocommit': True}
+conn_params    {'conninfo': 'postgresql://pgb:secret@us-central:26257/defaultdb?sslmode=require&sslrootcert=%2Fcerts%2Fca.crt&sslcert=%2Fcerts%2Fclient.pgb.crt&sslkey=%2Fcerts%2Fclient.pgb.key&application_name=Transactionsjsonb', 'autocommit': True}
 conn_extras    {}
-concurrency    128
+concurrency    171
 duration
 iterations     2048
 ramp           0
 args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': False}
+delay_stats    0
 ```
 
 ### Versus Manual JSONB
 ```
->>> Worker 2 (logs/results_direct_manual_20251205_145706_w2.log)
-run_name       Transactionsmanual.20251205_213022
-start_time     2025-12-05 21:30:22
-end_time       2025-12-05 21:44:21
-test_duration  839
+>>> Worker 2 (logs/results_direct_manual_20260117_203044_w2.log)
+run_name       Transactionsmanual.20260118_022110
+start_time     2026-01-18 02:21:10
+end_time       2026-01-18 02:32:41
+test_duration  691
 -------------  ----------------------------------
 
 ┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬────────────┬────────────┬────────────┬────────────┐
 │   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │    p90(ms) │    p95(ms) │    p99(ms) │    max(ms) │
 ├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼────────────┼────────────┼────────────┼────────────┤
-│       839 │ __cycle__ │       128 │     2,048 │           2 │  46,614.11 │ 25,231.53 │ 116,763.49 │ 158,155.35 │ 250,885.12 │ 412,646.54 │
-│       839 │ add       │       128 │     2,048 │           2 │   2,911.16 │  1,645.64 │   7,452.17 │   9,401.98 │  16,640.97 │  19,200.30 │
-│       839 │ archive   │       128 │     2,048 │           2 │   1,728.39 │    402.20 │   5,001.33 │   8,154.21 │  13,622.89 │  87,210.63 │
-│       839 │ process   │       128 │     2,048 │           2 │  41,873.37 │ 20,207.13 │ 110,347.16 │ 148,431.61 │ 241,987.39 │ 412,164.05 │
+│       691 │ __cycle__ │       171 │     1,881 │           2 │  51,988.38 │ 27,731.03 │ 118,131.61 │ 187,867.93 │ 353,585.27 │ 588,553.13 │
+│       691 │ add       │       171 │     1,881 │           2 │   4,925.09 │  4,092.50 │  10,782.05 │  12,324.03 │  14,007.58 │  15,393.78 │
+│       691 │ archive   │       171 │     1,881 │           2 │   3,215.76 │    964.07 │   7,391.51 │  10,846.03 │  43,671.31 │ 251,024.35 │
+│       691 │ process   │       171 │     1,881 │           2 │  43,747.07 │ 19,479.37 │ 110,008.19 │ 178,038.48 │ 340,556.14 │ 584,733.88 │
 └───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴────────────┴────────────┴────────────┴────────────┘
 
 Parameter      Value
--------------  ---------------------------------------------------------------------------------------------------------------------------------------------------
+-------------  -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 workload_path  /work/transactionsManual.py
-conn_params    {'conninfo': 'postgresql://pgb:secret@host.docker.internal:26257/defaultdb?sslmode=prefer&application_name=Transactionsmanual', 'autocommit': True}
+conn_params    {'conninfo': 'postgresql://pgb:secret@us-central:26257/defaultdb?sslmode=require&sslrootcert=%2Fcerts%2Fca.crt&sslcert=%2Fcerts%2Fclient.pgb.crt&sslkey=%2Fcerts%2Fclient.pgb.key&application_name=Transactionsmanual', 'autocommit': True}
 conn_extras    {}
-concurrency    128
+concurrency    171
 duration
 iterations     2048
 ramp           0
 args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': False}
+delay_stats    0
 ```
 
 ### Versus Text Fields
 ```
->>> Worker 2 (logs/results_direct_text_20251205_145706_w2.log)
-run_name       Transactionstext.20251205_215423
-start_time     2025-12-05 21:54:23
-end_time       2025-12-05 22:05:47
-test_duration  684
+>>> Worker 2 (logs/results_direct_text_20260117_203044_w2.log)
+run_name       Transactionstext.20260118_023505
+start_time     2026-01-18 02:35:05
+end_time       2026-01-18 02:46:13
+test_duration  668
 -------------  --------------------------------
 
-┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬───────────┬────────────┬────────────┬────────────┐
-│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │   p90(ms) │    p95(ms) │    p99(ms) │    max(ms) │
-├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼───────────┼────────────┼────────────┼────────────┤
-│       684 │ __cycle__ │       128 │     2,048 │           2 │  36,799.64 │ 21,470.48 │ 92,092.69 │ 128,059.77 │ 211,407.33 │ 365,707.04 │
-│       684 │ add       │       128 │     2,048 │           2 │   2,239.95 │    929.97 │  6,626.54 │   8,106.83 │  12,630.61 │  14,414.35 │
-│       684 │ archive   │       128 │     2,048 │           2 │   3,700.88 │    677.17 │ 11,227.06 │  19,723.95 │  33,162.44 │ 110,019.48 │
-│       684 │ process   │       128 │     2,048 │           2 │  30,754.82 │ 13,636.28 │ 82,801.00 │ 119,674.83 │ 208,971.75 │ 354,919.80 │
-└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴───────────┴────────────┴────────────┴────────────┘
+┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬────────────┬────────────┬────────────┬────────────┐
+│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │    p90(ms) │    p95(ms) │    p99(ms) │    max(ms) │
+├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼────────────┼────────────┼────────────┼────────────┤
+│       668 │ __cycle__ │       171 │     1,881 │           2 │  48,448.98 │ 25,354.44 │ 115,540.19 │ 186,557.60 │ 344,672.12 │ 541,853.03 │
+│       668 │ add       │       171 │     1,881 │           2 │   5,052.82 │  4,478.60 │  10,393.18 │  12,255.25 │  14,147.80 │  17,050.00 │
+│       668 │ archive   │       171 │     1,881 │           2 │   1,970.10 │    757.57 │   4,901.25 │   8,635.13 │  16,917.78 │  71,349.80 │
+│       668 │ process   │       171 │     1,881 │           2 │  41,325.13 │ 17,132.14 │ 109,464.76 │ 178,805.33 │ 335,581.32 │ 530,520.80 │
+└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴────────────┴────────────┴────────────┴────────────┘
 
 Parameter      Value
--------------  -------------------------------------------------------------------------------------------------------------------------------------------------
+-------------  -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 workload_path  /work/transactionsText.py
-conn_params    {'conninfo': 'postgresql://pgb:secret@host.docker.internal:26257/defaultdb?sslmode=prefer&application_name=Transactionstext', 'autocommit': True}
+conn_params    {'conninfo': 'postgresql://pgb:secret@us-central:26257/defaultdb?sslmode=require&sslrootcert=%2Fcerts%2Fca.crt&sslcert=%2Fcerts%2Fclient.pgb.crt&sslkey=%2Fcerts%2Fclient.pgb.key&application_name=Transactionstext', 'autocommit': True}
 conn_extras    {}
-concurrency    128
+concurrency    171
 duration
 iterations     2048
 ramp           0
 args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': False}
+delay_stats    0
 ```
 
 ## Managed Connections
 We can simulate the workload again, this time using our PgBouncer HA cluster with transaction pooling, but we'll have to disable prepared statements due to connection multiplexing between clients.
 ```
 cd ./workloads/train-events
-export TEST_URI="postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer"
+export TEST_URI_LIST="\
+postgresql://pgb@172.18.0.251:5432/defaultdb?sslmode=require&sslrootcert=/certs/ca.crt&sslcert=/certs/client.pgb.crt&sslkey=/certs/client.pgb.key,\
+postgresql://pgb@172.18.0.252:5432/defaultdb?sslmode=require&sslrootcert=/certs/ca.crt&sslcert=/certs/client.pgb.crt&sslkey=/certs/client.pgb.key,\
+postgresql://pgb@172.18.0.253:5432/defaultdb?sslmode=require&sslrootcert=/certs/ca.crt&sslcert=/certs/client.pgb.crt&sslkey=/certs/client.pgb.key"
 export TEST_NAME="pooling"
 export TXN_POOLONG="true"
-./run_workloads.sh 512 4
+./run_workloads.sh 512
 cd ../../
 ```
 You can tail the files in the logs directory or open another terminal and run ```docker logs -f dbw-1```
