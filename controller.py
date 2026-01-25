@@ -1,12 +1,29 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
 import subprocess
 import tempfile
 import time
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+SSH_OPTS = (
+    "-o StrictHostKeyChecking=no "
+    "-o UserKnownHostsFile=/dev/null "
+    "-o LogLevel=ERROR "
+    "-q"
+)
+
+# ----------------------------
+# Phase policy
+# ----------------------------
+
+class PhasePolicy(str, Enum):
+    SKIP = "skip"
+    NEW = "new"
+    REFRESH = "refresh"
 
 # ----------------------------
 # Shell helpers
@@ -39,11 +56,16 @@ def terraform_output(tf_dir: str) -> Dict[str, Any]:
 
 
 def ssh(host: str, ssh_user: str, ssh_key: str, remote_cmd: str, check: bool = True) -> str:
-    return run(f"ssh -i {ssh_key} {ssh_user}@{host} {json.dumps(remote_cmd)}", check=check)
+    return run(
+        f"ssh -i {ssh_key} {SSH_OPTS} {ssh_user}@{host} {json.dumps(remote_cmd)}",
+        check=check,
+    )
 
 
 def scp_file(host: str, ssh_user: str, ssh_key: str, local_path: Path, remote_path: str) -> None:
-    run(f"scp -i {ssh_key} {local_path} {ssh_user}@{host}:/tmp/{local_path.name}")
+    run(
+        f"scp -i {ssh_key} {SSH_OPTS} {local_path} {ssh_user}@{host}:/tmp/{local_path.name}"
+    )
     ssh(host, ssh_user, ssh_key, f"sudo mv /tmp/{local_path.name} {remote_path}")
 
 
@@ -54,9 +76,41 @@ def scp_text(host: str, ssh_user: str, ssh_key: str, remote_path: str, content: 
         scp_file(host, ssh_user, ssh_key, p, remote_path)
 
 
-def pick_dcp_ssh_host(dcp_record: Dict[str, Any]) -> str:
-    # Prefer EIP/public_ip; never rely on instance public_dns when EIP is in play.
-    return dcp_record.get("public_ip") or dcp_record.get("private_ip")
+def can_ssh(host: str, ssh_user: str, ssh_key: str, timeout: int = 5) -> bool:
+    try:
+        run(
+            f"ssh -i {ssh_key} {SSH_OPTS} "
+            f"-o ConnectTimeout={timeout} "
+            f"{ssh_user}@{host} echo ok",
+            check=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def pick_dcp_ssh_host(
+    dcp_record: Dict[str, Any],
+    ssh_user: str,
+    ssh_key: str,
+) -> str:
+    """
+    Try node public_ip first.
+    If unreachable, fall back to region EIP.
+    """
+    node_ip = dcp_record.get("public_ip")
+    eip = dcp_record.get("eip_public_ip")
+
+    if node_ip and can_ssh(node_ip, ssh_user, ssh_key):
+        return node_ip
+
+    if eip and can_ssh(eip, ssh_user, ssh_key):
+        return eip
+
+    raise RuntimeError(
+        f"Cannot SSH to DCP node {dcp_record.get('id')} "
+        f"via public_ip or eip_public_ip"
+    )
 
 
 # ----------------------------
@@ -88,14 +142,28 @@ def wait_for_expected_nodes(
             seed_host,
             ssh_user,
             ssh_key,
-            "cockroach node status --certs-dir=/var/lib/cockroach/certs --format=tsv",
+            "sudo -u cockroach cockroach node status "
+            "--certs-dir=/var/lib/cockroach/certs "
+            "--format=tsv",
             check=False,
         )
 
-        lines = [l for l in out.splitlines() if l.strip() and not l.startswith("id")]
-        live = [l for l in lines if "\tlive\t" in l]
+        lines = [l for l in out.splitlines() if l.strip() and not l.startswith("Warning:")]
+        if len(lines) < 2:
+            time.sleep(5)
+            continue
 
-        print(f"   seen={len(lines)} live={len(live)}")
+        header = lines[0].split("\t")
+        rows = [l.split("\t") for l in lines[1:]]
+
+        try:
+            is_live_idx = header.index("is_live")
+        except ValueError:
+            raise RuntimeError(f"Unexpected node status header: {header}")
+
+        live = [r for r in rows if len(r) > is_live_idx and r[is_live_idx] == "true"]
+
+        print(f"   seen={len(rows)} live={len(live)}")
 
         if len(live) >= expected_nodes:
             print("✅ All expected nodes are live")
@@ -144,29 +212,61 @@ def create_crdb_node_cert(node: Dict[str, Any], dns_zone: str, certs_dir: Path, 
     )
 
 
-def create_pgb_server_cert(region: str, dns_zone: str, certs_dir: Path, ca_key: Path, pgb_client_user: str) -> tuple[Path, Path]:
+def create_pgbouncer_server_cert(
+    region: str,
+    dns_zone: str,
+    certs_dir: Path,
+    ca_key: Path,
+) -> tuple[Path, Path]:
     """
-    Create a server certificate for PgBouncer endpoint pgb.<region>.<zone>.
-    Rename to server.<pgb_client_user>.crt/key to match the start-pgbouncer.sh expectations.
-    """
-    (certs_dir / "node.crt").unlink(missing_ok=True)
-    (certs_dir / "node.key").unlink(missing_ok=True)
+    Create a TLS server cert for PgBouncer.
+    Produces:
+      server.pgbouncer.crt
+      server.pgbouncer.key
 
+    SANs include:
+      - pgb.<region>.<dns_zone>
+      - localhost
+    """
+    key = certs_dir / "server.pgbouncer.key"
+    crt = certs_dir / "server.pgbouncer.crt"
+    csr = certs_dir / "server.pgbouncer.csr"
+    cnf = certs_dir / "server.pgbouncer.cnf"
+
+    cnf.write_text(f"""
+[ req ]
+default_bits        = 4096
+prompt              = no
+default_md          = sha256
+distinguished_name  = dn
+req_extensions      = req_ext
+
+[ dn ]
+CN = pgbouncer
+
+[ req_ext ]
+subjectAltName = @alt_names
+
+[ alt_names ]
+DNS.1 = pgb.{region}.{dns_zone}
+DNS.2 = localhost
+""".strip())
+
+    run(f"openssl genrsa -out {key} 4096")
+    run(f"openssl req -new -key {key} -out {csr} -config {cnf}")
     run(
-        "cockroach cert create-node "
-        f"pgb.{region}.{dns_zone} "
-        "localhost "
-        f"--certs-dir={certs_dir} "
-        f"--ca-key={ca_key}"
+        f"openssl x509 -req -in {csr} "
+        f"-CA {certs_dir/'ca.crt'} "
+        f"-CAkey {ca_key} "
+        f"-CAcreateserial "
+        f"-out {crt} "
+        f"-days 365 "
+        f"-sha256 "
+        f"-extensions req_ext "
+        f"-extfile {cnf}"
     )
 
-    server_crt = certs_dir / f"server.{pgb_client_user}.crt"
-    server_key = certs_dir / f"server.{pgb_client_user}.key"
-    server_crt.unlink(missing_ok=True)
-    server_key.unlink(missing_ok=True)
-    (certs_dir / "node.crt").replace(server_crt)
-    (certs_dir / "node.key").replace(server_key)
-    return server_crt, server_key
+    return crt, key
 
 
 # ----------------------------
@@ -176,27 +276,39 @@ def create_pgb_server_cert(region: str, dns_zone: str, certs_dir: Path, ca_key: 
 def install_crdb_certs(node: Dict[str, Any], ssh_user: str, ssh_key: str, certs_dir: Path) -> None:
     host = node["public_dns"]
     # Copy CA + node.* to node, then move into /var/lib/cockroach/certs
-    run(f"scp -i {ssh_key} {certs_dir/'ca.crt'} {ssh_user}@{host}:/tmp/ca.crt")
-    run(f"scp -i {ssh_key} {certs_dir/'node.crt'} {ssh_user}@{host}:/tmp/node.crt")
-    run(f"scp -i {ssh_key} {certs_dir/'node.key'} {ssh_user}@{host}:/tmp/node.key")
+    run(f"scp -i {ssh_key} {SSH_OPTS} {certs_dir/'ca.crt'} {ssh_user}@{host}:/tmp/ca.crt")
+    run(f"scp -i {ssh_key} {SSH_OPTS} {certs_dir/'node.crt'} {ssh_user}@{host}:/tmp/node.crt")
+    run(f"scp -i {ssh_key} {SSH_OPTS} {certs_dir/'node.key'} {ssh_user}@{host}:/tmp/node.key")
+    run(f"scp -i {ssh_key} {SSH_OPTS} {certs_dir/'client.root.crt'} {ssh_user}@{host}:/tmp/client.root.crt")
+    run(f"scp -i {ssh_key} {SSH_OPTS} {certs_dir/'client.root.key'} {ssh_user}@{host}:/tmp/client.root.key")
     run(f"""
-ssh -i {ssh_key} {ssh_user}@{host} <<'EOF'
+ssh -i {ssh_key} {SSH_OPTS} {ssh_user}@{host} <<'EOF'
 sudo mkdir -p /var/lib/cockroach/certs
-sudo mv /tmp/ca.crt /tmp/node.crt /tmp/node.key /var/lib/cockroach/certs/
+sudo mv /tmp/ca.crt /tmp/node.crt /tmp/node.key /tmp/client.root.crt /tmp/client.root.key /var/lib/cockroach/certs/
 sudo chown -R cockroach:cockroach /var/lib/cockroach
 sudo chmod 0644 /var/lib/cockroach/certs/*.crt
-sudo chmod 0600 /var/lib/cockroach/certs/node.key
+sudo chmod 0600 /var/lib/cockroach/certs/*.key
 EOF
 """)
 
 
-def install_and_start_crdb_service(nodes: List[Dict[str, Any]], ssh_user: str, ssh_key: str) -> None:
+def install_and_start_crdb_service(
+    nodes: List[Dict[str, Any]],
+    ssh_user: str,
+    ssh_key: str,
+    restart: bool,
+) -> None:
     """
-    Creates /etc/systemd/system/cockroach.service on each node and starts it.
-    Uses DNS names (node['name']) for advertise/join since Route53 A records exist for those names.
+    Creates /etc/systemd/system/cockroach.service on each node and
+    starts or restarts it depending on `restart`.
+
+    - restart=False → start only if not running
+    - restart=True  → force restart
     """
     join = ",".join(f"{n['name']}:26257" for n in nodes)
     total_nodes = len(nodes)
+
+    action = "restart" if restart else "start"
 
     for node in nodes:
         host = node["public_dns"]
@@ -227,7 +339,7 @@ def install_and_start_crdb_service(nodes: List[Dict[str, Any]], ssh_user: str, s
             )
 
         run(f"""
-ssh -i {ssh_key} {ssh_user}@{host} <<'EOF'
+ssh -i {ssh_key} {SSH_OPTS} {ssh_user}@{host} <<'EOF'
 sudo tee /etc/systemd/system/cockroach.service > /dev/null <<SERVICE
 [Unit]
 Description=CockroachDB
@@ -247,7 +359,7 @@ SERVICE
 
 sudo systemctl daemon-reload
 sudo systemctl enable cockroach
-sudo systemctl restart cockroach
+sudo systemctl {action} cockroach
 EOF
 """)
 
@@ -275,7 +387,7 @@ def init_cluster(seed_node: Dict[str, Any], certs_dir: Path) -> None:
 
 def sql_exec_on_seed(seed_host: str, ssh_user: str, ssh_key: str, sql: str) -> None:
     cmd = (
-        "cockroach sql "
+        "sudo -u cockroach cockroach sql "
         "--certs-dir=/var/lib/cockroach/certs "
         "--host=localhost:26257 "
         f"-e {json.dumps(sql)}"
@@ -312,7 +424,7 @@ def install_pgb_certs_on_dcp(
     """
     Copy:
       - ca.crt
-      - server.<pgb_client_user>.crt/key  (PgBouncer server identity)
+      - server.pgbouncer.crt/key  (PgBouncer server identity)
       - client.<pgb_server_user>.crt/key  (PgBouncer backend client identity for CRDB)
     Into /etc/pgbouncer/certs on each DCP node.
     """
@@ -321,8 +433,8 @@ def install_pgb_certs_on_dcp(
 
     for f in [
         certs_dir / "ca.crt",
-        certs_dir / f"server.{pgb_client_user}.crt",
-        certs_dir / f"server.{pgb_client_user}.key",
+        certs_dir / "server.pgbouncer.crt",
+        certs_dir / "server.pgbouncer.key",
         certs_dir / f"client.{pgb_server_user}.crt",
         certs_dir / f"client.{pgb_server_user}.key",
     ]:
@@ -332,6 +444,50 @@ def install_pgb_certs_on_dcp(
         "sudo chown -R postgres:postgres /etc/pgbouncer && "
         "sudo chmod 0644 /etc/pgbouncer/certs/*.crt && "
         "sudo chmod 0600 /etc/pgbouncer/certs/*.key")
+
+
+def compute_pgb_connections(total_conn: int, pgb_nodes: int) -> int:
+    # Divide across PgBouncer nodes
+    per_node = max(4, math.ceil(total_conn / pgb_nodes) / pgb_nodes)
+    return per_node
+
+
+def render_runner_env(
+    client_account: str,
+    server_account: str,
+    auth_mode: str,
+    client_password: str | None,
+    num_connections: int,
+    database: str,
+) -> str:
+    lines = [
+        f"PGB_CLIENT_ACCOUNT={client_account}",
+        f"PGB_SERVER_ACCOUNT={server_account}",
+        f"PGB_AUTH_MODE={auth_mode}",
+        f"PGB_NUM_CONNECTIONS={num_connections}",
+        f"PGB_DATABASE={database}",
+    ]
+
+    if auth_mode == "password":
+        lines.append(f"PGB_CLIENT_PASSWORD={client_password}")
+    else:
+        # avoid stale password lingering
+        lines.append("PGB_CLIENT_PASSWORD=")
+
+    return "\n".join(lines) + "\n"
+
+
+def push_runner_env(dcp_host: str, ssh_user: str, ssh_key: str, env_text: str) -> None:
+    scp_text(
+        host=dcp_host,
+        ssh_user=ssh_user,
+        ssh_key=ssh_key,
+        remote_path="/etc/pgbouncer/runner.env",
+        content=env_text,
+    )
+
+    ssh(dcp_host, ssh_user, ssh_key, "sudo chown postgres:postgres /etc/pgbouncer/runner.env")
+    ssh(dcp_host, ssh_user, ssh_key, "sudo chmod 600 /etc/pgbouncer/runner.env")
 
 
 def render_haproxy_cfg(pgbouncer_ips: List[str], backend_ips: List[str], pgb_port: int, db_port: int) -> str:
@@ -387,6 +543,7 @@ def push_haproxy_cfg(dcp_host: str, ssh_user: str, ssh_key: str, cfg: str) -> No
 
 
 def start_pgbouncer_runner(dcp_host: str, ssh_user: str, ssh_key: str) -> None:
+    ssh(dcp_host, ssh_user, ssh_key, "sudo systemctl daemon-reload")
     ssh(dcp_host, ssh_user, ssh_key, "sudo systemctl restart pgbouncer-runner")
 
 
@@ -397,7 +554,7 @@ def start_pgbouncer_runner(dcp_host: str, ssh_user: str, ssh_key: str) -> None:
 def validate_region_cert(region: str, dns_zone: str, certs_dir: Path, pgb_client_user: str, database: str, pgb_port: int) -> None:
     # Direct DB via VIP DNS
     db_host = f"db.{region}.{dns_zone}:26257"
-    run(f"cockroach sql --certs-dir={certs_dir} --host={db_host} -e 'SELECT 1;'")
+    run(f"sudo -u cockroach cockroach sql --certs-dir={certs_dir} --host={db_host} -e 'SELECT 1;'")
 
     # Through PgBouncer via VIP DNS (client cert)
     pgb_host = f"pgb.{region}.{dns_zone}"
@@ -422,46 +579,72 @@ def validate_region_password(region: str, dns_zone: str, username: str, password
 
 
 # ----------------------------
-# Main
+# Argument parsing
 # ----------------------------
 
-def main() -> None:
+def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--terraform-dir", required=True)
-    parser.add_argument("--tfvars-file", required=True)
-    parser.add_argument("--apply", action="store_true")
 
     parser.add_argument("--ssh-user", default="debian")
     parser.add_argument("--ssh-key", required=True)
 
+    # Infra
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--terraform-dir", required=True)
+    parser.add_argument("--tfvars-file", required=True)
+
+    # Certs
+    parser.add_argument("--ca-cert", action="store_true")
+    parser.add_argument("--node-certs", action="store_true")
+    parser.add_argument(
+        "--root-cert",
+        choices=[PhasePolicy.NEW, PhasePolicy.REFRESH, PhasePolicy.SKIP],
+        default=PhasePolicy.NEW,
+    )
     parser.add_argument("--dns-zone", required=True)
     parser.add_argument("--certs-dir", required=True)
     parser.add_argument("--ca-key", default="./my-safe-directory/ca.key")
 
+    # Cockroach
+    parser.add_argument(
+        "--start-nodes",
+        choices=[PhasePolicy.NEW, PhasePolicy.REFRESH, PhasePolicy.SKIP],
+        default=PhasePolicy.NEW,
+    )
+    parser.add_argument("--skip-init", action="store_true")
+    parser.add_argument("--sql-users", action="store_true")
+
+    # PgBouncer / HAProxy
+    parser.add_argument("--skip-pgbouncer", action="store_true")
+    parser.add_argument("--skip-haproxy", action="store_true")
     parser.add_argument("--auth-mode", choices=["password", "cert"], required=True)
-
-    # PgBouncer identity (cert mode) and default client identity
-    parser.add_argument("--pgb-client-user", default="postgres")  # client CN (cert mode), or a convenience test user
-    parser.add_argument("--pgb-server-user", default="pgb")       # PgBouncer -> CRDB (cert mode)
-
-    # Password mode: a single test user to create/validate (extend later)
-    parser.add_argument("--password-user", default="appuser")
-    parser.add_argument("--password", default="appuser-password")
-
+    parser.add_argument("--num-connections", type=int, default=10)
     parser.add_argument("--database", default="defaultdb")
     parser.add_argument("--pgb-port", type=int, default=5432)
     parser.add_argument("--db-port", type=int, default=26257)
 
-    parser.add_argument("--skip-init", action="store_true")
-    parser.add_argument("--skip-haproxy", action="store_true")
-    parser.add_argument("--skip-validation", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument("--pgb-client-user", default="postgres")
+    parser.add_argument("--pgb-server-user", default="pgb")
+    parser.add_argument("--password", default="appuser-password")
 
+    # Validation
+    parser.add_argument("--skip-validation", action="store_true")
+
+    return parser.parse_args()
+
+
+# ----------------------------
+# Main orchestration
+# ----------------------------
+
+def main():
+    args = parse_args()
+
+    # 1) Terraform
     if args.apply:
         terraform_apply(args.terraform_dir, args.tfvars_file)
 
     outputs = terraform_output(args.terraform_dir)
-
     cockroach_nodes_by_region = outputs["cockroach_nodes"]["value"]
     dcp_endpoints_by_region = outputs["dcp_endpoints"]["value"]
 
@@ -472,12 +655,11 @@ def main() -> None:
             n["region"] = region
             nodes.append(n)
 
-    # Flatten dcp nodes
-    proxies: List[Dict[str, Any]] = []
-    for region, region_proxies in dcp_endpoints_by_region.items():
-        for p in region_proxies:
+    dcp_nodes: List[Dict[str, Any]] = []
+    for region, region_nodes in dcp_endpoints_by_region.items():
+        for p in region_nodes:
             p["region"] = region
-            proxies.append(p)
+            dcp_nodes.append(p)
 
     # Group
     crdb_by_region: Dict[str, List[Dict[str, Any]]] = {}
@@ -485,68 +667,125 @@ def main() -> None:
         crdb_by_region.setdefault(n["region"], []).append(n)
 
     dcp_by_region: Dict[str, List[Dict[str, Any]]] = {}
-    for p in proxies:
+    for p in dcp_nodes:
         dcp_by_region.setdefault(p["region"], []).append(p)
 
     certs_dir = Path(args.certs_dir).expanduser().resolve()
     ca_key = Path(args.ca_key).expanduser().resolve()
 
-    # 1) Ensure CA (both modes, harmless; needed for direct cockroach verify-full and cert mode)
-    ensure_ca(certs_dir, ca_key)
+    # 2) CA
+    if args.ca_cert:
+        ensure_ca(certs_dir, ca_key)
+    else:
+        if not ca_key.exists():
+            raise RuntimeError("CA does not exist and --ca-cert not specified")
 
-    # 2) Client certs (cert mode needs both client identities; password mode typically uses root locally for validation)
-    # Always create root client for local admin operations (init/validate convenience)
-    create_client_cert(certs_dir, ca_key, "root")
+    # 3) root and dcp certs
+    if args.root_cert != PhasePolicy.SKIP:
+        if args.root_cert == PhasePolicy.REFRESH or not (certs_dir / "client.root.crt").exists():
+            create_client_cert(certs_dir, ca_key, "root")
 
-    if args.auth_mode == "cert":
-        create_client_cert(certs_dir, ca_key, args.pgb_server_user)  # pgb -> crdb
-        create_client_cert(certs_dir, ca_key, args.pgb_client_user)  # client -> pgb
+    if args.auth_mode == "cert" and args.sql_users:
+        if not (certs_dir / f"client.{args.pgb_server_user}.crt").exists():
+            create_client_cert(certs_dir, ca_key, args.pgb_server_user)  # pgb -> crdb
+        if not (certs_dir / f"client.{args.pgb_client_user}.crt").exists():
+            create_client_cert(certs_dir, ca_key, args.pgb_client_user)  # client -> pgb
 
-    # 3) Generate + install node certs, then install/start cockroach service
+    # 4) node certs
     for node in nodes:
         wait_for_ssh(node["public_dns"], args.ssh_user, args.ssh_key, timeout=300)
-        create_crdb_node_cert(node, args.dns_zone, certs_dir, ca_key)
+        if args.node_certs:
+            create_crdb_node_cert(node, args.dns_zone, certs_dir, ca_key)
         install_crdb_certs(node, args.ssh_user, args.ssh_key, certs_dir)
 
-    install_and_start_crdb_service(nodes, args.ssh_user, args.ssh_key)
+    # 5) start Cockroach nodes
+    if args.start_nodes != PhasePolicy.SKIP:
+        install_and_start_crdb_service(
+            nodes,
+            args.ssh_user,
+            args.ssh_key,
+            restart=(args.start_nodes == PhasePolicy.REFRESH),
+        )
 
-    # 4) Wait for cluster SQL to respond
-    seed = nodes[0]
-    wait_for_expected_nodes(seed["public_dns"], args.ssh_user, args.ssh_key, expected_nodes=len(nodes))
+        wait_for_expected_nodes(
+            seed_host=nodes[0]["public_dns"],
+            ssh_user=args.ssh_user,
+            ssh_key=args.ssh_key,
+            expected_nodes=len(nodes),
+        )
 
-    # 5) Init cluster (multi-node)
+    # 6) init cluster
     if not args.skip_init and len(nodes) > 1:
-        init_cluster(seed, certs_dir)
+        init_cluster(nodes[0], certs_dir)
 
-    # 6) Create DB/users (both modes)
-    if args.auth_mode == "cert":
-        # Both identities must exist in SQL namespace (CN mapping)
-        ensure_db_and_user(seed["public_dns"], args.ssh_user, args.ssh_key, args.database, args.pgb_server_user, password=None, make_admin=True)
-        ensure_db_and_user(seed["public_dns"], args.ssh_user, args.ssh_key, args.database, args.pgb_client_user, password=None, make_admin=False)
-    else:
-        # Create at least one test/expected app user with password
-        ensure_db_and_user(seed["public_dns"], args.ssh_user, args.ssh_key, args.database, args.password_user, password=args.password, make_admin=False)
+    # 7) SQL users / DBs
+    if args.sql_users:
+        if args.auth_mode == "cert":
+            ensure_db_and_user(
+                nodes[0]["public_dns"],
+                args.ssh_user,
+                args.ssh_key,
+                args.database,
+                args.pgb_server_user,
+                password=None,
+                make_admin=True,
+            )
+            ensure_db_and_user(
+                nodes[0]["public_dns"],
+                args.ssh_user,
+                args.ssh_key,
+                args.database,
+                args.pgb_client_user,
+                password=None,
+                make_admin=False,
+            )
+        else:
+            ensure_db_and_user(
+                nodes[0]["public_dns"],
+                args.ssh_user,
+                args.ssh_key,
+                args.database,
+                args.pgb_client_user,
+                password=args.password,
+                make_admin=False,
+            )
 
-    # 7) PgBouncer (cert mode: create per-region server cert & distribute; password mode: just start)
-    if args.auth_mode == "cert":
+    # 8) PgBouncer
+    if not args.skip_pgbouncer:
+        total_pgb_nodes = sum(len(region_proxies) for region_proxies in dcp_by_region.values())
+        per_node_conn = compute_pgb_connections(args.num_connections, total_pgb_nodes)
+
+        env_text = render_runner_env(
+            client_account=args.pgb_client_user,
+            server_account=args.pgb_server_user,
+            auth_mode=args.auth_mode,
+            client_password=args.password,
+            num_connections=per_node_conn,
+            database=args.database,
+        )
+
         for region, region_proxies in dcp_by_region.items():
-            # Generate server cert once per region (pgb.<region>.<zone>)
-            create_pgb_server_cert(region, args.dns_zone, certs_dir, ca_key, args.pgb_client_user)
+            if args.auth_mode == "cert":
+                create_pgbouncer_server_cert(region, args.dns_zone, certs_dir, ca_key)
 
-            # Push certs + start runner on every DCP node
             for p in region_proxies:
-                dcp_host = pick_dcp_ssh_host(p)
+                dcp_host = pick_dcp_ssh_host(p, args.ssh_user, args.ssh_key)
                 wait_for_ssh(dcp_host, args.ssh_user, args.ssh_key, timeout=300)
-                install_pgb_certs_on_dcp(dcp_host, args.ssh_user, args.ssh_key, certs_dir, args.pgb_client_user, args.pgb_server_user)
-                start_pgbouncer_runner(dcp_host, args.ssh_user, args.ssh_key)
-    else:
-        for region, region_proxies in dcp_by_region.items():
-            for p in region_proxies:
-                dcp_host = pick_dcp_ssh_host(p)
-                wait_for_ssh(dcp_host, args.ssh_user, args.ssh_key, timeout=300)
+                push_runner_env(dcp_host, args.ssh_user, args.ssh_key, env_text)
+
+                if args.auth_mode == "cert":
+                    install_pgb_certs_on_dcp(
+                        dcp_host,
+                        args.ssh_user,
+                        args.ssh_key,
+                        certs_dir,
+                        args.pgb_client_user,
+                        args.pgb_server_user,
+                    )
+
                 start_pgbouncer_runner(dcp_host, args.ssh_user, args.ssh_key)
 
-    # 8) HAProxy render/push/restart (per region: pgb pool = all DCP nodes in region; db pool = CRDB nodes in region)
+    # 9) HAProxy
     if not args.skip_haproxy:
         for region, region_proxies in dcp_by_region.items():
             pgb_ips = [p["private_ip"] for p in region_proxies]
@@ -556,16 +795,16 @@ def main() -> None:
 
             cfg = render_haproxy_cfg(pgb_ips, db_ips, pgb_port=args.pgb_port, db_port=args.db_port)
             for p in region_proxies:
-                dcp_host = pick_dcp_ssh_host(p)
+                dcp_host = pick_dcp_ssh_host(p, args.ssh_user, args.ssh_key)
                 push_haproxy_cfg(dcp_host, args.ssh_user, args.ssh_key, cfg)
 
-    # 9) Validate
+    # 10) Validation
     if not args.skip_validation:
         for region in sorted(dcp_by_region.keys()):
             if args.auth_mode == "cert":
                 validate_region_cert(region, args.dns_zone, certs_dir, args.pgb_client_user, args.database, args.pgb_port)
             else:
-                validate_region_password(region, args.dns_zone, args.password_user, args.password, args.database, args.pgb_port)
+                validate_region_password(region, args.dns_zone, args.pgb_client_user, args.password, args.database, args.pgb_port)
 
     print("\n✅ Bootstrap complete: Cockroach + PgBouncer + HAProxy configured and validated")
 

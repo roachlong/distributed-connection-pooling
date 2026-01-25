@@ -182,18 +182,16 @@ for (( i=1; i<=${num_files}; i++ )); do
     sed -i "s/%DATABASE%/${DATABASE}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
     sed -i "s/%HOST_IP%/${HOST_IP}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
     sed -i "s/%HOST_PORT%/${HOST_PORT}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
-    sed -i "s/%CLIENT%/${PGBOUNCER_CLIENT}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
     sed -i "s/%PGID%/${PGID}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
     sed -i "s/%SIZE%/${pool_size}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
-    sed -i "s/%SERVER%/${PGBOUNCER_SERVER}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
 
     if [[ "${AUTH_MODE}" == "cert" ]]; then
         sed -i "s/^auth_type =.*/auth_type = cert/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
         sed -i "s/%SERVER_USER%/user=${PGBOUNCER_SERVER}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
         sed -i "s/^client_tls_sslmode =.*/client_tls_sslmode = verify-full/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
         sed -i "s/^; client_tls_ca_file =.*/client_tls_ca_file = \/etc\/pgbouncer\/certs\/ca.crt/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
-        sed -i "s/^; client_tls_key_file =.*/client_tls_key_file = \/etc\/pgbouncer\/certs\/server.${PGBOUNCER_CLIENT}.key/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
-        sed -i "s/^; client_tls_cert_file =.*/client_tls_cert_file = \/etc\/pgbouncer\/certs\/server.${PGBOUNCER_CLIENT}.crt/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+        sed -i "s/^; client_tls_key_file =.*/client_tls_key_file = \/etc\/pgbouncer\/certs\/server.pgbouncer.key/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+        sed -i "s/^; client_tls_cert_file =.*/client_tls_cert_file = \/etc\/pgbouncer\/certs\/server.pgbouncer.crt/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
         sed -i "s/^server_tls_sslmode =.*/server_tls_sslmode = verify-full/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
         sed -i "s/^; server_tls_ca_file =.*/server_tls_ca_file = \/etc\/pgbouncer\/certs\/ca.crt/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
         sed -i "s/^; server_tls_key_file =.*/server_tls_key_file = \/etc\/pgbouncer\/certs\/client.${PGBOUNCER_SERVER}.key/" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini

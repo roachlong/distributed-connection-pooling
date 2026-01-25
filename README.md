@@ -448,7 +448,7 @@ cockroach cert create-client pgb --certs-dir=./certs --ca-key=./my-safe-director
 chmod 600 ./certs/client.pgb.key
 
 # generate the config file used for CSR and signing
-cat > "./certs/server.pgb.cnf" <<EOF
+cat > "./certs/server.pgbouncer.cnf" <<EOF
 [ req ]
 default_bits        = 4096
 prompt              = no
@@ -477,31 +477,31 @@ IP.4  = 172.18.0.253
 EOF
 
 # generate a private key for PgBouncer (server key)
-openssl genrsa -out ./certs/server.pgb.key 4096
-chmod 600 ./certs/server.pgb.key
+openssl genrsa -out ./certs/server.pgbouncer.key 4096
+chmod 600 ./certs/server.pgbouncer.key
 
 # create a CSR using that key + config
 openssl req \
   -new \
-  -key ./certs/server.pgb.key \
-  -out ./certs/server.pgb.csr \
-  -config ./certs/server.pgb.cnf
+  -key ./certs/server.pgbouncer.key \
+  -out ./certs/server.pgbouncer.csr \
+  -config ./certs/server.pgbouncer.cnf
 
 # sign the CSR with existing cockroach CA
 openssl x509 \
   -req \
-  -in ./certs/server.pgb.csr \
+  -in ./certs/server.pgbouncer.csr \
   -CA ./certs/ca.crt \
   -CAkey ./my-safe-directory/ca.key \
   -CAcreateserial \
-  -out ./certs/server.pgb.crt \
+  -out ./certs/server.pgbouncer.crt \
   -days 365 \
   -sha256 \
   -extensions v3_req \
-  -extfile ./certs/server.pgb.cnf
+  -extfile ./certs/server.pgbouncer.cnf
 
 # verify the SANs look correct
-openssl x509 -in ./certs/server.pgb.crt -noout -text | grep -A1 "Subject Alternative Name"
+openssl x509 -in ./certs/server.pgbouncer.crt -noout -text | grep -A1 "Subject Alternative Name"
 ```
 
 And then build the image and deploy the instances
@@ -1621,12 +1621,6 @@ ha_node_count = 2
 pgb_port = 5432
 db_port = 26257
 ui_port = 8080
-pgb_client = "jleelong"
-auth_mode = "cert"
-client_pwd = ""
-pgb_server = "pgb"
-num_conn_per_region = 32
-database = "defaultdb"
 EOF
 ```
 
@@ -1680,20 +1674,27 @@ Now we can run the controller to orchestrate the deployment and initialization o
 ```
 export TF_VAR_ssh_public_key=$(cat ./my-safe-directory/dev.pub)
 python controller.py \
-  --terraform-dir ./terraform/aws \
-  --tfvars-file crdb-dcp-test.tfvars \
   --ssh-user debian \
   --ssh-key ./my-safe-directory/dev \
+  --apply \
+  --terraform-dir ./terraform/aws \
+  --tfvars-file crdb-dcp-test.tfvars \
+  --ca-cert \
+  --node-certs \
+  --root-cert new \
+  --dns-zone dcp-test.crdb.com \
   --certs-dir ./certs/crdb-dcp-test \
   --ca-key ./my-safe-directory/ca.key \
+  --start-nodes new \
+  --sql-users \
   --auth-mode cert \
-  --pgb-client-user pgb \
-  --pgb-server-user pgb \
+  --num-connections 32 \
   --database defaultdb \
   --pgb-port 5432 \
-  --db-port 26257
-  --dns-zone dcp-test.crdb.com \
-  --apply
+  --db-port 26257 \
+  --pgb-client-user jleelong \
+  --pgb-server-user pgb
+
 
 
 
@@ -1723,11 +1724,11 @@ ls -ltrh /var/lib/cockroach/certs
 cockroach --version
 exit
 
-DCPNODE=$(terraform -chdir=terraform/aws output -json dcp_endpoints | jq -r '.["us-east-2"][0]["public_dns"]')
+DCPNODE=$(terraform -chdir=terraform/aws output -json dcp_endpoints | jq -r '.["us-east-2"][0]["public_ip"]')
 ssh -i ./my-safe-directory/dev debian@$DCPNODE
-ls -l /opt/dcp
-ls -l /etc/pgbouncer
-ls -l /usr/local/bin/claim-eip.sh
+ls -ltrh /opt/dcp
+ls -ltrh /etc/pgbouncer
+ls -ltrh /usr/local/bin/claim-eip.sh
 systemctl status pgbouncer-runner
 systemctl status keepalived
 exit

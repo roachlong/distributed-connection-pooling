@@ -10,6 +10,17 @@ write_files:
   # PgBouncer runner + templates
   # -----------------------------
   #
+  - path: /etc/pgbouncer/runner.env
+    permissions: "0644"
+    owner: pgbouncer:pgbouncer
+    content: |
+      PGB_CLIENT_ACCOUNT=appuser
+      PGB_SERVER_ACCOUNT=appuser
+      PGB_AUTH_MODE=password
+      PGB_CLIENT_PASSWORD=appuser-password
+      PGB_NUM_CONNECTIONS=24
+      PGB_DATABASE=defaultdb
+
   - path: /etc/systemd/system/pgbouncer-runner.service
     permissions: "0644"
     owner: root:root
@@ -23,20 +34,26 @@ write_files:
       Type=simple
       User=postgres
       Group=postgres
+
+      # Controller-managed config
+      EnvironmentFile=/etc/pgbouncer/runner.env
+
       ExecStart=/etc/pgbouncer/start-pgbouncer.sh \
-        --client-account ${pgb_client} \
-        --auth-mode ${auth_mode} \
-        --client-password ${client_pwd} \
-        --server-account ${pgb_server} \
-        --num-connections ${num_connections} \
+        --client-account $${PGB_CLIENT_ACCOUNT} \
+        --server-account $${PGB_SERVER_ACCOUNT} \
+        --auth-mode $${PGB_AUTH_MODE} \
+        --client-password $${PGB_CLIENT_PASSWORD} \
+        --num-connections $${PGB_NUM_CONNECTIONS} \
+        --database $${PGB_DATABASE} \
         --host-ip db.${region}.${dns_zone} \
-        --host-port ${db_port} \
-        --database ${database}
+        --host-port ${db_port}
+
       Restart=always
       RestartSec=5
 
       [Install]
       WantedBy=multi-user.target
+
 
   #
   # -----------------------------
@@ -85,7 +102,7 @@ write_files:
       cat > /etc/keepalived/keepalived.conf <<EOF
       vrrp_instance VI_DCP {
         state BACKUP
-        interface ${IFACE}
+        interface $${IFACE}
         virtual_router_id 42
         priority 100
         advert_int 1

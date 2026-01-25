@@ -58,8 +58,8 @@ auth_file = %SCRIPT_DIR%/userlist.txt
 ; In cert mode, you typically use:
 ;   client_tls_sslmode = verify-full
 ;   client_tls_ca_file = /etc/pgbouncer/certs/ca.crt
-;   client_tls_key_file = /etc/pgbouncer/certs/server.pgb.key
-;   client_tls_cert_file = /etc/pgbouncer/certs/server.pgb.crt
+;   client_tls_key_file = /etc/pgbouncer/certs/server.postgres.key
+;   client_tls_cert_file = /etc/pgbouncer/certs/server.postgres.crt
 ;
 ; The start script will also toggle these based on mode.
 ; ------------------------------------------------------------------------------
