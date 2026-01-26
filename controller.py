@@ -536,7 +536,7 @@ def render_haproxy_cfg(pgbouncer_ips: List[str], backend_ips: List[str], pgb_por
         "  default-server inter 2s fall 3 rise 2",
     ]
     for i, ip in enumerate(pgbouncer_ips, start=1):
-        lines.append(f"  server pgb{i} {ip}:{pgb_port} check")
+        lines.append(f"  server pgb{i} {ip}:6432 check")
 
     lines += [
         "",

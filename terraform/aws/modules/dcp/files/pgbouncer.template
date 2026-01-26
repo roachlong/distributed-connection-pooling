@@ -18,7 +18,7 @@
 ; The start script will usually override listen_port via CLI and possibly write
 ; out per-instance config files (e.g., pgbouncer.0.ini, pgbouncer.1.ini)
 ; ------------------------------------------------------------------------------
-listen_port = 5432
+listen_port = 6432
 listen_addr = *
 
 ; ------------------------------------------------------------------------------

@@ -1682,7 +1682,7 @@ python controller.py \
   --ca-cert \
   --node-certs \
   --root-cert new \
-  --dns-zone crdb-dcp-test.hutchandben.com \
+  --dns-zone dcp-test.crdb.com \
   --certs-dir ./certs/crdb-dcp-test \
   --ca-key ./my-safe-directory/ca.key \
   --start-nodes new \
@@ -1724,7 +1724,7 @@ ls -ltrh /var/lib/cockroach/certs
 cockroach --version
 exit
 
-DCPNODE=$(terraform -chdir=terraform/aws output -json dcp_endpoints | jq -r '.["us-east-2"][0]["public_ip"]')
+DCPNODE=$(terraform -chdir=terraform/aws output -json dcp_endpoints | jq -r '.["us-east-2"][0]["eip_public_ip"]')
 ssh -i ./my-safe-directory/dev debian@$DCPNODE
 ls -ltrh /opt/dcp
 ls -ltrh /etc/pgbouncer

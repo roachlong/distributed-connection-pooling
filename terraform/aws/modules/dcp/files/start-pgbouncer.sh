@@ -200,7 +200,7 @@ for (( i=1; i<=${num_files}; i++ )); do
 
     script_dir_esc=$(eval echo ${SCRIPT_DIR} | sed 's/\//\\\//g')
     sed -i "s/%SCRIPT_DIR%/${script_dir_esc}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
-    mkdir -p ${SCRIPT_DIR}/../run/${PGID}
+    mkdir -p /var/run/pgbouncer/${PGID}
 done
 chown -R postgres:postgres ${SCRIPT_DIR}
 
