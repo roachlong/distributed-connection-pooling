@@ -127,6 +127,25 @@ def wait_for_ssh(host: str, ssh_user: str, ssh_key: str, timeout: int = 300) -> 
     raise RuntimeError(f"Timed out waiting for SSH on {host}")
 
 
+def wait_for_cloud_init(
+    host: str,
+    ssh_user: str,
+    ssh_key: str,
+) -> None:
+    print(f"⏳ Waiting for cloud-init to finish on {host}...")
+    try:
+        ssh(
+            host,
+            ssh_user,
+            ssh_key,
+            "sudo cloud-init status --wait > /dev/null",
+            check=True,
+        )
+        print("✅ cloud-init finished")
+    except Exception as e:
+        raise RuntimeError(f"cloud-init did not complete on {host}") from e
+
+
 def wait_for_expected_nodes(
     seed_host: str,
     ssh_user: str,
@@ -442,13 +461,14 @@ def install_pgb_certs_on_dcp(
 
     ssh(dcp_host, ssh_user, ssh_key,
         "sudo chown -R postgres:postgres /etc/pgbouncer && "
-        "sudo chmod 0644 /etc/pgbouncer/certs/*.crt && "
-        "sudo chmod 0600 /etc/pgbouncer/certs/*.key")
+        "sudo find /etc/pgbouncer/certs -type f -name '*.crt' -exec chmod 0644 {} + && "
+        "sudo find /etc/pgbouncer/certs -type f -name '*.key' -exec chmod 0600 {} +"
+    )
 
 
 def compute_pgb_connections(total_conn: int, pgb_nodes: int) -> int:
     # Divide across PgBouncer nodes
-    per_node = max(4, math.ceil(total_conn / pgb_nodes) / pgb_nodes)
+    per_node = max(4, math.ceil(total_conn / pgb_nodes))
     return per_node
 
 
@@ -554,7 +574,7 @@ def start_pgbouncer_runner(dcp_host: str, ssh_user: str, ssh_key: str) -> None:
 def validate_region_cert(region: str, dns_zone: str, certs_dir: Path, pgb_client_user: str, database: str, pgb_port: int) -> None:
     # Direct DB via VIP DNS
     db_host = f"db.{region}.{dns_zone}:26257"
-    run(f"sudo -u cockroach cockroach sql --certs-dir={certs_dir} --host={db_host} -e 'SELECT 1;'")
+    run(f"cockroach sql --certs-dir={certs_dir} --host={db_host} -e 'SELECT 1;'")
 
     # Through PgBouncer via VIP DNS (client cert)
     pgb_host = f"pgb.{region}.{dns_zone}"
@@ -694,6 +714,7 @@ def main():
     # 4) node certs
     for node in nodes:
         wait_for_ssh(node["public_dns"], args.ssh_user, args.ssh_key, timeout=300)
+        wait_for_cloud_init(node["public_dns"], args.ssh_user, args.ssh_key)
         if args.node_certs:
             create_crdb_node_cert(node, args.dns_zone, certs_dir, ca_key)
         install_crdb_certs(node, args.ssh_user, args.ssh_key, certs_dir)
@@ -771,6 +792,7 @@ def main():
             for p in region_proxies:
                 dcp_host = pick_dcp_ssh_host(p, args.ssh_user, args.ssh_key)
                 wait_for_ssh(dcp_host, args.ssh_user, args.ssh_key, timeout=300)
+                wait_for_cloud_init(dcp_host, args.ssh_user, args.ssh_key)
                 push_runner_env(dcp_host, args.ssh_user, args.ssh_key, env_text)
 
                 if args.auth_mode == "cert":

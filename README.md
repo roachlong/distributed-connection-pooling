@@ -1682,7 +1682,7 @@ python controller.py \
   --ca-cert \
   --node-certs \
   --root-cert new \
-  --dns-zone dcp-test.crdb.com \
+  --dns-zone crdb-dcp-test.hutchandben.com \
   --certs-dir ./certs/crdb-dcp-test \
   --ca-key ./my-safe-directory/ca.key \
   --start-nodes new \

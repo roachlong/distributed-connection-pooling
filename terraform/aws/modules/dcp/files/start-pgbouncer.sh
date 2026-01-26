@@ -205,7 +205,7 @@ done
 chown -R postgres:postgres ${SCRIPT_DIR}
 
 while true; do
-    for FILE in ${SCRIPT_DIR}/*.ini; do
+    for FILE in ${SCRIPT_DIR}/pgbouncer.*.ini; do
         pid=$(ps aux | grep ${FILE} | grep -v 'grep' | awk '{print $2}')
         if [ -z "${pid}" ]; then
             pgbouncer -d -u postgres ${FILE}

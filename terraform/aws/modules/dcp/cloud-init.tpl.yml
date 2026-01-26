@@ -1,6 +1,6 @@
 #cloud-config
-#cloud-config
 repo_update: true
+package_update: true
 package_upgrade: true
 timezone: UTC
 
@@ -12,7 +12,7 @@ write_files:
   #
   - path: /etc/pgbouncer/runner.env
     permissions: "0644"
-    owner: pgbouncer:pgbouncer
+    owner: root:root
     content: |
       PGB_CLIENT_ACCOUNT=appuser
       PGB_SERVER_ACCOUNT=appuser
@@ -120,11 +120,27 @@ write_files:
       }
       EOF
 
+packages:
+  - awscli
+  - ca-certificates
+  - curl
+  - dnsutils
+  - gnupg2
+  - haproxy
+  - jq
+  - keepalived
+  - net-tools
+  - pgbouncer
+  - postgresql-client
+
 runcmd:
   #
   # Base directories
   #
   - mkdir -p /etc/pgbouncer/certs
+  - mkdir -p /var/run/pgbouncer
+  - mkdir -p /var/log/pgbouncer
+  - rm /etc/pgbouncer/pgbouncer.ini || true
 
   #
   # Fetch artifacts from GitHub (public)
@@ -138,7 +154,7 @@ runcmd:
   #
   - chmod +x /etc/pgbouncer/start-pgbouncer.sh
   - chmod +x /usr/local/bin/claim-eip.sh
-  - chown -R postgres:postgres /etc/pgbouncer
+  - chown -R postgres:postgres /etc/pgbouncer /var/run/pgbouncer /var/log/pgbouncer
   - chmod 700 /etc/pgbouncer/certs
 
   #
@@ -146,6 +162,7 @@ runcmd:
   #
   - /usr/local/bin/generate-keepalived-conf.sh
   - systemctl daemon-reload
+  - systemctl disable --now pgbouncer || true
   - systemctl enable pgbouncer-runner
   - systemctl enable haproxy
   - systemctl enable keepalived
@@ -155,19 +172,6 @@ runcmd:
   #
   - systemctl start haproxy
   - systemctl start keepalived
-
-packages:
-  - awscli
-  - ca-certificates
-  - curl
-  - dnsutils
-  - gnupg2
-  - haproxy
-  - jq
-  - keepalived
-  - net-tools
-  - pgbouncer
-  - postgresql-client
 
 users:
 - default

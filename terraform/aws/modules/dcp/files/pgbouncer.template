@@ -24,7 +24,7 @@ listen_addr = *
 ; ------------------------------------------------------------------------------
 ; Low level network settings
 ; ------------------------------------------------------------------------------
-unix_socket_dir = %SCRIPT_DIR%/../run/%PGID%
+unix_socket_dir = /var/run/pgbouncer/%PGID%
 so_reuseport = 1
 pkt_buf = 8192
 tcp_keepalive = 1
@@ -126,8 +126,8 @@ verbose = 0
 
 ; Where PgBouncer will log (stdout by default in Docker).
 syslog = 0
-logfile = %SCRIPT_DIR%/../pgbouncer.%PGID%.log
-pidfile = %SCRIPT_DIR%/../pgbouncer.%PGID%.pid
+logfile = /var/log/pgbouncer/pgbouncer.%PGID%.log
+pidfile = /var/run/pgbouncer/%PGID%/pgbouncer.pid
 
 ; ------------------------------------------------------------------------------
 ; Admin console
