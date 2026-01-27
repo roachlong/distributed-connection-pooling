@@ -1527,8 +1527,15 @@ docker exec -it ha-node-us-east-1 bash -lc "tail -n 100 /var/log/corosync/corosy
 
 
 ## Reference Architecture
-### WIP
-We can setup an actual multi-region cluster in the cloud of your choice.  I'm going to use AWS with terraform and then simulate the distributed connection pool locally.  I'll start by setting up my AWS crednetials with my SSO profile and verify with a simple aws cli command.
+This is a work in progress...
+
+### AWS Setup
+We can setup an actual multi-region cluster in the cloud of your choice.  I'm going to use AWS with terraform and then simulate the distributed connection pool locally.
+
+<details>
+<summary>more info...</summary>
+
+I'll start by setting up my AWS crednetials with an SSO profile and verify with a simple aws cli command.
 ```
 # first i needed to update my aws cli version
 curl -k "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "AWSCLIV2.pkg"
@@ -1579,51 +1586,6 @@ aws route53 get-hosted-zone --id Z09942323KHF5XIP6R8IR
 dig NS dcp-test.crdb.com
 ```
 
-If the credentials for your AWS account work and the hosted zone is available then you should be able to leverage the startup scripts with terraform to setup our reference architecture for testing.  We can use a tfvars file to configure our cluster, i.e.
-```
-# to find your public ip for the ssh ip range you can use
-dig +short myip.opendns.com @resolver1.opendns.com
-
-# then setup the values for your tfvars configuration
-cat <<'EOF' > ./terraform/aws/crdb-dcp-test.tfvars
-project_name = "crdb-dcp-test"
-project_tags = {
-    Project = "jsonb-vs-text"
-}
-dns_zone = "dcp-test.crdb.com"
-public_zone_id = "Z09942323KHF5XIP6R8IR"
-enabled_regions = ["us-east-2", "us-west-1", "us-west-2]
-vpc_cidrs = {
-    us-east-1 = "10.10.0.0/16"
-    us-east-2 = "10.20.0.0/16"
-    us-west-1 = "10.30.0.0/16"
-    us-west-2 = "10.40.0.0/16"
-}
-ssh_ip_range = "xxx.xxx.xxx.xxx/32"
-ssh_key_name = "dev"
-
-nodes_per_region = 1
-az_count = 1
-vm_user = "debian"
-
-cockroach_version = "25.4.3"
-cluster_profile_name = "m6a-2xlarge"
-cockroach_disk_size_gb = 50
-cockroach_disk_type = "gp3"
-cockroach_disk_iops = null
-cockroach_disk_throughput = null
-
-proxy_defaults = {
-    instance_architecture = "amd64"
-    instance_type = "c6a.large"
-}
-ha_node_count = 2
-pgb_port = 5432
-db_port = 26257
-ui_port = 8080
-EOF
-```
-
 You may also need to create a limited inline policy for your assigned role so that our HA solution can move the EIP during failover.  If a policy can't be created you can comment out the eni_role, eni_policy and eni_profile resources and the dcp_node iam_instance_profile in the dcp module of the terraform scripts, as well as the notify_master command of the keepalived.conf file configured in the dcp module cloud-init script.
 ```
 {
@@ -1669,6 +1631,59 @@ You may also need to create a limited inline policy for your assigned role so th
   ]
 }
 ```
+</details>
+
+### DCP Deployment
+If the credentials for your AWS account work and the hosted zone is available then you should be able to leverage the startup scripts with terraform to setup our reference architecture for testing.
+
+<details>
+<summary>more info...</summary>
+
+We can use a tfvars file to configure our cluster, i.e.
+```
+# to find your public ip for the ssh ip range you can use
+dig +short myip.opendns.com @resolver1.opendns.com
+
+# then setup the values for your tfvars configuration
+cat <<'EOF' > ./terraform/aws/crdb-dcp-test.tfvars
+project_name = "crdb-dcp-test"
+project_tags = {
+    Project = "jsonb-vs-text"
+}
+dns_zone = "dcp-test.crdb.com"
+public_zone_id = "Z09942323KHF5XIP6R8IR"
+enabled_regions = ["us-east-2", "us-west-1", "us-west-2]
+vpc_cidrs = {
+    us-east-1 = "10.10.0.0/16"
+    us-east-2 = "10.20.0.0/16"
+    us-west-1 = "10.30.0.0/16"
+    us-west-2 = "10.40.0.0/16"
+}
+ssh_ip_range = "xxx.xxx.xxx.xxx/32"
+ssh_key_name = "dev"
+
+nodes_per_region = 1
+az_count = 1
+vm_user = "debian"
+permissions_boundary_arn = "arn:aws:iam::<ACCOUNT_ID>:policy/CL-Revenue-Permissions-Boundary"
+
+cockroach_version = "25.4.3"
+cluster_profile_name = "m6a-2xlarge"
+cockroach_disk_size_gb = 50
+cockroach_disk_type = "gp3"
+cockroach_disk_iops = null
+cockroach_disk_throughput = null
+
+proxy_defaults = {
+    instance_architecture = "amd64"
+    instance_type = "c6a.large"
+}
+ha_node_count = 2
+pgb_port = 5432
+db_port = 26257
+ui_port = 8080
+EOF
+```
 
 Now we can run the controller to orchestrate the deployment and initialization of our cockroach cluster
 ```
@@ -1694,16 +1709,72 @@ python controller.py \
   --db-port 26257 \
   --pgb-client-user jleelong \
   --pgb-server-user pgb
+```
 
+Next we'll need to configure our multi-region cluster
+```
+cockroach sql --certs-dir ./certs/crdb-dcp-test --url "postgresql://db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full" -e """
+ALTER DATABASE defaultdb SET PRIMARY REGION 'us-east-2';
+ALTER DATABASE defaultdb ADD REGION 'us-west-1';
+ALTER DATABASE defaultdb ADD REGION 'us-west-2';
+ALTER DATABASE defaultdb SURVIVE REGION FAILURE;
+"""
+```
 
+And create a new admin user for your cluster.  **Note**: with Windows PowerShell use two pairs of double quotes around me, i.e. ``` ""me"" ```
+```
+cockroach sql --certs-dir ./certs/crdb-dcp-test --url "postgresql://db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full" -e """
+CREATE ROLE "me" WITH LOGIN PASSWORD 'secret';
+GRANT admin TO me;
+"""
+```
+Now you can log into the cockroachdb console for your secure cluster using the credentials you provided above at https://db.us-east-2.dcp-test.crdb.com:8080/
 
+Let's also test the connection through our distributed connection pool using our client certificate
+```
+cockroach sql --certs-dir ./certs/crdb-dcp-test --url "postgresql://jleelong@db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full" -e "show databases;"
+```
+And we can use the above pgbouncer endpoint to execute any of our workload tests.
 
+**IMPORTANT**: when the workload test is complete don't forget to bring down the infrastructure for your cockroach multi-region cluster
+```
+terraform -chdir=terraform/aws destroy -var-file=crdb-dcp-test.tfvars
+```
+</details>
 
+### Additional Notes
+We also can use the controller with terraform to manage changes in our distributed connection pool architecture.
 
+<details>
+<summary>more info...</summary>
+
+The controller is idempotent and can also be executed to apply changes to your infrastructure or to modify your connection pool configuration to increase the number of allowed sockets.
+```
+python controller.py \
+  --ssh-user debian \
+  --ssh-key ./my-safe-directory/dev \
+  --dns-zone dcp-test.crdb.com \
+  --certs-dir ./certs/crdb-dcp-test \
+  --ca-key ./my-safe-directory/ca.key \
+  --auth-mode cert \
+  --num-connections 96 \
+  --database defaultdb \
+  --pgb-port 5432 \
+  --db-port 26257 \
+  --pgb-client-user jleelong \
+  --pgb-server-user pgb
+```
+
+If you prefer to update your infrastructure outside of the controller you can use the standard terraform commands.
+```
 terraform -chdir=terraform/aws init
 terraform -chdir=terraform/aws plan -var-file=crdb-dcp-test.tfvars
 terraform -chdir=terraform/aws apply -var-file=crdb-dcp-test.tfvars
+terraform -chdir=terraform/aws output -json | jq -r '.'
+```
 
+Once our infrastructure is up we can perform some basic commands, **note** that I had a project tag in my terraform for the workload I wanted to test, jsonb-vs-text
+```
 # confirm that the vpc exists, assuming you're connected to the same region
 aws configure set region "us-east-2"
 aws configure get region
@@ -1731,27 +1802,15 @@ ls -ltrh /etc/pgbouncer
 ls -ltrh /usr/local/bin/claim-eip.sh
 systemctl status pgbouncer-runner
 systemctl status keepalived
+aws sts get-caller-identity
+aws ec2 describe-addresses
 exit
 ```
 
-Then we can verify if our cockroach cluster is up and running
+Or check the status and configuration of our multi-region cockroachdb cluster
 ```
-# copy the certs
-mkdir -p certs
-terraform output -raw cockroach_ca_cert > certs/ca.crt
-terraform output -raw cockroach_node_cert > certs/node.crt
-terraform output -raw cockroach_node_key > certs/node.key
+cockroach sql --certs-dir ./certs/crdb-dcp-test --url "postgresql://db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full" -e "SHOW REGIONS FROM DATABASE defaultdb;"
 
-HAPROXY=$(terraform -chdir=terraform/aws output -json haproxy_endpoints | jq -r '.["us-east-1"]')
+cockroach sql --certs-dir ./certs/crdb-dcp-test --url "postgresql://db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full" -e "SELECT node_id, locality, addr FROM crdb_internal.gossip_nodes ORDER BY node_id;"
 ```
-
-Then check the status and configuration of our cluster
-```
-cockroach sql --url $CONN_STR -e "SHOW REGIONS FROM DATABASE defaultdb;"
-cockroach sql --url $CONN_STR -e "SELECT node_id, locality, addr FROM crdb_internal.gossip_nodes ORDER BY node_id;"
-```
-
-**IMPORTANT**: when the workload test is complete don't forget to bring down the infrastructure for your cockroach multi-region cluster
-```
-terraform -chdir=terraform/aws destroy -var-file=crdb-dcp-test.tfvars
-```
+</details>

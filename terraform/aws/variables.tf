@@ -174,3 +174,8 @@ variable "ssh_public_key" {
   type        = string
   description = "SSH public key material."
 }
+
+variable "permissions_boundary_arn" {
+  type        = string
+  description = "IAM permissions boundary ARN required by the CL revenue account"
+}

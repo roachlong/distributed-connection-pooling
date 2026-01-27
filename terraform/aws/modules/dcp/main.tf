@@ -28,36 +28,55 @@ data "aws_iam_policy_document" "instance_assume" {
   }
 }
 
-# resource "aws_iam_role" "eni_role" {
-#   name               = "${var.name}-${var.region}-eni-role"
-#   assume_role_policy = data.aws_iam_policy_document.instance_assume.json
-# }
+resource "aws_iam_role" "dcp_eip_role" {
+  name = "${var.name}-${var.region}-dcp-eip-role"
 
-# resource "aws_iam_role_policy" "eni_policy" {
-#   name = "${var.name}-${var.region}-eni-policy"
-#   role = aws_iam_role.eni_role.id
-#   policy = jsonencode({
-#     Version = "2012-10-17"
-#     Statement = [{
-#       Effect = "Allow"
-#       Action = [
-#         "ec2:AssignPrivateIpAddresses",
-#         "ec2:UnassignPrivateIpAddresses",
-#         "ec2:DescribeNetworkInterfaces",
-#         "ec2:DescribeInstances",
-#         "ec2:AssociateAddress",
-#         "ec2:DisassociateAddress",
-#         "ec2:DescribeAddresses"
-#       ]
-#       Resource = "*"
-#     }]
-#   })
-# }
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
 
-# resource "aws_iam_instance_profile" "eni_profile" {
-#   name = "${aws_iam_role.eni_role.name}-profile"
-#   role = aws_iam_role.eni_role.name
-# }
+  permissions_boundary = var.permissions_boundary_arn
+
+  tags = {
+    Name = "${var.name}-${var.region}-dcp-eip-role"
+  }
+}
+
+resource "aws_iam_role_policy" "dcp_eip_failover" {
+  name = "${var.name}-${var.region}-dcp-eip-policy"
+  role = aws_iam_role.dcp_eip_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowEIPFailover"
+        Effect = "Allow"
+        Action = [
+          "ec2:AssociateAddress",
+          "ec2:DisassociateAddress",
+          "ec2:DescribeAddresses",
+          "ec2:DescribeInstances"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_instance_profile" "dcp" {
+  name = "${var.name}-${var.region}-dcp-eip-profile"
+  role = aws_iam_role.dcp_eip_role.name
+}
 
 # Network Interface used as VIP holder (private IP specified in tfvars or left to provider)
 resource "aws_network_interface" "vip_eni" {
@@ -74,7 +93,7 @@ resource "aws_instance" "dcp_node" {
   subnet_id     = element([var.subnet_id], 0)
   vpc_security_group_ids = [var.security_group_id]
   key_name      = var.ssh_key_name
-  # iam_instance_profile = aws_iam_instance_profile.eni_profile.name
+  iam_instance_profile = aws_iam_instance_profile.dcp.name
 
   user_data = templatefile("${path.module}/cloud-init.tpl.yml", {
     name               = var.name

@@ -203,6 +203,7 @@ module "dcp_us_east_1" {
   dns_zone          = var.dns_zone
   subnet_id         = module.vpc_us_east_1[0].public_subnet_ids[0]
   security_group_id = module.vpc_us_east_1[0].proxy_security_group_id
+  permissions_boundary_arn = var.permissions_boundary_arn
 
   backend_nodes = module.cockroach_us_east_1[0].private_ips
 
@@ -233,6 +234,7 @@ module "dcp_us_east_2" {
   dns_zone          = var.dns_zone
   subnet_id         = module.vpc_us_east_2[0].public_subnet_ids[0]
   security_group_id = module.vpc_us_east_2[0].proxy_security_group_id
+  permissions_boundary_arn = var.permissions_boundary_arn
 
   backend_nodes = module.cockroach_us_east_2[0].private_ips
 
@@ -263,6 +265,7 @@ module "dcp_us_west_1" {
   dns_zone          = var.dns_zone
   subnet_id         = module.vpc_us_west_1[0].public_subnet_ids[0]
   security_group_id = module.vpc_us_west_1[0].proxy_security_group_id
+  permissions_boundary_arn = var.permissions_boundary_arn
 
   backend_nodes = module.cockroach_us_west_1[0].private_ips
 
@@ -293,6 +296,7 @@ module "dcp_us_west_2" {
   dns_zone          = var.dns_zone
   subnet_id         = module.vpc_us_west_2[0].public_subnet_ids[0]
   security_group_id = module.vpc_us_west_2[0].proxy_security_group_id
+  permissions_boundary_arn = var.permissions_boundary_arn
 
   backend_nodes = module.cockroach_us_west_2[0].private_ips
 

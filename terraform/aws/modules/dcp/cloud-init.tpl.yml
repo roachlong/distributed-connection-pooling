@@ -116,7 +116,7 @@ write_files:
           ${vip_private_ip}
         }
 
-        # notify_master "/usr/local/bin/claim-eip.sh ${eip_allocation_id}"
+        notify_master "/usr/local/bin/claim-eip.sh ${eip_allocation_id}"
       }
       EOF
 

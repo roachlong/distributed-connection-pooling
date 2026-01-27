@@ -9,6 +9,11 @@ variable "ssh_key_name" {}
 variable "vm_user" {}
 variable "ssh_key" {}
 
+variable "permissions_boundary_arn" {
+  type        = string
+  description = "IAM permissions boundary ARN required by the CL revenue account"
+}
+
 variable "backend_nodes" {
   type = list(string) # private IPs of regional HAProxy → Cockroach
 }
