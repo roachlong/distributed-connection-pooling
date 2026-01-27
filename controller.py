@@ -316,6 +316,8 @@ def install_and_start_crdb_service(
     ssh_user: str,
     ssh_key: str,
     restart: bool,
+    db_port: int,
+    ui_port: int,
 ) -> None:
     """
     Creates /etc/systemd/system/cockroach.service on each node and
@@ -324,7 +326,7 @@ def install_and_start_crdb_service(
     - restart=False → start only if not running
     - restart=True  → force restart
     """
-    join = ",".join(f"{n['name']}:26257" for n in nodes)
+    join = ",".join(f"{n['name']}:{db_port}" for n in nodes)
     total_nodes = len(nodes)
 
     action = "restart" if restart else "start"
@@ -340,9 +342,9 @@ def install_and_start_crdb_service(
                 "/usr/local/bin/cockroach start-single-node "
                 "--certs-dir=/var/lib/cockroach/certs "
                 "--store=/mnt/cockroach-data "
-                "--listen-addr=0.0.0.0:26257 "
-                f"--advertise-addr={name}:26257 "
-                "--http-addr=0.0.0.0:8080 "
+                f"--listen-addr=0.0.0.0:{db_port} "
+                f"--advertise-addr={name}:{db_port} "
+                f"--http-addr=0.0.0.0:{ui_port} "
                 f"--locality=region={region},zone={az}"
             )
         else:
@@ -350,9 +352,9 @@ def install_and_start_crdb_service(
                 "/usr/local/bin/cockroach start "
                 "--certs-dir=/var/lib/cockroach/certs "
                 "--store=/mnt/cockroach-data "
-                "--listen-addr=0.0.0.0:26257 "
-                f"--advertise-addr={name}:26257 "
-                "--http-addr=0.0.0.0:8080 "
+                f"--listen-addr=0.0.0.0:{db_port} "
+                f"--advertise-addr={name}:{db_port} "
+                f"--http-addr=0.0.0.0:{ui_port} "
                 f"--join={join} "
                 f"--locality=region={region},zone={az}"
             )
@@ -383,12 +385,12 @@ EOF
 """)
 
 
-def init_cluster(seed_node: Dict[str, Any], certs_dir: Path) -> None:
+def init_cluster(seed_node: Dict[str, Any], certs_dir: Path, db_port: int) -> None:
     """
     Idempotent init: if already initialized, ignore the error.
     We use certs_dir client certs locally (typically client.root.*).
     """
-    seed = f"{seed_node['name']}:26257"
+    seed = f"{seed_node['name']}:{db_port}"
     out = run(f"cockroach init --certs-dir={certs_dir} --host={seed}", check=False)
     if "already initialized" in out.lower() or "cluster has already been initialized" in out.lower():
         print("ℹ️ Cluster already initialized, continuing")
@@ -404,18 +406,18 @@ def init_cluster(seed_node: Dict[str, Any], certs_dir: Path) -> None:
 # SQL bootstrap
 # ----------------------------
 
-def sql_exec_on_seed(seed_host: str, ssh_user: str, ssh_key: str, sql: str) -> None:
+def sql_exec_on_seed(seed_host: str, ssh_user: str, ssh_key: str, sql: str, db_port: int) -> None:
     cmd = (
         "sudo -u cockroach cockroach sql "
         "--certs-dir=/var/lib/cockroach/certs "
-        "--host=localhost:26257 "
+        f"--host=localhost:{db_port} "
         f"-e {json.dumps(sql)}"
     )
     ssh(seed_host, ssh_user, ssh_key, cmd)
 
 
 def ensure_db_and_user(seed_host: str, ssh_user: str, ssh_key: str, dbname: str, username: str,
-                       password: Optional[str], make_admin: bool) -> None:
+                       password: Optional[str], make_admin: bool, db_port: int) -> None:
     stmts = [
         f"CREATE DATABASE IF NOT EXISTS {dbname};",
         f"CREATE USER IF NOT EXISTS {username};",
@@ -425,7 +427,7 @@ def ensure_db_and_user(seed_host: str, ssh_user: str, ssh_key: str, dbname: str,
         stmts.append(f"ALTER USER {username} WITH PASSWORD {json.dumps(password)};")
     if make_admin:
         stmts.append(f"GRANT admin TO {username};")
-    sql_exec_on_seed(seed_host, ssh_user, ssh_key, " ".join(stmts))
+    sql_exec_on_seed(seed_host, ssh_user, ssh_key, " ".join(stmts), db_port)
 
 
 # ----------------------------
@@ -510,7 +512,7 @@ def push_runner_env(dcp_host: str, ssh_user: str, ssh_key: str, env_text: str) -
     ssh(dcp_host, ssh_user, ssh_key, "sudo chmod 600 /etc/pgbouncer/runner.env")
 
 
-def render_haproxy_cfg(pgbouncer_ips: List[str], backend_ips: List[str], pgb_port: int, db_port: int) -> str:
+def render_haproxy_cfg(pgbouncer_ips: List[str], backend_ips: List[str], pgb_port: int, db_port: int, ui_port: int) -> str:
     lines: List[str] = []
     lines += [
         "global",
@@ -552,6 +554,20 @@ def render_haproxy_cfg(pgbouncer_ips: List[str], backend_ips: List[str], pgb_por
     for i, ip in enumerate(backend_ips, start=1):
         lines.append(f"  server crdb{i} {ip}:{db_port} check")
 
+    lines += [
+        "",
+        "frontend crdb_admin",
+        f"  bind *:{ui_port}",
+        "  default_backend crdb_admin_pool",
+        "",
+        "backend crdb_admin_pool",
+        "  balance roundrobin",
+        "  option tcp-check",
+        "  default-server inter 2s fall 3 rise 2",
+    ]
+    for i, ip in enumerate(backend_ips, start=1):
+        lines.append(f"  server admin{i} {ip}:{ui_port} check")
+
     lines.append("")
     return "\n".join(lines)
 
@@ -571,9 +587,9 @@ def start_pgbouncer_runner(dcp_host: str, ssh_user: str, ssh_key: str) -> None:
 # Validation
 # ----------------------------
 
-def validate_region_cert(region: str, dns_zone: str, certs_dir: Path, pgb_client_user: str, database: str, pgb_port: int) -> None:
+def validate_region_cert(region: str, dns_zone: str, certs_dir: Path, pgb_client_user: str, database: str, pgb_port: int, db_port: int) -> None:
     # Direct DB via VIP DNS
-    db_host = f"db.{region}.{dns_zone}:26257"
+    db_host = f"db.{region}.{dns_zone}:{db_port}"
     run(f"cockroach sql --certs-dir={certs_dir} --host={db_host} -e 'SELECT 1;'")
 
     # Through PgBouncer via VIP DNS (client cert)
@@ -606,12 +622,12 @@ def parse_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--ssh-user", default="debian")
-    parser.add_argument("--ssh-key", required=True)
+    parser.add_argument("--ssh-key", default="./my-safe-directory/dev")
 
     # Infra
     parser.add_argument("--apply", action="store_true")
-    parser.add_argument("--terraform-dir", required=True)
-    parser.add_argument("--tfvars-file", required=True)
+    parser.add_argument("--terraform-dir", default="./terraform/aws")
+    parser.add_argument("--tfvars-file", default="crdb-dcp-test.tfvars")
 
     # Certs
     parser.add_argument("--ca-cert", action="store_true")
@@ -642,6 +658,7 @@ def parse_args():
     parser.add_argument("--database", default="defaultdb")
     parser.add_argument("--pgb-port", type=int, default=5432)
     parser.add_argument("--db-port", type=int, default=26257)
+    parser.add_argument("--ui-port", type=int, default=8080)
 
     parser.add_argument("--pgb-client-user", default="postgres")
     parser.add_argument("--pgb-server-user", default="pgb")
@@ -711,21 +728,23 @@ def main():
         if not (certs_dir / f"client.{args.pgb_client_user}.crt").exists():
             create_client_cert(certs_dir, ca_key, args.pgb_client_user)  # client -> pgb
 
-    # 4) node certs
-    for node in nodes:
-        wait_for_ssh(node["public_dns"], args.ssh_user, args.ssh_key, timeout=300)
-        wait_for_cloud_init(node["public_dns"], args.ssh_user, args.ssh_key)
-        if args.node_certs:
-            create_crdb_node_cert(node, args.dns_zone, certs_dir, ca_key)
-        install_crdb_certs(node, args.ssh_user, args.ssh_key, certs_dir)
-
-    # 5) start Cockroach nodes
     if args.start_nodes != PhasePolicy.SKIP:
+        # 4) node certs
+        for node in nodes:
+            wait_for_ssh(node["public_dns"], args.ssh_user, args.ssh_key, timeout=300)
+            wait_for_cloud_init(node["public_dns"], args.ssh_user, args.ssh_key)
+            if args.node_certs:
+                create_crdb_node_cert(node, args.dns_zone, certs_dir, ca_key)
+            install_crdb_certs(node, args.ssh_user, args.ssh_key, certs_dir)
+
+        # 5) start Cockroach nodes
         install_and_start_crdb_service(
             nodes,
             args.ssh_user,
             args.ssh_key,
             restart=(args.start_nodes == PhasePolicy.REFRESH),
+            db_port=args.db_port,
+            ui_port=args.ui_port,
         )
 
         wait_for_expected_nodes(
@@ -737,7 +756,7 @@ def main():
 
     # 6) init cluster
     if not args.skip_init and len(nodes) > 1:
-        init_cluster(nodes[0], certs_dir)
+        init_cluster(nodes[0], certs_dir, args.db_port)
 
     # 7) SQL users / DBs
     if args.sql_users:
@@ -750,6 +769,7 @@ def main():
                 args.pgb_server_user,
                 password=None,
                 make_admin=True,
+                db_port=args.db_port,
             )
             ensure_db_and_user(
                 nodes[0]["public_dns"],
@@ -759,6 +779,7 @@ def main():
                 args.pgb_client_user,
                 password=None,
                 make_admin=False,
+                db_port=args.db_port,
             )
         else:
             ensure_db_and_user(
@@ -769,6 +790,7 @@ def main():
                 args.pgb_client_user,
                 password=args.password,
                 make_admin=False,
+                db_port=args.db_port,
             )
 
     # 8) PgBouncer
@@ -815,7 +837,7 @@ def main():
             if not db_ips:
                 raise RuntimeError(f"No Cockroach nodes found for region {region}")
 
-            cfg = render_haproxy_cfg(pgb_ips, db_ips, pgb_port=args.pgb_port, db_port=args.db_port)
+            cfg = render_haproxy_cfg(pgb_ips, db_ips, pgb_port=args.pgb_port, db_port=args.db_port, ui_port=args.ui_port)
             for p in region_proxies:
                 dcp_host = pick_dcp_ssh_host(p, args.ssh_user, args.ssh_key)
                 push_haproxy_cfg(dcp_host, args.ssh_user, args.ssh_key, cfg)
@@ -824,9 +846,9 @@ def main():
     if not args.skip_validation:
         for region in sorted(dcp_by_region.keys()):
             if args.auth_mode == "cert":
-                validate_region_cert(region, args.dns_zone, certs_dir, args.pgb_client_user, args.database, args.pgb_port)
+                validate_region_cert(region, args.dns_zone, certs_dir, args.pgb_client_user, args.database, args.pgb_port, args.db_port)
             else:
-                validate_region_password(region, args.dns_zone, args.pgb_client_user, args.password, args.database, args.pgb_port)
+                validate_region_password(region, args.dns_zone, args.pgb_client_user, args.password, args.database, args.pgb_port, args.db_port)
 
     print("\n✅ Bootstrap complete: Cockroach + PgBouncer + HAProxy configured and validated")
 

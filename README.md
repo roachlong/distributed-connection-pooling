@@ -1707,6 +1707,7 @@ python controller.py \
   --database defaultdb \
   --pgb-port 5432 \
   --db-port 26257 \
+  --ui-port 8080 \
   --pgb-client-user jleelong \
   --pgb-server-user pgb
 ```
@@ -1754,6 +1755,10 @@ python controller.py \
   --ssh-user debian \
   --ssh-key ./my-safe-directory/dev \
   --dns-zone dcp-test.crdb.com \
+  --root-cert skip \
+  --start-nodes skip \
+  --skip-init \
+  --skip-haproxy \
   --certs-dir ./certs/crdb-dcp-test \
   --ca-key ./my-safe-directory/ca.key \
   --auth-mode cert \
@@ -1761,8 +1766,24 @@ python controller.py \
   --database defaultdb \
   --pgb-port 5432 \
   --db-port 26257 \
+  --pgb-client-user jleelong
+```
+
+Or to just validate the deployment
+```
+python controller.py \
+  --root-cert skip \
+  --start-nodes skip \
+  --skip-init \
+  --skip-pgbouncer \
+  --skip-haproxy \
+  --auth-mode cert \
+  --dns-zone dcp-test.crdb.com \
+  --certs-dir ./certs/crdb-dcp-test \
   --pgb-client-user jleelong \
-  --pgb-server-user pgb
+  --database defaultdb \
+  --pgb-port 5432 \
+  --db-port 26257
 ```
 
 If you prefer to update your infrastructure outside of the controller you can use the standard terraform commands.
@@ -1797,7 +1818,6 @@ exit
 
 DCPNODE=$(terraform -chdir=terraform/aws output -json dcp_endpoints | jq -r '.["us-east-2"][0]["eip_public_ip"]')
 ssh -i ./my-safe-directory/dev debian@$DCPNODE
-ls -ltrh /opt/dcp
 ls -ltrh /etc/pgbouncer
 ls -ltrh /usr/local/bin/claim-eip.sh
 systemctl status pgbouncer-runner
@@ -1811,6 +1831,6 @@ Or check the status and configuration of our multi-region cockroachdb cluster
 ```
 cockroach sql --certs-dir ./certs/crdb-dcp-test --url "postgresql://db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full" -e "SHOW REGIONS FROM DATABASE defaultdb;"
 
-cockroach sql --certs-dir ./certs/crdb-dcp-test --url "postgresql://db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full" -e "SELECT node_id, locality, addr FROM crdb_internal.gossip_nodes ORDER BY node_id;"
+cockroach sql --certs-dir ./certs/crdb-dcp-test --url "postgresql://db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full" -e "SELECT node_id, locality FROM crdb_internal.gossip_nodes ORDER BY node_id;"
 ```
 </details>
