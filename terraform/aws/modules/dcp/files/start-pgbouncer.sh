@@ -179,6 +179,7 @@ echo "creating ${num_files} instances with ${pool_size} connections each"
 for (( i=1; i<=${num_files}; i++ )); do
     PGID=${i}
     cp ${SCRIPT_DIR}/pgbouncer.template ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
+    sed -i "s/%CLIENT%/${PGBOUNCER_CLIENT}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
     sed -i "s/%DATABASE%/${DATABASE}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
     sed -i "s/%HOST_IP%/${HOST_IP}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini
     sed -i "s/%HOST_PORT%/${HOST_PORT}/g" ${SCRIPT_DIR}/pgbouncer.${PGID}.ini

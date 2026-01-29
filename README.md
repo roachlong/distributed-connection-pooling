@@ -1729,7 +1729,7 @@ CREATE ROLE "me" WITH LOGIN PASSWORD 'secret';
 GRANT admin TO me;
 """
 ```
-Now you can log into the cockroachdb console for your secure cluster using the credentials you provided above at https://db.us-east-2.dcp-test.crdb.com:8080/
+Now you can log into the cockroachdb console for your secure cluster using the credentials you provided above at https://db.us-east-2.dcp-test.crdb.com:8080/ and also review stats on haproxy for tcp connections across your distributed connection pool at http://pgb.us-east-2.dcp-test.crdb.com:8404/stats
 
 Let's also test the connection through our distributed connection pool using our client certificate
 ```
@@ -1824,6 +1824,19 @@ systemctl status pgbouncer-runner
 systemctl status keepalived
 aws sts get-caller-identity
 aws ec2 describe-addresses
+
+sudo psql "host=localhost port=6432 dbname=pgbouncer user=jleelong \
+   sslmode=verify-full \
+   sslrootcert=/etc/pgbouncer/certs/ca.crt \
+   sslcert=/etc/pgbouncer/certs/client.jleelong.crt \
+   sslkey=/etc/pgbouncer/certs/client.jleelong.key"
+
+show pools;
+\watch 1
+<CTRL>+C
+show clients;
+show servers;
+\q
 exit
 ```
 

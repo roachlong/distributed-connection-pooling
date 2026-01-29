@@ -494,6 +494,8 @@ def install_pgb_certs_on_dcp(
         certs_dir / "server.pgbouncer.key",
         certs_dir / f"client.{pgb_server_user}.crt",
         certs_dir / f"client.{pgb_server_user}.key",
+        certs_dir / f"client.{pgb_client_user}.crt",
+        certs_dir / f"client.{pgb_client_user}.key",
     ]:
         scp_file(dcp_host, ssh_user, ssh_key, f, f"/etc/pgbouncer/certs/{f.name}")
 
@@ -604,6 +606,16 @@ def render_haproxy_cfg(pgbouncer_ips: List[str], backend_ips: List[str], pgb_por
     for i, ip in enumerate(backend_ips, start=1):
         lines.append(f"  server admin{i} {ip}:{ui_port} check")
 
+    lines += [
+        "",
+        "listen stats",
+        "  bind *:8404",
+        "  mode http",
+        "  stats enable",
+        "  stats uri /stats",
+        "  stats refresh 2s",
+    ]
+    
     lines.append("")
     return "\n".join(lines)
 

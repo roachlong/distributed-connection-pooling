@@ -177,6 +177,15 @@ resource "aws_security_group" "proxy" {
     cidr_blocks = concat(local.inbound_cidrs, [var.ssh_ip_range])
   }
 
+  # HAProxy Stats UI
+  ingress {
+    description = "HAProxy Stats UI"
+    from_port   = 8404
+    to_port     = 8404
+    protocol    = "tcp"
+    cidr_blocks = concat(local.inbound_cidrs, [var.ssh_ip_range])
+  }
+
   # Allow all egress
   egress {
     description = "All egress"
