@@ -31,6 +31,14 @@ variable "public_subnet_newbits" {
   }
 }
 
+# you can either provide explicit private subnet CIDRs, or leave empty
+# and script will auto-create one private subnet per AZ using cidrsubnet().
+variable "private_subnet_cidrs" {
+  type        = list(string)
+  description = "Optional explicit CIDR blocks for private subnets (one per AZ). If empty, auto-generate."
+  default     = []
+}
+
 variable "ssh_ip_range" {
   type        = string
   description = "CIDR allowed to SSH into instances (e.g. your public IP/32)."
@@ -67,14 +75,16 @@ variable "project_tags" {
 }
 
 variable "pgb_port" {
-  type = number
+  type    = number
   default = 5432
 }
-variable "db_port"  {
-  type = number
+
+variable "db_port" {
+  type    = number
   default = 26257
 }
-variable "ui_port"  {
-  type = number
+
+variable "ui_port" {
+  type    = number
   default = 8080
 }

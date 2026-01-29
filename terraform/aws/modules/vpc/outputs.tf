@@ -18,25 +18,29 @@ output "public_subnet_ids" {
   description = "Public subnet IDs."
 }
 
-output "public_subnets" {
-  value = {
-    for az, s in aws_subnet.public : az => {
-      id         = s.id
-      cidr_block = s.cidr_block
-      az         = s.availability_zone
-    }
-  }
-  description = "Public subnet details keyed by AZ."
+output "public_route_table_id" {
+  value       = aws_route_table.public.id
+  description = "Public route table ID."
+}
+
+output "private_subnet_ids" {
+  description = "Private subnet IDs (one per AZ), suitable for TGW attachments."
+  value       = [for s in aws_subnet.private : s.id]
+}
+
+output "private_subnets_by_az" {
+  description = "Map of AZ to private subnet ID."
+  value       = { for az, s in aws_subnet.private : az => s.id }
+}
+
+output "private_route_table_id" {
+  description = "Private route table ID (TGW routes should target this too if instances use private subnets)."
+  value       = aws_route_table.private.id
 }
 
 output "internet_gateway_id" {
   value       = aws_internet_gateway.this.id
   description = "IGW ID."
-}
-
-output "public_route_table_id" {
-  value       = aws_route_table.public.id
-  description = "Public route table ID."
 }
 
 output "node_security_group_id" {

@@ -1652,7 +1652,7 @@ project_tags = {
 }
 dns_zone = "dcp-test.crdb.com"
 public_zone_id = "Z09942323KHF5XIP6R8IR"
-enabled_regions = ["us-east-2", "us-west-1", "us-west-2]
+enabled_regions = ["us-east-2", "us-west-1", "us-west-2"]
 vpc_cidrs = {
     us-east-1 = "10.10.0.0/16"
     us-east-2 = "10.20.0.0/16"

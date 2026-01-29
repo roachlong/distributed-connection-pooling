@@ -146,6 +146,26 @@ def wait_for_cloud_init(
         raise RuntimeError(f"cloud-init did not complete on {host}") from e
 
 
+def wait_for_crdb_listener(host: str, ssh_user: str, ssh_key: str, timeout=300):
+    print(f"⏳ Waiting for CockroachDB to listen on {host}:26257...")
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        out = ssh(
+            host,
+            ssh_user,
+            ssh_key,
+            "ss -ltn | grep ':26257'",
+            check=False,
+        )
+        if out.strip():
+            print("✅ CockroachDB port is listening")
+            return
+        time.sleep(5)
+
+    raise RuntimeError("CockroachDB never started listening on 26257")
+
+
 def wait_for_expected_nodes(
     seed_host: str,
     ssh_user: str,
@@ -167,6 +187,11 @@ def wait_for_expected_nodes(
             check=False,
         )
 
+        if "cannot dial server" in out or "Failed running" in out:
+            print("   Cockroach not ready yet")
+            time.sleep(5)
+            continue
+
         lines = [l for l in out.splitlines() if l.strip() and not l.startswith("Warning:")]
         if len(lines) < 2:
             time.sleep(5)
@@ -175,6 +200,11 @@ def wait_for_expected_nodes(
         header = lines[0].split("\t")
         rows = [l.split("\t") for l in lines[1:]]
 
+        if "is_live" not in header:
+            print(f"   Unexpected output, retrying: {header}")
+            time.sleep(5)
+            continue
+        
         try:
             is_live_idx = header.index("is_live")
         except ValueError:
@@ -225,6 +255,7 @@ def create_crdb_node_cert(node: Dict[str, Any], dns_zone: str, certs_dir: Path, 
         "cockroach cert create-node "
         f"{node['name']} "
         f"db.{node['region']}.{dns_zone} "
+        f"{node['private_ip']} "
         "localhost "
         f"--certs-dir={certs_dir} "
         f"--ca-key={ca_key}"
@@ -385,13 +416,18 @@ EOF
 """)
 
 
-def init_cluster(seed_node: Dict[str, Any], certs_dir: Path, db_port: int) -> None:
+def init_cluster(seed_node: Dict[str, Any], ssh_user: str, ssh_key: str, db_port: int) -> None:
     """
     Idempotent init: if already initialized, ignore the error.
     We use certs_dir client certs locally (typically client.root.*).
     """
     seed = f"{seed_node['name']}:{db_port}"
-    out = run(f"cockroach init --certs-dir={certs_dir} --host={seed}", check=False)
+    cmd = (
+        "sudo -u cockroach cockroach init "
+        "--certs-dir=/var/lib/cockroach/certs "
+        f"--host={seed}"
+    )
+    out = ssh(seed_node["public_dns"], ssh_user, ssh_key, cmd)
     if "already initialized" in out.lower() or "cluster has already been initialized" in out.lower():
         print("ℹ️ Cluster already initialized, continuing")
     elif "successfully initialized" in out.lower() or "initialized" in out.lower():
@@ -747,16 +783,22 @@ def main():
             ui_port=args.ui_port,
         )
 
-        wait_for_expected_nodes(
-            seed_host=nodes[0]["public_dns"],
-            ssh_user=args.ssh_user,
-            ssh_key=args.ssh_key,
-            expected_nodes=len(nodes),
+        wait_for_crdb_listener(
+            nodes[0]["public_dns"],
+            args.ssh_user,
+            args.ssh_key,
         )
 
     # 6) init cluster
     if not args.skip_init and len(nodes) > 1:
-        init_cluster(nodes[0], certs_dir, args.db_port)
+        init_cluster(nodes[0], args.ssh_user, args.ssh_key, args.db_port)
+
+    wait_for_expected_nodes(
+        seed_host=nodes[0]["public_dns"],
+        ssh_user=args.ssh_user,
+        ssh_key=args.ssh_key,
+        expected_nodes=len(nodes),
+    )
 
     # 7) SQL users / DBs
     if args.sql_users:

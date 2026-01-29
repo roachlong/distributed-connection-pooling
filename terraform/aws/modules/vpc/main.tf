@@ -22,7 +22,6 @@ resource "aws_internet_gateway" "this" {
 }
 
 # Public subnets (one per AZ).
-# Default subnet sizing: /24s carved out of the VPC (assumes /16; works with other sizes too).
 resource "aws_subnet" "public" {
   for_each = { for idx, az in local.azs : az => idx }
 
@@ -57,15 +56,44 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-# Node SG you can attach to Cockroach instances later
-# (kept in VPC module because it’s commonly reused).
+resource "aws_subnet" "private" {
+  for_each = local.private_subnets_by_az
+
+  vpc_id                  = aws_vpc.this.id
+  availability_zone       = each.key
+  cidr_block              = each.value
+  map_public_ip_on_launch = false
+
+  tags = merge(local.common_tags, {
+    Component = "subnet-private"
+    AZ        = each.key
+  })
+}
+
+# Private route table (no internet route; TGW routes get added at top-level)
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.this.id
+
+  tags = merge(local.common_tags, {
+    Component = "rt-private"
+  })
+}
+
+resource "aws_route_table_association" "private" {
+  for_each = aws_subnet.private
+
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.private.id
+}
+
+# Node SG (unchanged)
 resource "aws_security_group" "node" {
   count       = var.create_node_security_group ? 1 : 0
   name        = "${var.name}-node-sg"
   description = "Node SG: SSH + Cockroach ports"
   vpc_id      = aws_vpc.this.id
 
-  # SSH from your IP/CIDR
+  # SSH from a public IP/CIDR
   ingress {
     description = "SSH"
     from_port   = 22
@@ -106,15 +134,14 @@ resource "aws_security_group" "node" {
   })
 }
 
-# Proxy SG you can attach to DCP instances later
-# (kept in VPC module because it’s commonly reused).
+# Proxy SG to attach to DCP instances later
 resource "aws_security_group" "proxy" {
   count       = var.create_proxy_security_group ? 1 : 0
   name        = "${var.name}-proxy-sg"
   description = "Proxy SG: SSH + DCP ports"
   vpc_id      = aws_vpc.this.id
 
-  # SSH from your IP/CIDR
+  # SSH from a public IP/CIDR
   ingress {
     description = "SSH"
     from_port   = 22
