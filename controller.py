@@ -557,6 +557,7 @@ def render_haproxy_cfg(pgbouncer_ips: List[str], backend_ips: List[str], pgb_por
         "  maxconn 200000",
         "  log /dev/log local0",
         "  daemon",
+        "  stats socket /run/haproxy/admin.sock mode 660 level admin"
         "",
         "defaults",
         "  mode tcp",

@@ -159,6 +159,15 @@ resource "aws_security_group" "proxy" {
     cidr_blocks = concat(local.inbound_cidrs, [var.ssh_ip_range])
   }
 
+  # Backend PgBouncer
+  ingress {
+    description = "Backend PgBouncer"
+    from_port   = 6432
+    to_port     = 6432
+    protocol    = "tcp"
+    cidr_blocks = concat(local.inbound_cidrs)
+  }
+
   # CockroachDB SQL/KV (client and node-to-node)
   ingress {
     description = "CockroachDB (SQL/KV)"

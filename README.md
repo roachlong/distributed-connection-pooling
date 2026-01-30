@@ -1733,13 +1733,13 @@ Now you can log into the cockroachdb console for your secure cluster using the c
 
 Let's also test the connection through our distributed connection pool using our client certificate
 ```
-cockroach sql --certs-dir ./certs/crdb-dcp-test --url "postgresql://jleelong@db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full" -e "show databases;"
+cockroach sql --certs-dir ./certs/crdb-dcp-test --url "postgresql://jleelong@pgb.us-east-2.dcp-test.crdb.com:5432/defaultdb?sslmode=verify-full" -e "show databases;"
 ```
 And we can use the above pgbouncer endpoint to execute any of our workload tests.
 
 **IMPORTANT**: when the workload test is complete don't forget to bring down the infrastructure for your cockroach multi-region cluster
 ```
-terraform -chdir=terraform/aws destroy -var-file=crdb-dcp-test.tfvars
+terraform -chdir=terraform/aws destroy -var-file=crdb-dcp-test.tfvars. -auto-approve
 ```
 </details>
 
