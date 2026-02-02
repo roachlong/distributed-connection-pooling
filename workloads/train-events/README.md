@@ -73,7 +73,7 @@ In write-heavy queue-style systems, JSONB provides powerful read/query features,
 - JSON structure is preserved, but now acts mostly as a storage envelope, not an indexed query surface.
 - And we're still encoding and decoding JSON, incurring additional overhead on every read and write operation.
 
-JSONB-Manual gives you the shape and flexibility of JSONB, but you're paying the storage costs without the benefit of .
+JSONB-Manual gives you the shape and flexibility of JSONB, but you're paying the storage costs without the benefit of fast ad hoc query capabilities.
 
 ### Option 3: TEXT (string payload + generated columns)
 **Best for**: High-throughput OLTP, event queues, ingestion scenarios, heavy write workloads.
@@ -109,13 +109,13 @@ TEXT is ideal when payloads are treated as **opaque blobs** and write throughput
 ## Initial Setup
 First we'll execute the sql to create a sample schema and load some data into it.
 ```
-cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -f ./workloads/train-events/initial-schema.sql
-cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -f ./workloads/train-events/populate-sample-data.sql
+cockroach sql --certs-dir ./certs/crdb-dcp-test --url "postgresql://db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full" -f ./workloads/train-events/initial-schema.sql
+cockroach sql --certs-dir ./certs/crdb-dcp-test --url "postgresql://db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full" -f ./workloads/train-events/populate-sample-data.sql
 ```
 
 Then permission access to the tables for our pgbouncer client.
 ```
-cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb" -e """
+cockroach sql --certs-dir ./certs/crdb-dcp-test --url "postgresql://db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full" -e """
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE defaultdb.* TO pgb;
 """
 ```
@@ -149,21 +149,20 @@ cd ./workloads/train-events
 # if requirements.txt doesn't exist then $ pip freeze > requirements.txt
 sed -E '/^(pyobjc-core|pyobjc-framework-Cocoa|py2app|rumps|macholib|tensorflow-macos|tensorflow-metal)(=|==)/d' \
   requirements.txt > requirements-runner.txt
-cd ../../
 ```
 
 ## Direct Connections
 Then we can use our workload script to simulate the workload going directly against the database running on our host machine.
 ```
-cd ./workloads/train-events
+export CRT="../../certs/crdb-dcp-test"
+export USR="pgb"
 export TEST_URI_LIST="\
-postgresql://pgb:secret@us-east:26257/defaultdb?sslmode=require&sslrootcert=/certs/ca.crt&sslcert=/certs/client.pgb.crt&sslkey=/certs/client.pgb.key,\
-postgresql://pgb:secret@us-central:26257/defaultdb?sslmode=require&sslrootcert=/certs/ca.crt&sslcert=/certs/client.pgb.crt&sslkey=/certs/client.pgb.key,\
-postgresql://pgb:secret@us-west:26257/defaultdb?sslmode=require&sslrootcert=/certs/ca.crt&sslcert=/certs/client.pgb.crt&sslkey=/certs/client.pgb.key"
+postgresql://${USR}@db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full&sslrootcert=${CRT}/ca.crt&sslcert=${CRT}/client.${USR}.crt&sslkey=${CRT}/client.${USR}.key,\
+postgresql://${USR}@db.us-west-1.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full&sslrootcert=${CRT}/ca.crt&sslcert=${CRT}/client.${USR}.crt&sslkey=${CRT}/client.${USR}.key,\
+postgresql://${USR}@db.us-west-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full&sslrootcert=${CRT}/ca.crt&sslcert=${CRT}/client.${USR}.crt&sslkey=${CRT}/client.${USR}.key"
 export TEST_NAME="direct"
 export TXN_POOLONG="false"
 ./run_workloads.sh 512
-cd ../../
 ```
 You can tail the files in the logs directory or open another terminal and run ```docker logs -f dbw-jsonb-1```
 
@@ -171,109 +170,109 @@ A summary of the test results for one of the workers is outlined below...
 
 ### Using JSONB Fields
 ```
->>> Worker 2 (logs/results_direct_jsonb_20260117_203044_w2.log)
-run_name       Transactionsjsonb.20260118_013106
-start_time     2026-01-18 01:31:06
-end_time       2026-01-18 02:18:43
-test_duration  2857
+>>> Worker 1 (logs/results_direct_jsonb_20260201_232857_w1.log)
+run_name       Transactionsjsonb.20260202_042917
+start_time     2026-02-02 04:29:17
+end_time       2026-02-02 05:05:42
+test_duration  2185
 -------------  ---------------------------------
 
-┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬────────────┬────────────┬──────────────┬──────────────┐
-│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │    p90(ms) │    p95(ms) │      p99(ms) │      max(ms) │
-├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼────────────┼────────────┼──────────────┼──────────────┤
-│     2,857 │ __cycle__ │       171 │     1,881 │           0 │ 207,417.21 │ 89,857.89 │ 547,900.13 │ 852,206.93 │ 1,395,698.37 │ 2,087,824.38 │
-│     2,857 │ add       │       171 │     1,881 │           0 │  13,709.75 │  8,791.41 │  29,656.86 │  43,898.90 │    86,013.51 │   102,154.67 │
-│     2,857 │ archive   │       171 │     1,881 │           0 │  11,405.73 │  3,546.12 │  23,695.40 │  32,912.71 │    87,569.24 │   659,528.86 │
-│     2,857 │ process   │       171 │     1,881 │           0 │ 182,201.12 │ 70,059.69 │ 500,098.56 │ 831,664.49 │ 1,366,170.97 │ 2,061,857.49 │
-└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴────────────┴────────────┴──────────────┴──────────────┘
+┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬────────────┬────────────┬────────────┬──────────────┐
+│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │    p90(ms) │    p95(ms) │    p99(ms) │      max(ms) │
+├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼────────────┼────────────┼────────────┼──────────────┤
+│     2,185 │ __cycle__ │       171 │     1,881 │           0 │ 130,947.72 │ 88,293.49 │ 294,354.78 │ 388,867.11 │ 590,176.07 │ 1,299,944.92 │
+│     2,185 │ add       │       171 │     2,216 │           1 │  14,818.45 │ 10,676.13 │  35,713.40 │  45,542.28 │  59,649.63 │    77,279.58 │
+│     2,185 │ archive   │       171 │     1,881 │           0 │   8,165.49 │  2,655.28 │  17,530.39 │  46,628.53 │ 103,101.63 │   162,686.21 │
+│     2,185 │ process   │       171 │     1,882 │           0 │  98,687.50 │ 54,092.30 │ 246,922.72 │ 344,313.71 │ 555,862.72 │ 1,286,094.99 │
+└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴────────────┴────────────┴────────────┴──────────────┘
 
 Parameter      Value
--------------  ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-------------  ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 workload_path  /work/transactionsJsonb.py
-conn_params    {'conninfo': 'postgresql://pgb:secret@us-central:26257/defaultdb?sslmode=require&sslrootcert=%2Fcerts%2Fca.crt&sslcert=%2Fcerts%2Fclient.pgb.crt&sslkey=%2Fcerts%2Fclient.pgb.key&application_name=Transactionsjsonb', 'autocommit': True}
+conn_params    {'conninfo': 'postgresql://pgb@db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full&sslrootcert=..%2F..%2Fcerts%2Fcrdb-dcp-test%2Fca.crt&sslcert=..%2F..%2Fcerts%2Fcrdb-dcp-test%2Fclient.pgb.crt&sslkey=..%2F..%2Fcerts%2Fcrdb-dcp-test%2Fclient.pgb.key&application_name=Transactionsjsonb', 'autocommit': True}
 conn_extras    {}
 concurrency    171
 duration
 iterations     2048
 ramp           0
-args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': False}
+args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 10000, 'txn_pooling': False}
 delay_stats    0
 ```
 
 ### Versus Manual JSONB
 ```
->>> Worker 2 (logs/results_direct_manual_20260117_203044_w2.log)
-run_name       Transactionsmanual.20260118_022110
-start_time     2026-01-18 02:21:10
-end_time       2026-01-18 02:32:41
-test_duration  691
+>>> Worker 1 (logs/results_direct_manual_20260201_232857_w1.log)
+run_name       Transactionsmanual.20260202_050804
+start_time     2026-02-02 05:08:04
+end_time       2026-02-02 05:25:24
+test_duration  1040
 -------------  ----------------------------------
 
 ┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬────────────┬────────────┬────────────┬────────────┐
 │   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │    p90(ms) │    p95(ms) │    p99(ms) │    max(ms) │
 ├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼────────────┼────────────┼────────────┼────────────┤
-│       691 │ __cycle__ │       171 │     1,881 │           2 │  51,988.38 │ 27,731.03 │ 118,131.61 │ 187,867.93 │ 353,585.27 │ 588,553.13 │
-│       691 │ add       │       171 │     1,881 │           2 │   4,925.09 │  4,092.50 │  10,782.05 │  12,324.03 │  14,007.58 │  15,393.78 │
-│       691 │ archive   │       171 │     1,881 │           2 │   3,215.76 │    964.07 │   7,391.51 │  10,846.03 │  43,671.31 │ 251,024.35 │
-│       691 │ process   │       171 │     1,881 │           2 │  43,747.07 │ 19,479.37 │ 110,008.19 │ 178,038.48 │ 340,556.14 │ 584,733.88 │
+│     1,040 │ __cycle__ │       171 │     1,881 │           1 │  86,127.65 │ 41,062.49 │ 199,917.79 │ 377,881.49 │ 536,124.69 │ 694,552.46 │
+│     1,040 │ add       │       171 │     1,891 │           1 │   5,753.35 │  3,104.25 │  11,062.73 │  23,863.38 │  49,736.04 │  72,341.72 │
+│     1,040 │ archive   │       171 │     1,881 │           1 │  17,333.99 │    868.65 │  54,290.19 │ 102,910.74 │ 212,467.59 │ 444,729.41 │
+│     1,040 │ process   │       171 │     1,881 │           1 │  53,247.14 │ 19,793.64 │ 132,338.65 │ 256,783.48 │ 436,152.77 │ 677,293.43 │
 └───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴────────────┴────────────┴────────────┴────────────┘
 
 Parameter      Value
--------------  -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-------------  ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 workload_path  /work/transactionsManual.py
-conn_params    {'conninfo': 'postgresql://pgb:secret@us-central:26257/defaultdb?sslmode=require&sslrootcert=%2Fcerts%2Fca.crt&sslcert=%2Fcerts%2Fclient.pgb.crt&sslkey=%2Fcerts%2Fclient.pgb.key&application_name=Transactionsmanual', 'autocommit': True}
+conn_params    {'conninfo': 'postgresql://pgb@db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full&sslrootcert=..%2F..%2Fcerts%2Fcrdb-dcp-test%2Fca.crt&sslcert=..%2F..%2Fcerts%2Fcrdb-dcp-test%2Fclient.pgb.crt&sslkey=..%2F..%2Fcerts%2Fcrdb-dcp-test%2Fclient.pgb.key&application_name=Transactionsmanual', 'autocommit': True}
 conn_extras    {}
 concurrency    171
 duration
 iterations     2048
 ramp           0
-args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': False}
+args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 10000, 'txn_pooling': False}
 delay_stats    0
 ```
 
 ### Versus Text Fields
 ```
->>> Worker 2 (logs/results_direct_text_20260117_203044_w2.log)
-run_name       Transactionstext.20260118_023505
-start_time     2026-01-18 02:35:05
-end_time       2026-01-18 02:46:13
-test_duration  668
+>>> Worker 1 (logs/results_direct_text_20260201_232857_w1.log)
+run_name       Transactionstext.20260202_052831
+start_time     2026-02-02 05:28:31
+end_time       2026-02-02 05:44:40
+test_duration  969
 -------------  --------------------------------
 
 ┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬────────────┬────────────┬────────────┬────────────┐
 │   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │    p90(ms) │    p95(ms) │    p99(ms) │    max(ms) │
 ├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼────────────┼────────────┼────────────┼────────────┤
-│       668 │ __cycle__ │       171 │     1,881 │           2 │  48,448.98 │ 25,354.44 │ 115,540.19 │ 186,557.60 │ 344,672.12 │ 541,853.03 │
-│       668 │ add       │       171 │     1,881 │           2 │   5,052.82 │  4,478.60 │  10,393.18 │  12,255.25 │  14,147.80 │  17,050.00 │
-│       668 │ archive   │       171 │     1,881 │           2 │   1,970.10 │    757.57 │   4,901.25 │   8,635.13 │  16,917.78 │  71,349.80 │
-│       668 │ process   │       171 │     1,881 │           2 │  41,325.13 │ 17,132.14 │ 109,464.76 │ 178,805.33 │ 335,581.32 │ 530,520.80 │
+│       969 │ __cycle__ │       171 │     1,881 │           1 │  74,766.19 │ 35,619.72 │ 173,128.59 │ 397,310.80 │ 440,342.07 │ 553,196.50 │
+│       969 │ add       │       171 │     1,901 │           1 │   5,947.70 │  3,944.38 │  11,744.32 │  19,251.79 │  42,798.03 │  75,650.74 │
+│       969 │ archive   │       171 │     1,881 │           1 │   7,806.89 │    398.07 │   8,010.72 │  24,629.75 │ 244,791.75 │ 293,387.23 │
+│       969 │ process   │       171 │     1,882 │           1 │  51,180.56 │ 19,720.89 │ 122,061.28 │ 225,816.58 │ 417,327.34 │ 537,779.37 │
 └───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴────────────┴────────────┴────────────┴────────────┘
 
 Parameter      Value
--------------  -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-------------  --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 workload_path  /work/transactionsText.py
-conn_params    {'conninfo': 'postgresql://pgb:secret@us-central:26257/defaultdb?sslmode=require&sslrootcert=%2Fcerts%2Fca.crt&sslcert=%2Fcerts%2Fclient.pgb.crt&sslkey=%2Fcerts%2Fclient.pgb.key&application_name=Transactionstext', 'autocommit': True}
+conn_params    {'conninfo': 'postgresql://pgb@db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full&sslrootcert=..%2F..%2Fcerts%2Fcrdb-dcp-test%2Fca.crt&sslcert=..%2F..%2Fcerts%2Fcrdb-dcp-test%2Fclient.pgb.crt&sslkey=..%2F..%2Fcerts%2Fcrdb-dcp-test%2Fclient.pgb.key&application_name=Transactionstext', 'autocommit': True}
 conn_extras    {}
 concurrency    171
 duration
 iterations     2048
 ramp           0
-args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': False}
+args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 10000, 'txn_pooling': False}
 delay_stats    0
 ```
 
 ## Managed Connections
 We can simulate the workload again, this time using our PgBouncer HA cluster with transaction pooling, but we'll have to disable prepared statements due to connection multiplexing between clients.
 ```
-cd ./workloads/train-events
+export CRT="../../certs/crdb-dcp-test"
+export USR="jleelong"
 export TEST_URI_LIST="\
-postgresql://pgb@172.18.0.251:5432/defaultdb?sslmode=require&sslrootcert=/certs/ca.crt&sslcert=/certs/client.pgb.crt&sslkey=/certs/client.pgb.key,\
-postgresql://pgb@172.18.0.252:5432/defaultdb?sslmode=require&sslrootcert=/certs/ca.crt&sslcert=/certs/client.pgb.crt&sslkey=/certs/client.pgb.key,\
-postgresql://pgb@172.18.0.253:5432/defaultdb?sslmode=require&sslrootcert=/certs/ca.crt&sslcert=/certs/client.pgb.crt&sslkey=/certs/client.pgb.key"
+postgresql://${USR}@pgb.us-east-2.dcp-test.crdb.com:5432/defaultdb?sslmode=verify-full&sslrootcert=${CRT}/ca.crt&sslcert=${CRT}/client.${USR}.crt&sslkey=${CRT}/client.${USR}.key,\
+postgresql://${USR}@pgb.us-west-1.dcp-test.crdb.com:5432/defaultdb?sslmode=verify-full&sslrootcert=${CRT}/ca.crt&sslcert=${CRT}/client.${USR}.crt&sslkey=${CRT}/client.${USR}.key,\
+postgresql://${USR}@pgb.us-west-2.dcp-test.crdb.com:5432/defaultdb?sslmode=verify-full&sslrootcert=${CRT}/ca.crt&sslcert=${CRT}/client.${USR}.crt&sslkey=${CRT}/client.${USR}.key"
 export TEST_NAME="pooling"
 export TXN_POOLONG="true"
 ./run_workloads.sh 512
-cd ../../
 ```
 You can tail the files in the logs directory or open another terminal and run ```docker logs -f dbw-1```
 
@@ -281,92 +280,95 @@ And a summary of the test results for one of the workers is outlined below...
 
 ### Using JSONB Fields
 ```
->>> Worker 2 (logs/results_pooling_jsonb_20251205_171253_w2.log)
-run_name       Transactionsjsonb.20251205_222037
-start_time     2025-12-05 22:20:37
-end_time       2025-12-05 23:38:12
-test_duration  4655
+>>> Worker 1 (logs/results_pooling_jsonb_20260202_011427_w1.log)
+run_name       Transactionsjsonb.20260202_061444
+start_time     2026-02-02 06:14:44
+end_time       2026-02-02 06:34:00
+test_duration  1156
 -------------  ---------------------------------
 
-┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬────────────┬────────────┬────────────┬────────────┬────────────┐
-│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │    p50(ms) │    p90(ms) │    p95(ms) │    p99(ms) │    max(ms) │
-├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼────────────┼────────────┼────────────┼────────────┼────────────┤
-│     4,655 │ __cycle__ │       128 │     2,048 │           0 │ 288,712.61 │ 286,967.91 │ 350,116.72 │ 359,988.52 │ 375,841.83 │ 475,557.90 │
-│     4,655 │ add       │       128 │     2,048 │           0 │  84,617.07 │  81,069.30 │ 130,454.07 │ 144,062.69 │ 157,494.96 │ 168,891.45 │
-│     4,655 │ archive   │       128 │     2,048 │           0 │  91,835.67 │  91,520.36 │ 116,591.05 │ 122,029.38 │ 132,162.56 │ 237,160.00 │
-│     4,655 │ process   │       128 │     2,048 │           0 │ 112,159.25 │ 108,681.20 │ 147,030.65 │ 156,819.09 │ 167,366.98 │ 216,535.58 │
-└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴────────────┴────────────┴────────────┴────────────┴────────────┘
+┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬────────────┬────────────┬────────────┬────────────┐
+│   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │    p90(ms) │    p95(ms) │    p99(ms) │    max(ms) │
+├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼────────────┼────────────┼────────────┼────────────┤
+│     1,156 │ __cycle__ │       171 │     1,881 │           1 │  99,408.55 │ 99,451.13 │ 119,121.07 │ 126,899.92 │ 145,570.78 │ 209,148.29 │
+│     1,156 │ add       │       171 │     1,881 │           1 │  26,284.15 │ 26,327.28 │  36,550.17 │  40,186.75 │  46,196.64 │  50,994.82 │
+│     1,156 │ archive   │       171 │     1,881 │           1 │  28,305.92 │ 27,663.31 │  38,959.11 │  42,900.66 │  62,931.77 │ 140,221.61 │
+│     1,156 │ process   │       171 │     1,881 │           1 │  34,833.03 │ 34,301.52 │  44,371.93 │  49,921.53 │  67,357.89 │  92,954.13 │
+└───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴────────────┴────────────┴────────────┴────────────┘
 
 Parameter      Value
--------------  -----------------------------------------------------------------------------------------------------------------------------------------
+-------------  ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 workload_path  /work/transactionsJsonb.py
-conn_params    {'conninfo': 'postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer&application_name=Transactionsjsonb', 'autocommit': True}
+conn_params    {'conninfo': 'postgresql://jleelong@pgb.us-east-2.dcp-test.crdb.com:5432/defaultdb?sslmode=verify-full&sslrootcert=..%2F..%2Fcerts%2Fcrdb-dcp-test%2Fca.crt&sslcert=..%2F..%2Fcerts%2Fcrdb-dcp-test%2Fclient.jleelong.crt&sslkey=..%2F..%2Fcerts%2Fcrdb-dcp-test%2Fclient.jleelong.key&application_name=Transactionsjsonb', 'autocommit': True}
 conn_extras    {}
-concurrency    128
+concurrency    171
 duration
 iterations     2048
 ramp           0
-args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': True}
+args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 10000, 'txn_pooling': True}
+delay_stats    0
 ```
 
 ### Versus Manual JSONB
 ```
->>> Worker 2 (logs/results_pooling_manual_20251205_171253_w2.log)
-run_name       Transactionsmanual.20251205_234809
-start_time     2025-12-05 23:48:09
-end_time       2025-12-06 00:05:27
-test_duration  1038
+>>> Worker 1 (logs/results_pooling_manual_20260202_011427_w1.log)
+run_name       Transactionsmanual.20260202_063646
+start_time     2026-02-02 06:36:46
+end_time       2026-02-02 06:42:28
+test_duration  342
 -------------  ----------------------------------
 
 ┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬───────────┬───────────┬───────────┬───────────┐
 │   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │   p90(ms) │   p95(ms) │   p99(ms) │   max(ms) │
 ├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼───────────┼───────────┼───────────┼───────────┤
-│     1,038 │ __cycle__ │       128 │     2,048 │           1 │  28,116.17 │ 28,110.66 │ 32,341.83 │ 33,583.76 │ 36,051.07 │ 38,847.89 │
-│     1,038 │ add       │       128 │     2,048 │           1 │   4,891.30 │  4,741.76 │  7,081.66 │  8,026.68 │ 10,923.60 │ 17,005.71 │
-│     1,038 │ archive   │       128 │     2,048 │           1 │  10,718.30 │ 10,518.72 │ 15,517.76 │ 16,769.48 │ 18,854.50 │ 20,523.07 │
-│     1,038 │ process   │       128 │     2,048 │           1 │  12,406.43 │ 12,354.42 │ 16,327.43 │ 17,693.94 │ 20,130.97 │ 22,613.52 │
+│       342 │ __cycle__ │       171 │     1,881 │           5 │  28,729.25 │ 28,257.46 │ 34,769.58 │ 36,614.50 │ 40,658.81 │ 45,822.07 │
+│       342 │ add       │       171 │     1,881 │           5 │   5,373.32 │  5,342.45 │  7,462.92 │  8,391.69 │  9,711.30 │ 10,812.82 │
+│       342 │ archive   │       171 │     1,881 │           5 │   5,005.44 │  4,639.17 │  7,798.14 │  8,946.84 │ 11,875.71 │ 20,616.78 │
+│       342 │ process   │       171 │     1,881 │           5 │   8,354.88 │  7,930.99 │ 11,832.73 │ 13,065.06 │ 16,057.24 │ 23,312.62 │
 └───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴───────────┴───────────┴───────────┴───────────┘
 
 Parameter      Value
--------------  ------------------------------------------------------------------------------------------------------------------------------------------
+-------------  -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 workload_path  /work/transactionsManual.py
-conn_params    {'conninfo': 'postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer&application_name=Transactionsmanual', 'autocommit': True}
+conn_params    {'conninfo': 'postgresql://jleelong@pgb.us-east-2.dcp-test.crdb.com:5432/defaultdb?sslmode=verify-full&sslrootcert=..%2F..%2Fcerts%2Fcrdb-dcp-test%2Fca.crt&sslcert=..%2F..%2Fcerts%2Fcrdb-dcp-test%2Fclient.jleelong.crt&sslkey=..%2F..%2Fcerts%2Fcrdb-dcp-test%2Fclient.jleelong.key&application_name=Transactionsmanual', 'autocommit': True}
 conn_extras    {}
-concurrency    128
+concurrency    171
 duration
 iterations     2048
 ramp           0
-args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': True}
+args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 10000, 'txn_pooling': True}
+delay_stats    0
 ```
 
 ### Versus Text Fields
 ```
->>> Worker 2 (logs/results_pooling_text_20251205_171253_w2.log)
-run_name       Transactionstext.20251206_031550
-start_time     2025-12-06 03:15:50
-end_time       2025-12-06 03:23:14
-test_duration  444
+>>> Worker 1 (logs/results_pooling_text_20260202_011427_w1.log)
+run_name       Transactionstext.20260202_064714
+start_time     2026-02-02 06:47:14
+end_time       2026-02-02 06:52:38
+test_duration  324
 -------------  --------------------------------
 
 ┌───────────┬───────────┬───────────┬───────────┬─────────────┬────────────┬───────────┬───────────┬───────────┬───────────┬───────────┐
 │   elapsed │ id        │   threads │   tot_ops │   tot_ops/s │   mean(ms) │   p50(ms) │   p90(ms) │   p95(ms) │   p99(ms) │   max(ms) │
 ├───────────┼───────────┼───────────┼───────────┼─────────────┼────────────┼───────────┼───────────┼───────────┼───────────┼───────────┤
-│       444 │ __cycle__ │       128 │     2,048 │           4 │  25,978.44 │ 27,711.76 │ 34,419.31 │ 36,271.11 │ 40,399.79 │ 50,658.46 │
-│       444 │ add       │       128 │     2,048 │           4 │   7,051.76 │  6,871.03 │ 11,928.27 │ 13,341.34 │ 16,424.42 │ 19,118.48 │
-│       444 │ archive   │       128 │     2,048 │           4 │   8,393.76 │  8,083.32 │ 13,856.32 │ 15,753.56 │ 18,525.14 │ 19,966.52 │
-│       444 │ process   │       128 │     2,048 │           4 │  10,432.22 │ 10,413.02 │ 15,619.18 │ 17,436.47 │ 20,112.72 │ 28,476.41 │
+│       324 │ __cycle__ │       171 │     1,881 │           5 │  26,788.40 │ 26,997.20 │ 30,572.55 │ 31,756.35 │ 35,379.15 │ 40,885.93 │
+│       324 │ add       │       171 │     1,881 │           5 │   5,270.62 │  5,248.67 │  7,136.44 │  7,652.41 │  8,523.46 │  9,656.48 │
+│       324 │ archive   │       171 │     1,881 │           5 │   4,610.94 │  4,554.18 │  6,328.49 │  7,130.06 │ 10,696.91 │ 18,935.66 │
+│       324 │ process   │       171 │     1,881 │           5 │   6,915.02 │  6,903.93 │  9,025.60 │  9,633.00 │ 13,207.14 │ 19,699.65 │
 └───────────┴───────────┴───────────┴───────────┴─────────────┴────────────┴───────────┴───────────┴───────────┴───────────┴───────────┘
 
 Parameter      Value
--------------  ----------------------------------------------------------------------------------------------------------------------------------------
+-------------  -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 workload_path  /work/transactionsText.py
-conn_params    {'conninfo': 'postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer&application_name=Transactionstext', 'autocommit': True}
+conn_params    {'conninfo': 'postgresql://jleelong@pgb.us-east-2.dcp-test.crdb.com:5432/defaultdb?sslmode=verify-full&sslrootcert=..%2F..%2Fcerts%2Fcrdb-dcp-test%2Fca.crt&sslcert=..%2F..%2Fcerts%2Fcrdb-dcp-test%2Fclient.jleelong.crt&sslkey=..%2F..%2Fcerts%2Fcrdb-dcp-test%2Fclient.jleelong.key&application_name=Transactionstext', 'autocommit': True}
 conn_extras    {}
-concurrency    128
+concurrency    171
 duration
 iterations     2048
 ramp           0
-args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 100, 'txn_pooling': True}
+args           {'min_batch_size': 10, 'max_batch_size': 100, 'delay': 10000, 'txn_pooling': True}
+delay_stats    0
 ```
 
 ## Interpretation
@@ -378,73 +380,80 @@ The output from our testing shows that JSONB with inverted indexes is not a good
 **Mean Latency Comparison (per operation)**
 | Operation | JSONB Mean (ms) | Manual Mean (ms) | Improvement Without Inverted Index | TEXT Mean (ms) | Improvement When Using TEXT |
 | ------------- | ------------- | ------------- | ------------- | ------------- | ------------- |
-| add | 26,336 ms | 2,911 ms | ~89% faster | 2,239 ms | ~23% faster |
-| process | 197,110 ms | 41,873 ms | ~79% faster | 30,754 ms | ~27% faster |
-| archive | 11,692 ms | 1,728 ms | ~85% faster | 3,700 ms | ~53% slower |
-| cycle | 235,245 ms | 46,614 ms | ~80% faster | 36,799 ms | ~21% faster |
+| add | 14,818 ms | 5,753 ms | ~61% faster | 5,947 ms | ~3% slower |
+| process | 98,687 ms | 53,247 ms | ~46% faster | 51,180 ms | ~4% faster |
+| archive | 8,165 ms | 17,333 ms | ~112% slower | 7,806 ms | ~55% faster |
 
-TEXT is *20-30%* faster depending on the phase, with the largest gains in the high-contention process stage.
+In our single region tests, TEXT was *20-30%* faster depending on the phase, with the largest gains in the high-contention process stage.  However, in multi-region, the dominant cost shifts away from payload representation (JSONB vs TEXT) and toward cross-region coordination, replication, and transaction latency.  So, in multi-region, coordination and replication dominate, so the payload representation becomes irrelevant once inverted indexes are removed.
 
-**Why is JSONB so much slower?**
+But notice deletes with JSONB without inverted indexes are a costly operation.  While manual JSONB removes inverted-index overhead, which dramatically improves inserts and updates, deletes still pay the cost of rewriting large binary JSON values.  TEXT avoids that cost entirely, and inverted indexes partially offset it by accelerating delete targeting.  That’s why manual JSONB is fastest for add/process but slowest for archive.
+
+**When is JSONB much slower?**
 
 Using the CRDB metrics (statement activity & txn activity), several major factors become obvious:
 - JSONB updates rewrite **large structured documents**, whereas TEXT just replaces a blob
 - JSONB inverted indexes generate much higher **write amplification** (many more KV keys per write)
-- JSONB transactions create significantly **more contention** and **longer lock hold times**
-- JSONB ‘process’ operations often run ~1 second to multiple seconds per statement, while TEXT runs them in **tens of milliseconds**
+- JSONB transactions also create significantly **more contention** and **longer lock hold times**
 
-From the database metrics:
+From the single-region database metrics:
 - JSONB transactions show multi-minute average latencies in some cases, and heavy retry behavior (p99 5–10 seconds+)
 - TEXT transactions remain sub-second to low-second even under load
 
 ### PART 2 - DIRECT vs MANAGED CONNECTIONS
 
-The output from our testing shows that we get much better throughput with managed connections, even with the larger payloads.  However, longer transaction times will tie up 
-those shared connections and you will see some latency while the client waits for a pooled connection to become available.  But it's far better to block at the client than to throttle performance on the database.  And we can always increase capacity if we need more connections.
+The output from our testing shows that we get much better throughput with managed connections, even with the larger payloads.  However, longer transaction times will tie up those shared connections and you will see some latency while the client waits for a pooled connection to become available.  But it's far better to block at the client than to throttle performance on the database.  And we can always increase capacity if we need more connections.
 
 **Mean Latencies (per operation)**
 | Operation | Direct Cxn Mean | Managed Cxn Mean | Client Experience |
 | ------------- | ------------- | ------------- | ------------- |
-| add | 19,684 ms | 10,997 ms | ~44% faster |
-| process | 130,594 ms | 12,436 ms | ~90% faster |
-| archive | 17,618 ms | 10,810 ms | ~38% faster |
-| cycle | 167,998 ms | 34,344 ms | ~80% faster |
+| add | 5,947 ms | 5,270 ms | ~11% faster |
+| process | 51,180 ms | 6,915 ms | ~86% faster |
+| archive | 7,806 ms | 4,610 ms | ~41% faster |
 
-If we had more capacity in the dababase we could increase our connection pool size to meet demand and would see sub-second response times in the client for most of these transactions.  But even without that, **managed pooling reduces client-perceived mean latency by ~40–90%**, depending on the operation.
+If we had more capacity, we could safely increase the pool size **without reintroducing contention**, pushing these operations closer to sub-second latency.  But even without that, **managed pooling reduces client-perceived mean latency by ~40–90%**, depending on how contention-heavy the transaction is.
 
-The database behaves dramatically better when concurrency is controlled by PgBouncer, and the client sees faster completion of its total workload.  Here we did 2048 cycles in less than 10 minutes with managed transaction connections versus almost 52 minutes with session based connections.
+The database behaves dramatically better when concurrency is controlled by PgBouncer, and the client sees faster completion of its total workload.  Here we did 2048 cycles in less than 6 minutes with managed transaction connections versus over 16 minutes with session based connections.
 
-**Why is pooling so effective here?**
+**Why managed pooling is so effective here**
 
-Under Direct Connections:
-- High KV execution latency
-- High admission queue delays
-- Spiky WAL fsync latency
-- Many concurrent backends running expensive JSONB/TEXT updates
-- Significant retry behavior even with TEXT
+Managed pooling dramatically improves client-perceived latency when transactions are contention-heavy.
 
-Under Managed Connections:
-- Database sees only ~64 active sessions (instead of 512)
-- Fewer active KV requests = **less contention**
-- Shorter lock durations = **fewer restarts**
-- Lower CPU scheduling pressure
+Under direct connections:
+- Hundreds of concurrent SQL sessions execute long-running UPDATE/DELETE transactions
+- Lock durations overlap heavily
+- KV admission queues build up
+- Transaction retries and restarts spike
+- CPU scheduling and Raft coordination dominate latency
+
+Under managed pooling:
+- The database sees a bounded number of active transactions
+- Write conflicts are reduced
+- Lock hold times shrink
+- Admission queues drain faster
+- Overall work completes sooner even if clients wait briefly for a pooled connection
+
+This effect is strongest for:
+- processing long-running / update-heavy workloads
+- moderate for archive / delete-heavy workloads
+- less pronounced with append-heavy / low contention workloads
 
 **External pooling protects the database from the client’s concurrency**, so fewer queries overlap, causing fewer RB conflicts and much lower overall latency.
 
 ### SUMMARY OF WORKLOAD TESTING
 
 A. JSONB vs TEXT Data Types:
-- TEXT is **40–90%** faster across all operations
-- JSONB’s write amplification, inverted-index maintenance, and structural costs significantly degrade throughput
-- JSONB workloads show much higher contention and long-tail latency
-- TEXT workloads show stable, predictable performance
+- JSONB with inverted indexes incurs severe write amplification and contention
+- Removing inverted indexes yields large gains for both JSONB and TEXT
+- TEXT provides additional benefits primarily in delete-heavy workloads
+- In multi-region and high-latency environments, payload format is a second-order concern
 
-**JSONB is not appropriate for a write-heavy OLTP queue workload.**
+**JSONB inverted indexes are the primary performance risk, not JSONB itself.**
 
 B. Direct vs Managed Connections:
-- Managed pooling makes client operations **40–90%** faster on average
-- Tail latency (p95/p99) improves **5–10×**
-- Database metrics show smoother CPU usage, lower contention, higher throughput
-- Client waits longer for pooled connections, but benefits from dramatically faster DB execution
+- Managed pooling reduces mean client latency by 40–90%, depending on transaction contention
+- The largest gains occur for long-running, update-heavy transactions (process)
+- Append-heavy transactions (add) benefit less, as they are not contention-bound
+- Tail latency (p95/p99) improves 5–10×
+- Database metrics show smoother CPU usage, lower contention, and higher throughput
 
-**Managed pooling is the superior deployment model for this workload.**
+**Managed pooling is the superior deployment model for contention-heavy OLTP workloads.**

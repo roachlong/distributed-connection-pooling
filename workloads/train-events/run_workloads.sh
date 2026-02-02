@@ -4,7 +4,7 @@
 #   export TEST_URI_LIST="postgresql://pgb:secret@172.18.0.250:5432/defaultdb?sslmode=prefer,..."
 #   export TEST_NAME="pooling"
 #   export TXN_POOLONG="true"
-# Example: ./run_workloads.sh 512
+# Example: ./run_workloads.sh 256
 
 set -euo pipefail
 
@@ -20,7 +20,7 @@ TXN_POOLONG=${TXN_POOLONG:-false}
 # Other tunables
 min_batch_size=${min_batch_size:-10}
 max_batch_size=${max_batch_size:-100}
-delay=${delay:-100}
+delay=${delay:-10000}
 
 # workload files can be overridden via env
 JSONB_WORKLOAD=${JSONB_WORKLOAD:-"transactionsJsonb.py"}
@@ -133,17 +133,15 @@ run_phase() {
 
 # Run JSONB phase, then MANUAL phase, then TEXT phase
 
-# echo "Running JSON workload first..."
-# run_phase "${JSONB_WORKLOAD}" "jsonb"
+echo "Running JSON workload first..."
+run_phase "${JSONB_WORKLOAD}" "jsonb"
 
-# echo "Sleeping two minutes before starting MANUAL workload..."
-# sleep 120
-
+echo "Sleeping two minutes before starting MANUAL workload..."
+sleep 120
 run_phase "${MANUAL_WORKLOAD}" "manual"
 
 echo "Sleeping two minutes before starting TEXT workload..."
 sleep 120
-
 run_phase "${TEXT_WORKLOAD}" "text"
 
 echo "All phases complete."

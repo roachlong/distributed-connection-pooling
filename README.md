@@ -1527,10 +1527,10 @@ docker exec -it ha-node-us-east-1 bash -lc "tail -n 100 /var/log/corosync/corosy
 
 
 ## Reference Architecture
-This is a work in progress...
+For simplicity and repeatability, CockroachDB nodes are deployed in public subnets with restricted security groups. Production deployments may choose private subnets with centralized egress, without changing the database or connection pooling architecture.
 
 ### AWS Setup
-We can setup an actual multi-region cluster in the cloud of your choice.  I'm going to use AWS with terraform and then simulate the distributed connection pool locally.
+We can setup an actual multi-region cluster in the cloud of your choice.  I'm going to use AWS with terraform to provide a reference architecture for distributed connection pooling.
 
 <details>
 <summary>more info...</summary>
@@ -1739,7 +1739,7 @@ And we can use the above pgbouncer endpoint to execute any of our workload tests
 
 **IMPORTANT**: when the workload test is complete don't forget to bring down the infrastructure for your cockroach multi-region cluster
 ```
-terraform -chdir=terraform/aws destroy -var-file=crdb-dcp-test.tfvars. -auto-approve
+terraform -chdir=terraform/aws destroy -var-file=crdb-dcp-test.tfvars -auto-approve
 ```
 </details>
 
