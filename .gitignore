@@ -220,7 +220,7 @@ logs/
 **/bin/
 **/obj/
 my-safe-directory/
-obsolette/
+obsolete/
 settings
 .DS_Store
 *.log
