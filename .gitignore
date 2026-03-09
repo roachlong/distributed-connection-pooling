@@ -217,6 +217,7 @@ build/
 certs/
 data/
 logs/
+output/
 **/bin/
 **/obj/
 my-safe-directory/

@@ -1,0 +1,4 @@
+dbworkload==0.10.1
+numpy==1.26.4
+psycopg==3.2.3
+psycopg-binary==3.2.3
