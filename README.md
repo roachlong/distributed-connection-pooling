@@ -215,6 +215,11 @@ cp certs\client.root.key $env:APPDATA\.postgresql\postgresql.key
 
 **<ins>CLUSTER</ins>**
 
+Make sure we create the network for our docker instances to communicate
+```
+docker network create dcp-net
+```
+
 <details>
 <summary>expand for single-node...</summary>
 
@@ -242,9 +247,9 @@ cd ..
 Next we'll need to configure our multi-region cluster
 ```
 cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb?sslmode=verify-full" -e """
-ALTER DATABASE defaultdb SET PRIMARY REGION 'us-east-1';
-ALTER DATABASE defaultdb ADD REGION 'us-central-1';
-ALTER DATABASE defaultdb ADD REGION 'us-west-2';
+ALTER DATABASE defaultdb SET PRIMARY REGION 'us-east';
+ALTER DATABASE defaultdb ADD REGION 'us-central';
+ALTER DATABASE defaultdb ADD REGION 'us-west';
 ALTER DATABASE defaultdb SURVIVE REGION FAILURE;
 """
 ```
@@ -323,13 +328,7 @@ Before we get started we'll need to increase the capacity of our docker network 
 <summary>more info...</summary>
 
 
-First, we'll start colima with less resources to run the HA services.
-```
-colima stop
-colima start --network-address --memory 4 --cpu 2 --disk 50
-```
-
-Then increase the kernel and networking limits on the VM 
+First, increase the kernel and networking limits on the VM 
 ```
 colima ssh
 
@@ -383,15 +382,16 @@ docker rm $(docker ps -aq --filter "name=^pgbouncer") $(docker ps -aq --filter "
 
 ### PgBouncer Setup
 Next we'll build our pgbouncer docker image and spin up two pgbouncer instances for a single node, or per region
+```
+docker network create dcp-net
+
+docker build -t pgbouncer --build-arg PGBOUNCER_VERSION=1.17.0 pgbouncer
+```
 
 <details>
 <summary>expand for single-node...</summary>
 
 ```
-docker network create dcp-net
-
-docker build -t pgbouncer --build-arg PGBOUNCER_VERSION=1.17.0 pgbouncer
-
 docker container run \
     --name pgbouncer1 \
     --network dcp-net \
@@ -504,12 +504,8 @@ openssl x509 \
 openssl x509 -in ./certs/server.pgbouncer.crt -noout -text | grep -A1 "Subject Alternative Name"
 ```
 
-And then build the image and deploy the instances
+And then deploy the instances
 ```
-docker network create dcp-net
-
-docker build -t pgbouncer --build-arg PGBOUNCER_VERSION=1.17.0 pgbouncer
-
 REGIONS=("us-east" "us-west" "us-central")
 NODES_PER_REGION=2
 
@@ -526,7 +522,7 @@ for region in "${REGIONS[@]}"; do
       -v ./certs:/etc/pgbouncer/certs \
       -d pgbouncer \
       --client-account pgb \
-      --server-account pgb \
+      --server-account pgbouncer \
       --auth-mode cert \
       --num-connections 24 \
       --host-ip "${region}" \
@@ -967,6 +963,9 @@ Also check the stats pages at http://localhost:8404/stats
 
 <br/>
 <details>
+<summary>Either Manual Setup</summary>
+
+<details>
 <summary>1. Start by creating two containers per region using the host network so they can manipulate an IP on the host interface:</summary>
 
 ```
@@ -1310,6 +1309,22 @@ done
 Should report both nodes Online in each region: i.e. [ ha-node-us-east-1 ha-node-us-east-2 ].
 </details>
 
+</details>
+
+<details>
+<summary>Or With Docker Compose</summary>
+
+```
+cd ha-node
+docker-compose up --detach
+./init-ha-cluster.sh
+cd ..
+```
+</details>
+
+<details>
+<summary>And Then Finalize Setup</summary>
+
 <details>
 <summary>7. Create the VIP inside the Docker network for each region</summary>
 
@@ -1446,12 +1461,12 @@ for region in "${REGIONS[@]}"; do
 
   docker run --rm -it \
     --network dcp-net \
-    -v ./certs:/etc/pgbouncer/certs \
-    alpine sh -c "
-      apk add --no-cache postgresql15-client curl >/dev/null && \
+    -v ./certs:/certs \
+    postgres:16 bash -c "
+      apt-get update -qq && apt-get install -y -qq curl >/dev/null 2>&1 && \
       echo 'Stats page:' && curl -s http://${VIP}:8404/stats | head -n 3 || true && \
       echo && echo 'psql via VIP with TLS + client cert:' && \
-      psql \"postgresql://pgb@${VIP}:5432/defaultdb?sslmode=require&sslrootcert=/etc/pgbouncer/certs/ca.crt&sslcert=/etc/pgbouncer/certs/client.pgb.crt&sslkey=/etc/pgbouncer/certs/client.pgb.key\" -c 'show databases;' \
+      psql \"postgresql://pgb@${VIP}:5432/defaultdb?sslmode=require&sslrootcert=/certs/ca.crt&sslcert=/certs/client.pgb.crt&sslkey=/certs/client.pgb.key\" -c 'show databases;' \
     "
 done
 ```
@@ -1475,11 +1490,14 @@ Hit the VIP again (should still work)
 ```
 docker run --rm -it \
   --network dcp-net \
-  -v ./certs:/etc/pgbouncer/certs \
-  alpine sh -c "
-    apk add --no-cache postgresql15-client curl >/dev/null && \
-    psql \"postgresql://pgb@${VIP}:5432/defaultdb?sslmode=require&sslrootcert=/etc/pgbouncer/certs/ca.crt&sslcert=/etc/pgbouncer/certs/client.pgb.crt&sslkey=/etc/pgbouncer/certs/client.pgb.key\" -c 'show databases;' \
+  -v ./certs:/certs \
+  postgres:16 bash -c "
+    apt-get update -qq && apt-get install -y -qq curl >/dev/null 2>&1 && \
+    echo 'Stats page:' && curl -s http://${VIP}:8404/stats | head -n 3 || true && \
+    echo && echo 'psql via VIP with TLS + client cert:' && \
+    psql \"postgresql://pgb@${VIP}:5432/defaultdb?sslmode=require&sslrootcert=/certs/ca.crt&sslcert=/certs/client.pgb.crt&sslkey=/certs/client.pgb.key\" -c 'show databases;' \
   "
+done
 ```
 </details>
 
@@ -1522,6 +1540,8 @@ docker exec -it ha-node-us-east-1 bash -lc "pcs status"
 docker exec -it ha-node-us-east-1 bash -lc "corosync-cfgtool -s"
 docker exec -it ha-node-us-east-1 bash -lc "tail -n 100 /var/log/corosync/corosync.log"
 ```
+</details>
+
 </details>
 </details>
 

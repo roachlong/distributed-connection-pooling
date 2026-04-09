@@ -1,0 +1,163 @@
+services:
+  # US-EAST Region
+  ha-node-us-east-1:
+    build: .
+    container_name: ha-node-us-east-1
+    hostname: ha-node-us-east-1
+    networks:
+      - dcp-net
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    privileged: true
+    security_opt:
+      - seccomp=unconfined
+    cap_add:
+      - SYS_ADMIN
+    cgroup: host
+    shm_size: 512m  # Increased to handle Pacemaker IPC load
+    tmpfs:
+      - /run
+      - /run/lock
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    environment:
+      - REGION=us-east
+      - NODE_ID=1
+
+  ha-node-us-east-2:
+    build: .
+    container_name: ha-node-us-east-2
+    hostname: ha-node-us-east-2
+    networks:
+      - dcp-net
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    privileged: true
+    security_opt:
+      - seccomp=unconfined
+    cap_add:
+      - SYS_ADMIN
+    cgroup: host
+    shm_size: 512m  # Increased to handle Pacemaker IPC load
+    tmpfs:
+      - /run
+      - /run/lock
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    environment:
+      - REGION=us-east
+      - NODE_ID=2
+
+  # US-WEST Region
+  ha-node-us-west-1:
+    build: .
+    container_name: ha-node-us-west-1
+    hostname: ha-node-us-west-1
+    networks:
+      - dcp-net
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    privileged: true
+    security_opt:
+      - seccomp=unconfined
+    cap_add:
+      - SYS_ADMIN
+    cgroup: host
+    shm_size: 512m  # Increased to handle Pacemaker IPC load
+    tmpfs:
+      - /run
+      - /run/lock
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    environment:
+      - REGION=us-west
+      - NODE_ID=1
+
+  ha-node-us-west-2:
+    build: .
+    container_name: ha-node-us-west-2
+    hostname: ha-node-us-west-2
+    networks:
+      - dcp-net
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    privileged: true
+    security_opt:
+      - seccomp=unconfined
+    cap_add:
+      - SYS_ADMIN
+    cgroup: host
+    shm_size: 512m  # Increased to handle Pacemaker IPC load
+    tmpfs:
+      - /run
+      - /run/lock
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    environment:
+      - REGION=us-west
+      - NODE_ID=2
+
+  # US-CENTRAL Region
+  ha-node-us-central-1:
+    build: .
+    container_name: ha-node-us-central-1
+    hostname: ha-node-us-central-1
+    networks:
+      - dcp-net
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    privileged: true
+    security_opt:
+      - seccomp=unconfined
+    cap_add:
+      - SYS_ADMIN
+    cgroup: host
+    shm_size: 512m  # Increased to handle Pacemaker IPC load
+    tmpfs:
+      - /run
+      - /run/lock
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    environment:
+      - REGION=us-central
+      - NODE_ID=1
+
+  ha-node-us-central-2:
+    build: .
+    container_name: ha-node-us-central-2
+    hostname: ha-node-us-central-2
+    networks:
+      - dcp-net
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    privileged: true
+    security_opt:
+      - seccomp=unconfined
+    cap_add:
+      - SYS_ADMIN
+    cgroup: host
+    shm_size: 512m  # Increased to handle Pacemaker IPC load
+    tmpfs:
+      - /run
+      - /run/lock
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    environment:
+      - REGION=us-central
+      - NODE_ID=2
+
+networks:
+  dcp-net:
+    external: true
