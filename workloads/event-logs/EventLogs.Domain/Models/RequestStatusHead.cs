@@ -1,15 +1,13 @@
 ﻿using System;
 using System.Collections.Generic;
 
-namespace EventLogs.Data;
+namespace EventLogs.Domain.Models;
 
 /// <summary>
-/// Calculates the sum of the selected values.
+/// Calculates slope of the least-squares-fit linear equation determined by the (X, Y) pairs.
 /// </summary>
 public partial class RequestStatusHead
 {
-    public short Locality { get; set; }
-
     public Guid RequestId { get; set; }
 
     public long ActionStateLinkId { get; set; }

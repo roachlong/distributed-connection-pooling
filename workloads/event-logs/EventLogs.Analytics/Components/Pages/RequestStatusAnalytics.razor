@@ -1,0 +1,278 @@
+@page "/request-status"
+@using EventLogs.Analytics.Models
+@using EventLogs.Analytics.Services
+@inject RegionalPaginationService PaginationService
+@inject ILogger<RequestStatusAnalytics> Logger
+@rendermode InteractiveServer
+
+<PageTitle>Request Status Analytics</PageTitle>
+
+<MudThemeProvider />
+<MudPopoverProvider />
+<MudDialogProvider />
+<MudSnackbarProvider />
+
+<MudContainer MaxWidth="MaxWidth.ExtraExtraLarge" Class="mt-4">
+    <MudText Typo="Typo.h3" GutterBottom="true">Request Status Analytics</MudText>
+    <MudText Typo="Typo.body1" Class="mb-4">Parallel pagination across three regions with real-time metrics</MudText>
+
+    <!-- Configuration Panel -->
+    <MudPaper Class="pa-4 mb-4">
+        <MudGrid>
+            <MudItem xs="12" sm="4">
+                <MudNumericField @bind-Value="pageSize" Label="Page Size" Min="1" Max="100000"
+                    HelperText="Number of rows per page" Disabled="@isLoading" />
+            </MudItem>
+            <MudItem xs="12" sm="4">
+                <MudNumericField @bind-Value="maxConcurrentTasks" Label="Concurrent Tasks Per Region" Min="1" Max="50"
+                    HelperText="Max parallel queries per region" Disabled="@isLoading" />
+            </MudItem>
+            <MudItem xs="12" sm="4" Class="d-flex align-center">
+                <MudButton Variant="Variant.Filled" Color="Color.Primary"
+                    OnClick="LoadData" Disabled="@isLoading" FullWidth="true" Size="Size.Large">
+                    @if (isLoading)
+                    {
+                        <MudProgressCircular Class="mr-2" Size="Size.Small" Indeterminate="true" />
+                        <span>Loading...</span>
+                    }
+                    else
+                    {
+                        <span>Load Data</span>
+                    }
+                </MudButton>
+            </MudItem>
+        </MudGrid>
+    </MudPaper>
+
+    <!-- Error Display -->
+    @if (!string.IsNullOrEmpty(errorMessage))
+    {
+        <MudAlert Severity="Severity.Error" Class="mb-4">
+            <strong>Error:</strong> @errorMessage
+        </MudAlert>
+    }
+
+    <!-- Debug Info -->
+    @if (!string.IsNullOrEmpty(debugMessage))
+    {
+        <MudAlert Severity="Severity.Info" Class="mb-4">
+            <strong>Debug:</strong> @debugMessage
+        </MudAlert>
+    }
+
+    <!-- Overall Progress -->
+    @if (isLoading || globalMetrics != null)
+    {
+        <MudPaper Class="pa-4 mb-4">
+            <MudText Typo="Typo.h6" GutterBottom="true">Overall Progress</MudText>
+            <MudProgressLinear Color="Color.Primary" Size="Size.Large" Value="@(globalMetrics?.OverallProgress ?? 0)"
+                Class="mb-2" Striped="@isLoading" />
+            <MudText Typo="Typo.body2">@((globalMetrics?.OverallProgress ?? 0).ToString("F1"))% Complete</MudText>
+        </MudPaper>
+    }
+
+    <!-- Regional Progress -->
+    @if (globalMetrics != null && globalMetrics.RegionalMetrics.Any())
+    {
+        <MudPaper Class="pa-4 mb-4">
+            <MudText Typo="Typo.h6" GutterBottom="true">Regional Progress</MudText>
+            <MudGrid>
+                @foreach (var kvp in globalMetrics.RegionalMetrics.OrderBy(x => x.Key))
+                {
+                    var metrics = kvp.Value;
+                    <MudItem xs="12" md="4">
+                        <MudCard>
+                            <MudCardHeader>
+                                <CardHeaderContent>
+                                    <MudText Typo="Typo.h6">@kvp.Key.ToUpper()</MudText>
+                                </CardHeaderContent>
+                            </MudCardHeader>
+                            <MudCardContent>
+                                <MudProgressLinear Color="Color.Info" Value="@metrics.ProgressPercent" Class="mb-2" />
+                                <MudText Typo="Typo.body2">@metrics.CompletedPages / @metrics.TotalPages pages</MudText>
+                                <MudText Typo="Typo.caption">@metrics.TotalRowsProcessed rows processed</MudText>
+                                @if (metrics.ElapsedTime.HasValue)
+                                {
+                                    <MudText Typo="Typo.caption">Elapsed: @metrics.ElapsedTime.Value.TotalSeconds.ToString("F1")s</MudText>
+                                }
+                            </MudCardContent>
+                        </MudCard>
+                    </MudItem>
+                }
+            </MudGrid>
+        </MudPaper>
+    }
+
+    <!-- Metrics Dashboard -->
+    @if (globalMetrics != null)
+    {
+        <MudPaper Class="pa-4 mb-4">
+            <MudText Typo="Typo.h6" GutterBottom="true">Performance Metrics</MudText>
+            <MudGrid>
+                <MudItem xs="6" sm="3">
+                    <MudCard Outlined="true">
+                        <MudCardContent>
+                            <MudText Typo="Typo.caption">Total Queries</MudText>
+                            <MudText Typo="Typo.h5">@globalMetrics.TotalQueries</MudText>
+                        </MudCardContent>
+                    </MudCard>
+                </MudItem>
+                <MudItem xs="6" sm="3">
+                    <MudCard Outlined="true">
+                        <MudCardContent>
+                            <MudText Typo="Typo.caption">Avg Response Time</MudText>
+                            <MudText Typo="Typo.h5">@globalMetrics.AverageResponseTimeMs.ToString("F0")ms</MudText>
+                        </MudCardContent>
+                    </MudCard>
+                </MudItem>
+                <MudItem xs="6" sm="3">
+                    <MudCard Outlined="true">
+                        <MudCardContent>
+                            <MudText Typo="Typo.caption">Peak Connections</MudText>
+                            <MudText Typo="Typo.h5">@globalMetrics.PeakConnections</MudText>
+                        </MudCardContent>
+                    </MudCard>
+                </MudItem>
+                <MudItem xs="6" sm="3">
+                    <MudCard Outlined="true">
+                        <MudCardContent>
+                            <MudText Typo="Typo.caption">Total Rows</MudText>
+                            <MudText Typo="Typo.h5">@globalMetrics.TotalRowsProcessed</MudText>
+                        </MudCardContent>
+                    </MudCard>
+                </MudItem>
+            </MudGrid>
+        </MudPaper>
+    }
+
+    <!-- Chart -->
+    @if (aggregatedData != null && aggregatedData.Any())
+    {
+        <MudPaper Class="pa-4 mb-4">
+            <MudText Typo="Typo.h6" GutterBottom="true">Request Status Distribution</MudText>
+            <MudChart ChartType="ChartType.Bar" T="double" ChartSeries="@chartSeries" xaxislabels="@chartLabels"
+                Width="100%" Height="400px" ChartOptions="@chartOptions" />
+        </MudPaper>
+
+        <!-- Data Table -->
+        <MudPaper Class="pa-4">
+            <MudText Typo="Typo.h6" GutterBottom="true">Detailed Data</MudText>
+            <MudTable Items="@aggregatedData" Hover="true" Striped="true" Dense="true">
+                <HeaderContent>
+                    <MudTh>Request Type</MudTh>
+                    <MudTh>Status</MudTh>
+                    <MudTh>Count</MudTh>
+                    <MudTh>Region</MudTh>
+                </HeaderContent>
+                <RowTemplate>
+                    <MudTd DataLabel="Request Type">@context.RequestType</MudTd>
+                    <MudTd DataLabel="Status">
+                        <MudBadge Color="@GetStatusColor(context.Status)" Overlap="true">@context.Status</MudBadge>
+                    </MudTd>
+                    <MudTd DataLabel="Count">@context.Count</MudTd>
+                    <MudTd DataLabel="Region">@context.Region</MudTd>
+                </RowTemplate>
+            </MudTable>
+        </MudPaper>
+    }
+</MudContainer>
+
+@code {
+    private int pageSize = 1000;
+    private int maxConcurrentTasks = 5;
+    private bool isLoading = false;
+    private string errorMessage = "";
+    private string debugMessage = "";
+
+    private List<RequestStatusAggregate>? aggregatedData;
+    private GlobalMetrics? globalMetrics;
+
+    // Chart data
+    private List<ChartSeries<double>> chartSeries = new();
+    private string[] chartLabels = Array.Empty<string>();
+    private ChartOptions chartOptions = new();
+
+    private async Task LoadData()
+    {
+        Logger.LogInformation("LoadData button clicked - starting data fetch with pageSize={PageSize}, concurrentTasks={Tasks}",
+            pageSize, maxConcurrentTasks);
+
+        isLoading = true;
+        errorMessage = "";
+        debugMessage = $"Starting fetch: pageSize={pageSize}, concurrentTasks={maxConcurrentTasks}";
+        aggregatedData = null;
+        globalMetrics = null;
+        await InvokeAsync(StateHasChanged);
+
+        try
+        {
+            Logger.LogInformation("Calling PaginationService.FetchRequestStatusAggregatesAsync...");
+            debugMessage = "Calling PaginationService...";
+            await InvokeAsync(StateHasChanged);
+
+            aggregatedData = await PaginationService.FetchRequestStatusAggregatesAsync(
+                pageSize,
+                maxConcurrentTasks,
+                onMetricsUpdate: (metrics) =>
+                {
+                    Logger.LogDebug("Metrics update received: {Progress}% complete", metrics.OverallProgress);
+                    globalMetrics = metrics;
+                    debugMessage = $"Progress: {metrics.OverallProgress:F1}%";
+                    InvokeAsync(StateHasChanged);
+                });
+
+            Logger.LogInformation("Data fetch completed. Received {Count} aggregates", aggregatedData?.Count ?? 0);
+            debugMessage = $"Fetch complete! Received {aggregatedData?.Count ?? 0} aggregates";
+
+            // Prepare chart data
+            PrepareChartData();
+
+            isLoading = false;
+            await InvokeAsync(StateHasChanged);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load data - Exception: {Message}", ex.Message);
+            errorMessage = $"{ex.GetType().Name}: {ex.Message}";
+            debugMessage = "";
+            isLoading = false;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private void PrepareChartData()
+    {
+        if (aggregatedData == null || !aggregatedData.Any())
+            return;
+
+        // Group by request type and status
+        var grouped = aggregatedData
+            .GroupBy(a => a.RequestType)
+            .OrderBy(g => g.Key)
+            .ToList();
+
+        chartLabels = grouped.Select(g => g.Key).ToArray();
+
+        // Get all unique statuses
+        var statuses = aggregatedData.Select(a => a.Status).Distinct().OrderBy(s => s).ToList();
+
+        chartSeries = statuses.Select(status => new ChartSeries<double>
+        {
+            Name = status,
+            Data = grouped.Select(g =>
+                (double)g.Where(a => a.Status == status).Sum(a => a.Count)).ToArray()
+        }).ToList();
+    }
+
+    private Color GetStatusColor(string status)
+    {
+        return status.ToUpper() switch
+        {
+            "OPEN" => Color.Info,
+            "IN_PROGRESS" or "IN PROGRESS" => Color.Warning,
+            "CLOSED" => Color.Success,
+            "CANCELLED" or "CANCELED" => Color.Error,
+            _ => Color.Default
+        };
+    }
+}

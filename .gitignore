@@ -216,6 +216,7 @@ terraform.rc
 build/
 certs/
 data/
+demos/
 logs/
 output/
 **/bin/

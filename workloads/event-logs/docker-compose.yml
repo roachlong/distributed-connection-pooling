@@ -1,49 +1,162 @@
 services:
-  # existing cockroach + pgbouncer + kafka definitions here...
-
-  request-generator:
+  account-batch-loader:
     build:
       context: .
-      dockerfile: EventLogs.RequestGenerator/Dockerfile
+      dockerfile: Dockerfile.AccountBatchLoader
+    container_name: eventlogs-account-batch-loader
+    networks:
+      - dcp-net
+    restart: "no"  # Run once and exit
+    volumes:
+      - ../../certs:/certs:ro  # Mount certificates as read-only
     environment:
-      EVENTLOGS_DB: "Host=pgbouncer;Port=6543;Database=optima;Username=app_user;Password=secret"
-      KAFKA_BOOTSTRAP: "kafka:9093"
-    depends_on:
-      - kafka
-      - pgbouncer
+      - DOTNET_ENVIRONMENT=Production
+      # Override connection string with VIP and certificates
+      - ConnectionStrings__DefaultConnection=Host=${PGBOUNCER_VIP_US_EAST:-172.18.0.251};Port=5432;Database=defaultdb;Username=pgb;SSL Mode=Require;Root Certificate=/certs/ca.crt;SSL Certificate=/certs/client.pgb.crt;SSL Key=/certs/client.pgb.key;Pooling=true;Minimum Pool Size=10;Maximum Pool Size=200;Connection Lifetime=600;Connection Idle Lifetime=300;Application Name=eventlogs-account-batch-loader
+      # Locality configuration
+      - Localities_us_east=${LOCALITIES_US_EAST:-[0,1,2,3,4,5,6,7,8,9]}
+      - Localities_us_central=${LOCALITIES_US_CENTRAL:-[10,11,12,13,14,15,16,17,18,19]}
+      - Localities_us_west=${LOCALITIES_US_WEST:-[20,21,22,23,24,25,26,27,28,29]}
 
-  request-processor-us-east:
+  request-generator-us-east:
     build:
       context: .
-      dockerfile: EventLogs.RequestProcessor/Dockerfile
+      dockerfile: Dockerfile.RequestGenerator
+    container_name: eventlogs-request-generator-us-east
+    networks:
+      - dcp-net
+    restart: unless-stopped
+    volumes:
+      - ../../certs:/certs:ro
     environment:
-      REGION: "us-east"
-      EVENTLOGS_DB: "Host=pgbouncer-us-east;Port=6543;Database=optima;Username=app_user;Password=secret"
-      KAFKA_BOOTSTRAP: "kafka:9093"
-    depends_on:
-      - kafka
-      - pgbouncer-us-east
+      - DOTNET_ENVIRONMENT=Production
+      - ConnectionStrings__DefaultConnection=Host=${PGBOUNCER_VIP_US_EAST:-172.18.0.251};Port=5432;Database=defaultdb;Username=pgb;SSL Mode=Require;Root Certificate=/certs/ca.crt;SSL Certificate=/certs/client.pgb.crt;SSL Key=/certs/client.pgb.key;Pooling=true;Minimum Pool Size=10;Maximum Pool Size=200;Connection Lifetime=600;Connection Idle Lifetime=300;Application Name=eventlogs-request-generator-us-east
+      - Region=us-east
+      - BatchSize=100
+      - ThrottleMs=1000
+      - RequestedBy=system-us-east
+      - Localities_us_east=${LOCALITIES_US_EAST:-[0,1,2,3,4,5,6,7,8,9]}
 
-  request-processor-us-central:
+  request-generator-us-central:
     build:
       context: .
-      dockerfile: EventLogs.RequestProcessor/Dockerfile
+      dockerfile: Dockerfile.RequestGenerator
+    container_name: eventlogs-request-generator-us-central
+    networks:
+      - dcp-net
+    restart: unless-stopped
+    volumes:
+      - ../../certs:/certs:ro
     environment:
-      REGION: "us-central"
-      EVENTLOGS_DB: "Host=pgbouncer-us-central;Port=6543;Database=optima;Username=app_user;Password=secret"
-      KAFKA_BOOTSTRAP: "kafka:9093"
-    depends_on:
-      - kafka
-      - pgbouncer-us-central
+      - DOTNET_ENVIRONMENT=Production
+      - ConnectionStrings__DefaultConnection=Host=${PGBOUNCER_VIP_US_CENTRAL:-172.18.0.252};Port=5432;Database=defaultdb;Username=pgb;SSL Mode=Require;Root Certificate=/certs/ca.crt;SSL Certificate=/certs/client.pgb.crt;SSL Key=/certs/client.pgb.key;Pooling=true;Minimum Pool Size=10;Maximum Pool Size=200;Connection Lifetime=600;Connection Idle Lifetime=300;Application Name=eventlogs-request-generator-us-central
+      - Region=us-central
+      - BatchSize=100
+      - ThrottleMs=1000
+      - RequestedBy=system-us-central
+      - Localities_us_central=${LOCALITIES_US_CENTRAL:-[10,11,12,13,14,15,16,17,18,19]}
 
-  request-processor-us-west:
+  request-generator-us-west:
     build:
       context: .
-      dockerfile: EventLogs.RequestProcessor/Dockerfile
+      dockerfile: Dockerfile.RequestGenerator
+    container_name: eventlogs-request-generator-us-west
+    networks:
+      - dcp-net
+    restart: unless-stopped
+    volumes:
+      - ../../certs:/certs:ro
     environment:
-      REGION: "us-west"
-      EVENTLOGS_DB: "Host=pgbouncer-us-west;Port=6543;Database=optima;Username=app_user;Password=secret"
-      KAFKA_BOOTSTRAP: "kafka:9093"
-    depends_on:
-      - kafka
-      - pgbouncer-us-west
+      - DOTNET_ENVIRONMENT=Production
+      - ConnectionStrings__DefaultConnection=Host=${PGBOUNCER_VIP_US_WEST:-172.18.0.253};Port=5432;Database=defaultdb;Username=pgb;SSL Mode=Require;Root Certificate=/certs/ca.crt;SSL Certificate=/certs/client.pgb.crt;SSL Key=/certs/client.pgb.key;Pooling=true;Minimum Pool Size=10;Maximum Pool Size=200;Connection Lifetime=600;Connection Idle Lifetime=300;Application Name=eventlogs-request-generator-us-west
+      - Region=us-west
+      - BatchSize=100
+      - ThrottleMs=1000
+      - RequestedBy=system-us-west
+      - Localities_us_west=${LOCALITIES_US_WEST:-[20,21,22,23,24,25,26,27,28,29]}
+
+  workflow-processor-us-east:
+    build:
+      context: .
+      dockerfile: Dockerfile.WorkflowProcessor
+    container_name: eventlogs-workflow-processor-us-east
+    networks:
+      - dcp-net
+    restart: unless-stopped
+    volumes:
+      - ../../certs:/certs:ro
+    environment:
+      - DOTNET_ENVIRONMENT=Production
+      - ConnectionStrings__DefaultConnection=Host=${PGBOUNCER_VIP_US_EAST:-172.18.0.251};Port=5432;Database=defaultdb;Username=pgb;SSL Mode=Require;Root Certificate=/certs/ca.crt;SSL Certificate=/certs/client.pgb.crt;SSL Key=/certs/client.pgb.key;Pooling=true;Minimum Pool Size=10;Maximum Pool Size=200;Connection Lifetime=600;Connection Idle Lifetime=300;Application Name=eventlogs-workflow-processor-us-east
+      - Region=us-east
+      - KafkaBootstrap=kafka:9093
+      - PartitionCount=24
+      - BatchSize=128
+      - BatchWindowMs=1000
+      - MaxRetries=5
+      - ProcessingDelayMs=100
+
+  workflow-processor-us-central:
+    build:
+      context: .
+      dockerfile: Dockerfile.WorkflowProcessor
+    container_name: eventlogs-workflow-processor-us-central
+    networks:
+      - dcp-net
+    restart: unless-stopped
+    volumes:
+      - ../../certs:/certs:ro
+    environment:
+      - DOTNET_ENVIRONMENT=Production
+      - ConnectionStrings__DefaultConnection=Host=${PGBOUNCER_VIP_US_CENTRAL:-172.18.0.252};Port=5432;Database=defaultdb;Username=pgb;SSL Mode=Require;Root Certificate=/certs/ca.crt;SSL Certificate=/certs/client.pgb.crt;SSL Key=/certs/client.pgb.key;Pooling=true;Minimum Pool Size=10;Maximum Pool Size=200;Connection Lifetime=600;Connection Idle Lifetime=300;Application Name=eventlogs-workflow-processor-us-central
+      - Region=us-central
+      - KafkaBootstrap=kafka:9093
+      - PartitionCount=24
+      - BatchSize=128
+      - BatchWindowMs=1000
+      - MaxRetries=5
+      - ProcessingDelayMs=100
+
+  workflow-processor-us-west:
+    build:
+      context: .
+      dockerfile: Dockerfile.WorkflowProcessor
+    container_name: eventlogs-workflow-processor-us-west
+    networks:
+      - dcp-net
+    restart: unless-stopped
+    volumes:
+      - ../../certs:/certs:ro
+    environment:
+      - DOTNET_ENVIRONMENT=Production
+      - ConnectionStrings__DefaultConnection=Host=${PGBOUNCER_VIP_US_WEST:-172.18.0.253};Port=5432;Database=defaultdb;Username=pgb;SSL Mode=Require;Root Certificate=/certs/ca.crt;SSL Certificate=/certs/client.pgb.crt;SSL Key=/certs/client.pgb.key;Pooling=true;Minimum Pool Size=10;Maximum Pool Size=200;Connection Lifetime=600;Connection Idle Lifetime=300;Application Name=eventlogs-workflow-processor-us-west
+      - Region=us-west
+      - KafkaBootstrap=kafka:9093
+      - PartitionCount=24
+      - BatchSize=128
+      - BatchWindowMs=1000
+      - MaxRetries=5
+      - ProcessingDelayMs=100
+
+  analytics:
+    build:
+      context: .
+      dockerfile: Dockerfile.Analytics
+    container_name: eventlogs-analytics
+    networks:
+      - dcp-net
+    restart: unless-stopped
+    ports:
+      - "5080:8080"  # HTTP - access at http://localhost:5080
+    volumes:
+      - ../../certs:/certs:ro
+    environment:
+      - DOTNET_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:8080
+      - ConnectionStrings__us-east_connection=Host=${PGBOUNCER_VIP_US_EAST:-172.18.0.251};Port=5432;Database=defaultdb;Username=pgb;SSL Mode=Require;Root Certificate=/certs/ca.crt;SSL Certificate=/certs/client.pgb.crt;SSL Key=/certs/client.pgb.key;Pooling=true;Minimum Pool Size=5;Maximum Pool Size=50;Connection Lifetime=600;Connection Idle Lifetime=300;Application Name=eventlogs-analytics-us-east
+      - ConnectionStrings__us-central_connection=Host=${PGBOUNCER_VIP_US_CENTRAL:-172.18.0.252};Port=5432;Database=defaultdb;Username=pgb;SSL Mode=Require;Root Certificate=/certs/ca.crt;SSL Certificate=/certs/client.pgb.crt;SSL Key=/certs/client.pgb.key;Pooling=true;Minimum Pool Size=5;Maximum Pool Size=50;Connection Lifetime=600;Connection Idle Lifetime=300;Application Name=eventlogs-analytics-us-central
+      - ConnectionStrings__us-west_connection=Host=${PGBOUNCER_VIP_US_WEST:-172.18.0.253};Port=5432;Database=defaultdb;Username=pgb;SSL Mode=Require;Root Certificate=/certs/ca.crt;SSL Certificate=/certs/client.pgb.crt;SSL Key=/certs/client.pgb.key;Pooling=true;Minimum Pool Size=5;Maximum Pool Size=50;Connection Lifetime=600;Connection Idle Lifetime=300;Application Name=eventlogs-analytics-us-west
+
+networks:
+  dcp-net:
+    external: true

@@ -1,10 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 
-namespace EventLogs.Data;
+namespace EventLogs.Domain.Models;
 
 /// <summary>
-/// Identifies the minimum selected value.
+/// Calculates slope of the least-squares-fit linear equation determined by the (X, Y) pairs.
 /// </summary>
 public partial class RequestActionStateLink
 {

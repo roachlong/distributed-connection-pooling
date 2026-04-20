@@ -1,10 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 
-namespace EventLogs.Data;
+namespace EventLogs.Domain.Models;
 
 /// <summary>
-/// Concatenates all selected values using the provided delimiter.
+/// Calculates slope of the least-squares-fit linear equation determined by the (X, Y) pairs.
 /// </summary>
 public partial class RequestInfo
 {
@@ -23,8 +23,6 @@ public partial class RequestInfo
     public DateTime? TargetEffectiveTs { get; set; }
 
     public int RequestStatusId { get; set; }
-
-    public short Locality { get; set; }
 
     public virtual RequestStatus RequestStatus { get; set; } = null!;
 

@@ -1,10 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 
-namespace EventLogs.Data;
+namespace EventLogs.Domain.Models;
 
 /// <summary>
-/// Identifies the minimum selected value.
+/// Calculates square of the correlation coefficient.
 /// </summary>
 public partial class RequestActionType
 {

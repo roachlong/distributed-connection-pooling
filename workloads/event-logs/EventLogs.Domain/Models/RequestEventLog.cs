@@ -1,10 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 
-namespace EventLogs.Data;
+namespace EventLogs.Domain.Models;
 
 /// <summary>
-/// Calculates the sum of the selected values.
+/// Calculates slope of the least-squares-fit linear equation determined by the (X, Y) pairs.
 /// </summary>
 public partial class RequestEventLog
 {
@@ -21,8 +21,6 @@ public partial class RequestEventLog
     public string? Actor { get; set; }
 
     public string? Metadata { get; set; }
-
-    public short Locality { get; set; }
 
     public string IdempotencyKey { get; set; } = null!;
 

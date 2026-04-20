@@ -246,7 +246,7 @@ cd ..
 
 Next we'll need to configure our multi-region cluster
 ```
-cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb?sslmode=verify-full" -e """
+cockroach sql --certs-dir ./certs --url "postgresql://localhost:26257/defaultdb?=verify-full" -e """
 ALTER DATABASE defaultdb SET PRIMARY REGION 'us-east';
 ALTER DATABASE defaultdb ADD REGION 'us-central';
 ALTER DATABASE defaultdb ADD REGION 'us-west';
