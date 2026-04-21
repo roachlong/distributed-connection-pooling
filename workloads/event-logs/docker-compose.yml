@@ -138,6 +138,63 @@ services:
       - MaxRetries=5
       - ProcessingDelayMs=100
 
+  trade-generator-us-east:
+    build:
+      context: .
+      dockerfile: Dockerfile.TradeGenerator
+    container_name: eventlogs-trade-generator-us-east
+    networks:
+      - dcp-net
+    restart: unless-stopped
+    volumes:
+      - ../../certs:/certs:ro
+    environment:
+      - DOTNET_ENVIRONMENT=Production
+      - ConnectionStrings__DefaultConnection=Host=${PGBOUNCER_VIP_US_EAST:-172.18.0.251};Port=5432;Database=defaultdb;Username=pgb;SSL Mode=Require;Root Certificate=/certs/ca.crt;SSL Certificate=/certs/client.pgb.crt;SSL Key=/certs/client.pgb.key;Pooling=true;Minimum Pool Size=10;Maximum Pool Size=200;Connection Lifetime=600;Connection Idle Lifetime=300;Application Name=eventlogs-trade-generator-us-east
+      - Region=us-east
+      - BatchSize=100
+      - ThrottleMs=1000
+      - TradesPerAccount=3
+      - Localities_us_east=${LOCALITIES_US_EAST:-[0,1,2,3,4,5,6,7,8,9]}
+
+  trade-generator-us-central:
+    build:
+      context: .
+      dockerfile: Dockerfile.TradeGenerator
+    container_name: eventlogs-trade-generator-us-central
+    networks:
+      - dcp-net
+    restart: unless-stopped
+    volumes:
+      - ../../certs:/certs:ro
+    environment:
+      - DOTNET_ENVIRONMENT=Production
+      - ConnectionStrings__DefaultConnection=Host=${PGBOUNCER_VIP_US_CENTRAL:-172.18.0.252};Port=5432;Database=defaultdb;Username=pgb;SSL Mode=Require;Root Certificate=/certs/ca.crt;SSL Certificate=/certs/client.pgb.crt;SSL Key=/certs/client.pgb.key;Pooling=true;Minimum Pool Size=10;Maximum Pool Size=200;Connection Lifetime=600;Connection Idle Lifetime=300;Application Name=eventlogs-trade-generator-us-central
+      - Region=us-central
+      - BatchSize=100
+      - ThrottleMs=1000
+      - TradesPerAccount=3
+      - Localities_us_central=${LOCALITIES_US_CENTRAL:-[10,11,12,13,14,15,16,17,18,19]}
+
+  trade-generator-us-west:
+    build:
+      context: .
+      dockerfile: Dockerfile.TradeGenerator
+    container_name: eventlogs-trade-generator-us-west
+    networks:
+      - dcp-net
+    restart: unless-stopped
+    volumes:
+      - ../../certs:/certs:ro
+    environment:
+      - DOTNET_ENVIRONMENT=Production
+      - ConnectionStrings__DefaultConnection=Host=${PGBOUNCER_VIP_US_WEST:-172.18.0.253};Port=5432;Database=defaultdb;Username=pgb;SSL Mode=Require;Root Certificate=/certs/ca.crt;SSL Certificate=/certs/client.pgb.crt;SSL Key=/certs/client.pgb.key;Pooling=true;Minimum Pool Size=10;Maximum Pool Size=200;Connection Lifetime=600;Connection Idle Lifetime=300;Application Name=eventlogs-trade-generator-us-west
+      - Region=us-west
+      - BatchSize=100
+      - ThrottleMs=1000
+      - TradesPerAccount=3
+      - Localities_us_west=${LOCALITIES_US_WEST:-[20,21,22,23,24,25,26,27,28,29]}
+
   analytics:
     build:
       context: .
