@@ -21,6 +21,8 @@ public class PaginationMetrics
 public class GlobalMetrics
 {
     public Dictionary<string, PaginationMetrics> RegionalMetrics { get; set; } = new();
+    public DateTime? OverallStartTime { get; set; }
+    public DateTime? OverallEndTime { get; set; }
     public int TotalQueries => RegionalMetrics.Values.Sum(m => m.TotalQueries);
     public double AverageResponseTimeMs => RegionalMetrics.Values.Any() ?
         RegionalMetrics.Values.Average(m => m.AverageResponseTimeMs) : 0;
@@ -30,4 +32,6 @@ public class GlobalMetrics
     public bool AllComplete => RegionalMetrics.Values.All(m => m.IsComplete) && RegionalMetrics.Any();
     public double OverallProgress => RegionalMetrics.Values.Any() ?
         RegionalMetrics.Values.Average(m => m.ProgressPercent) : 0;
+    public TimeSpan? TotalElapsedTime => OverallStartTime.HasValue ?
+        (OverallEndTime ?? DateTime.UtcNow) - OverallStartTime.Value : null;
 }

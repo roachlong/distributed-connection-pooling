@@ -1,0 +1,81 @@
+@using EventLogs.Analytics.Models
+@inject ILogger<RequestDetailsDialog> Logger
+
+<MudDialog>
+    <DialogContent>
+        <MudContainer MaxWidth="MaxWidth.Large">
+            <MudText Typo="Typo.h6" GutterBottom="true">
+                @Aggregate?.RequestType - @Aggregate?.Status (@Aggregate?.Region)
+            </MudText>
+            <MudText Typo="Typo.body2" Class="mb-4">
+                Showing @Details?.Count of @Aggregate?.Count requests
+            </MudText>
+
+            @if (Details != null && Details.Any())
+            {
+                <MudTable Items="@Details" Hover="true" Striped="true" Dense="true" T="RequestDetail"
+                    FixedHeader="true" Height="500px">
+                    <HeaderContent>
+                        <MudTh>Request ID</MudTh>
+                        <MudTh>Account ID</MudTh>
+                        <MudTh>Requested By</MudTh>
+                        <MudTh>Created At</MudTh>
+                        <MudTh>Updated At</MudTh>
+                        <MudTh>Actions</MudTh>
+                    </HeaderContent>
+                    <RowTemplate>
+                        <MudTd DataLabel="Request ID">
+                            <MudText Typo="Typo.caption" Style="font-family: monospace;">
+                                @context.RequestId.ToString().Substring(0, 8)...
+                            </MudText>
+                        </MudTd>
+                        <MudTd DataLabel="Account ID">
+                            <MudText Typo="Typo.caption" Style="font-family: monospace;">
+                                @context.AccountId.ToString().Substring(0, 8)...
+                            </MudText>
+                        </MudTd>
+                        <MudTd DataLabel="Requested By">@context.RequestedBy</MudTd>
+                        <MudTd DataLabel="Created At">@context.CreatedAt.ToString("yyyy-MM-dd HH:mm:ss")</MudTd>
+                        <MudTd DataLabel="Updated At">@context.UpdatedAt.ToString("yyyy-MM-dd HH:mm:ss")</MudTd>
+                        <MudTd DataLabel="Actions">
+                            <MudButton Size="Size.Small" Variant="Variant.Text" Color="Color.Info"
+                                OnClick="@(() => ViewEventHistory(context.RequestId))">
+                                Event History
+                            </MudButton>
+                        </MudTd>
+                    </RowTemplate>
+                </MudTable>
+            }
+            else
+            {
+                <MudAlert Severity="Severity.Info">No requests found for this filter.</MudAlert>
+            }
+        </MudContainer>
+    </DialogContent>
+    <DialogActions>
+        <MudButton OnClick="Close">Close</MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code {
+    [Parameter]
+    public RequestStatusAggregate? Aggregate { get; set; }
+
+    [Parameter]
+    public List<RequestDetail>? Details { get; set; }
+
+    [Parameter]
+    public EventCallback<Guid> OnRequestSelected { get; set; }
+
+    private void Close()
+    {
+        // Dialog will close automatically when user clicks the X or Close button
+    }
+
+    private async Task ViewEventHistory(Guid requestId)
+    {
+        Logger.LogInformation("Requesting event history for {RequestId}", requestId);
+        await OnRequestSelected.InvokeAsync(requestId);
+        // Don't close automatically - let user decide
+    }
+}

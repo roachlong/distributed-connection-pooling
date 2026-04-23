@@ -1,12 +1,12 @@
-@page "/request-status"
+@page "/trade-analytics"
 @using EventLogs.Analytics.Models
 @using EventLogs.Analytics.Services
 @inject RegionalPaginationService PaginationService
-@inject ILogger<RequestStatusAnalytics> Logger
+@inject ILogger<TradeAnalytics> Logger
 @inject IDialogService DialogService
 @rendermode InteractiveServer
 
-<PageTitle>Account Analytics</PageTitle>
+<PageTitle>Trade Analytics</PageTitle>
 
 <MudThemeProvider />
 <MudPopoverProvider />
@@ -14,7 +14,7 @@
 <MudSnackbarProvider />
 
 <MudContainer MaxWidth="MaxWidth.ExtraExtraLarge" Class="mt-4">
-    <MudText Typo="Typo.h3" GutterBottom="true">Account Analytics</MudText>
+    <MudText Typo="Typo.h3" GutterBottom="true">Trade Analytics</MudText>
     <MudText Typo="Typo.body1" Class="mb-4">Parallel pagination across three regions with real-time metrics</MudText>
 
     <!-- Configuration Panel -->
@@ -192,7 +192,7 @@
                 <MudItem xs="6" sm="4" md="2">
                     <MudCard Outlined="true">
                         <MudCardContent>
-                            <MudText Typo="Typo.caption">Total Rows</MudText>
+                            <MudText Typo="Typo.caption">Total Trades</MudText>
                             <MudText Typo="Typo.h5">@globalMetrics.TotalRowsProcessed.ToString("N0")</MudText>
                         </MudCardContent>
                     </MudCard>
@@ -256,8 +256,8 @@
     @if (aggregatedData != null && aggregatedData.Any())
     {
         <MudPaper Class="pa-4 mb-4">
-            <MudText Typo="Typo.h6" GutterBottom="true">Request Status Distribution</MudText>
-            <MudText Typo="Typo.caption" Class="mb-2">Click on a bar group to filter by request type, or click legend chips to filter by status</MudText>
+            <MudText Typo="Typo.h6" GutterBottom="true">Top 10 Symbols by Volume (BUY vs SELL)</MudText>
+            <MudText Typo="Typo.caption" Class="mb-2">Click on a symbol to filter by symbol, or click legend chips to filter by side</MudText>
             <div style="position: relative;">
                 <MudChart ChartType="ChartType.Bar"
                     T="double"
@@ -279,39 +279,37 @@
                 </div>
             </div>
 
-            <!-- Clickable Legend for statuses -->
+            <!-- Clickable Legend for BUY/SELL -->
             <MudText Typo="Typo.caption" Class="mt-4">
-                <strong>Status Legend:</strong>
-                @for (int i = 0; i < chartSeries.Count; i++)
-                {
-                    var series = chartSeries[i];
-                    var colorIndex = i % chartOptions.ChartPalette.Length;
-                    var chipColor = GetChipColorForIndex(colorIndex);
-                    <MudChip T="string" Size="Size.Small" Color="@chipColor" Class="ml-2"
-                        OnClick="@(() => { filterStatus = series.Name; })">
-                        @series.Name
-                    </MudChip>
-                }
+                <strong>Legend:</strong>
+                <MudChip T="string" Size="Size.Small" Color="Color.Success" Class="ml-2"
+                    OnClick="@(() => { filterSide = "BUY"; })">
+                    BUY
+                </MudChip>
+                <MudChip T="string" Size="Size.Small" Color="Color.Error" Class="ml-2"
+                    OnClick="@(() => { filterSide = "SELL"; })">
+                    SELL
+                </MudChip>
             </MudText>
         </MudPaper>
 
         <!-- Data Table -->
         <MudPaper Class="pa-4">
-            <MudText Typo="Typo.h6" GutterBottom="true">Detailed Data</MudText>
+            <MudText Typo="Typo.h6" GutterBottom="true">Detailed Trade Data</MudText>
 
             <!-- Filters -->
             <MudGrid Class="mb-4">
-                <MudItem xs="12" sm="6">
-                    <MudSelect T="string" @bind-Value="filterRequestType" Label="Filter by Request Type"
+                <MudItem xs="12" sm="3">
+                    <MudSelect T="string" @bind-Value="filterSide" Label="Filter by Side"
                         Clearable="true" Variant="Variant.Outlined" Margin="Margin.Dense">
-                        <MudSelectItem T="string" Value="@("")">All Request Types</MudSelectItem>
-                        @foreach (var type in GetUniqueRequestTypes())
+                        <MudSelectItem T="string" Value="@("")">All Sides</MudSelectItem>
+                        @foreach (var side in GetUniqueSides())
                         {
-                            <MudSelectItem T="string" Value="@type">@type</MudSelectItem>
+                            <MudSelectItem T="string" Value="@side">@side</MudSelectItem>
                         }
                     </MudSelect>
                 </MudItem>
-                <MudItem xs="12" sm="6">
+                <MudItem xs="12" sm="3">
                     <MudSelect T="string" @bind-Value="filterStatus" Label="Filter by Status"
                         Clearable="true" Variant="Variant.Outlined" Margin="Margin.Dense">
                         <MudSelectItem T="string" Value="@("")">All Statuses</MudSelectItem>
@@ -321,16 +319,36 @@
                         }
                     </MudSelect>
                 </MudItem>
+                <MudItem xs="12" sm="3">
+                    <MudSelect T="string" @bind-Value="filterSymbol" Label="Filter by Symbol"
+                        Clearable="true" Variant="Variant.Outlined" Margin="Margin.Dense">
+                        <MudSelectItem T="string" Value="@("")">All Symbols</MudSelectItem>
+                        @foreach (var symbol in GetUniqueSymbols().Take(20))
+                        {
+                            <MudSelectItem T="string" Value="@symbol">@symbol</MudSelectItem>
+                        }
+                    </MudSelect>
+                </MudItem>
+                <MudItem xs="12" sm="3">
+                    <MudSelect T="string" @bind-Value="filterRegion" Label="Filter by Region"
+                        Clearable="true" Variant="Variant.Outlined" Margin="Margin.Dense">
+                        <MudSelectItem T="string" Value="@("")">All Regions</MudSelectItem>
+                        @foreach (var region in GetUniqueRegions())
+                        {
+                            <MudSelectItem T="string" Value="@region">@region</MudSelectItem>
+                        }
+                    </MudSelect>
+                </MudItem>
             </MudGrid>
 
             <!-- Filter chips -->
-            @if (!string.IsNullOrEmpty(filterRequestType) || !string.IsNullOrEmpty(filterStatus))
+            @if (!string.IsNullOrEmpty(filterSide) || !string.IsNullOrEmpty(filterStatus) || !string.IsNullOrEmpty(filterSymbol) || !string.IsNullOrEmpty(filterRegion))
             {
                 <MudChipSet T="string" Class="mb-2">
-                    @if (!string.IsNullOrEmpty(filterRequestType))
+                    @if (!string.IsNullOrEmpty(filterSide))
                     {
-                        <MudChip T="string" Color="Color.Primary" OnClose="@(() => filterRequestType = "")">
-                            Type: @filterRequestType
+                        <MudChip T="string" Color="Color.Primary" OnClose="@(() => filterSide = "")">
+                            Side: @filterSide
                         </MudChip>
                     }
                     @if (!string.IsNullOrEmpty(filterStatus))
@@ -339,28 +357,48 @@
                             Status: @filterStatus
                         </MudChip>
                     }
+                    @if (!string.IsNullOrEmpty(filterSymbol))
+                    {
+                        <MudChip T="string" Color="Color.Info" OnClose="@(() => filterSymbol = "")">
+                            Symbol: @filterSymbol
+                        </MudChip>
+                    }
+                    @if (!string.IsNullOrEmpty(filterRegion))
+                    {
+                        <MudChip T="string" Color="Color.Warning" OnClose="@(() => filterRegion = "")">
+                            Region: @filterRegion
+                        </MudChip>
+                    }
                     <MudChip T="string" Color="Color.Default" OnClick="ClearFilters">Clear All</MudChip>
                 </MudChipSet>
             }
 
-            <MudTable Items="@GetFilteredData()" Hover="true" Striped="true" Dense="true" T="RequestStatusAggregate">
+            <MudTable Items="@GetFilteredData()" Hover="true" Striped="true" Dense="true" T="TradeAggregate">
                 <HeaderContent>
-                    <MudTh>Request Type</MudTh>
+                    <MudTh>Side</MudTh>
                     <MudTh>Status</MudTh>
-                    <MudTh>Count</MudTh>
+                    <MudTh>Symbol</MudTh>
                     <MudTh>Region</MudTh>
+                    <MudTh>Count</MudTh>
+                    <MudTh>Total Quantity</MudTh>
+                    <MudTh>Avg Price</MudTh>
                     <MudTh>Actions</MudTh>
                 </HeaderContent>
                 <RowTemplate>
-                    <MudTd DataLabel="Request Type">@context.RequestType</MudTd>
+                    <MudTd DataLabel="Side">
+                        <MudChip T="string" Size="Size.Small" Color="@GetSideColor(context.Side)">@context.Side</MudChip>
+                    </MudTd>
                     <MudTd DataLabel="Status">
                         <MudBadge Color="@GetStatusColor(context.Status)" Overlap="true">@context.Status</MudBadge>
                     </MudTd>
-                    <MudTd DataLabel="Count">@context.Count</MudTd>
+                    <MudTd DataLabel="Symbol">@context.Symbol</MudTd>
                     <MudTd DataLabel="Region">@context.Region</MudTd>
+                    <MudTd DataLabel="Count">@context.Count.ToString("N0")</MudTd>
+                    <MudTd DataLabel="Total Quantity">@context.TotalQuantity.ToString("N2")</MudTd>
+                    <MudTd DataLabel="Avg Price">@context.AveragePrice.ToString("C2")</MudTd>
                     <MudTd DataLabel="Actions">
                         <MudButton Size="Size.Small" Variant="Variant.Text" Color="Color.Primary"
-                            OnClick="@(() => ShowRequestDetails(context))">
+                            OnClick="@(() => ShowTradeDetails(context))">
                             View Details
                         </MudButton>
                     </MudTd>
@@ -378,7 +416,7 @@
     private string errorMessage = "";
     private string debugMessage = "";
 
-    private List<RequestStatusAggregate>? aggregatedData;
+    private List<TradeAggregate>? aggregatedData;
     private GlobalMetrics? globalMetrics;
 
     // Chart data
@@ -388,15 +426,14 @@
     private int selectedChartIndex = -1;
 
     // Filters
-    private string filterRequestType = "";
+    private string filterSide = "";
     private string filterStatus = "";
-
-    // Track current region for drill-down
-    private string currentRegion = "";
+    private string filterSymbol = "";
+    private string filterRegion = "";
 
     private async Task LoadData()
     {
-        Logger.LogInformation("LoadData button clicked - starting data fetch with pageSize={PageSize}, concurrentTasks={Tasks}",
+        Logger.LogInformation("LoadData button clicked - starting trade data fetch with pageSize={PageSize}, concurrentTasks={Tasks}",
             pageSize, maxConcurrentTasks);
 
         isLoading = true;
@@ -408,12 +445,12 @@
 
         try
         {
-            Logger.LogInformation("Calling PaginationService.FetchRequestStatusAggregatesAsync with strategy {Strategy}...",
+            Logger.LogInformation("Calling PaginationService.FetchTradeAggregatesAsync with strategy {Strategy}...",
                 gatewayStrategy);
             debugMessage = $"Calling PaginationService with {gatewayStrategy} strategy...";
             await InvokeAsync(StateHasChanged);
 
-            aggregatedData = await PaginationService.FetchRequestStatusAggregatesAsync(
+            aggregatedData = await PaginationService.FetchTradeAggregatesAsync(
                 pageSize,
                 maxConcurrentTasks,
                 onMetricsUpdate: (metrics) =>
@@ -425,7 +462,7 @@
                 },
                 gatewayStrategy: gatewayStrategy);
 
-            Logger.LogInformation("Data fetch completed. Received {Count} aggregates", aggregatedData?.Count ?? 0);
+            Logger.LogInformation("Trade data fetch completed. Received {Count} aggregates", aggregatedData?.Count ?? 0);
             debugMessage = $"Fetch complete! Received {aggregatedData?.Count ?? 0} aggregates";
 
             // Prepare chart data
@@ -436,7 +473,7 @@
         }
         catch (Exception ex)
         {
-            Logger.LogError(ex, "Failed to load data - Exception: {Message}", ex.Message);
+            Logger.LogError(ex, "Failed to load trade data - Exception: {Message}", ex.Message);
             errorMessage = $"{ex.GetType().Name}: {ex.Message}";
             debugMessage = "";
             isLoading = false;
@@ -449,32 +486,56 @@
         if (aggregatedData == null || !aggregatedData.Any())
             return;
 
-        // Group by request type and status
+        // Group by symbol - take top 10 by volume
+        var topSymbols = aggregatedData
+            .GroupBy(a => a.Symbol)
+            .OrderByDescending(g => g.Sum(a => a.Count))
+            .Take(10)
+            .Select(g => g.Key)
+            .ToList();
+
         var grouped = aggregatedData
-            .GroupBy(a => a.RequestType)
+            .Where(a => topSymbols.Contains(a.Symbol))
+            .GroupBy(a => a.Symbol)
             .OrderBy(g => g.Key)
             .ToList();
 
         chartLabels = grouped.Select(g => g.Key).ToArray();
 
-        // Get all unique statuses
-        var statuses = aggregatedData.Select(a => a.Status).Distinct().OrderBy(s => s).ToList();
-
-        chartSeries = statuses.Select(status => new ChartSeries<double>
+        // Create series for BUY and SELL
+        chartSeries = new List<ChartSeries<double>>
         {
-            Name = status,
-            Data = grouped.Select(g =>
-                (double)g.Where(a => a.Status == status).Sum(a => a.Count)).ToArray()
-        }).ToList();
+            new ChartSeries<double>
+            {
+                Name = "BUY",
+                Data = grouped.Select(g =>
+                    (double)g.Where(a => a.Side == "BUY").Sum(a => a.Count)).ToArray()
+            },
+            new ChartSeries<double>
+            {
+                Name = "SELL",
+                Data = grouped.Select(g =>
+                    (double)g.Where(a => a.Side == "SELL").Sum(a => a.Count)).ToArray()
+            }
+        };
 
-        // Configure chart options
         chartOptions = new ChartOptions
         {
             ChartPalette = new[]
             {
-                "#2196F3", "#4CAF50", "#FF9800", "#F44336", "#9C27B0",
+                "#4CAF50", "#F44336", "#2196F3", "#FF9800", "#9C27B0",
                 "#00BCD4", "#8BC34A", "#FF5722", "#673AB7", "#03A9F4"
             }
+        };
+    }
+
+    private Color GetSideColor(string side)
+    {
+        return side.ToUpper() switch
+        {
+            "BUY" => Color.Success,
+            "SELL" => Color.Error,
+            _ => Color.Default
         };
     }
 
@@ -482,47 +543,30 @@
     {
         return status.ToUpper() switch
         {
-            "OPEN" => Color.Info,
+            "PENDING" => Color.Default,
             "IN_PROGRESS" or "IN PROGRESS" => Color.Warning,
-            "CLOSED" => Color.Success,
-            "CANCELLED" or "CANCELED" => Color.Error,
-            _ => Color.Default
+            "COMPLETE" or "COMPLETED" => Color.Success,
+            "FAILED" or "ERROR" => Color.Error,
+            _ => Color.Info
         };
     }
 
-    private Color GetChipColorForIndex(int index)
+    private List<TradeAggregate> GetFilteredData()
     {
-        // Map palette hex colors to MudBlazor Color enum
-        return index switch
-        {
-            0 => Color.Info,      // #2196F3 (blue)
-            1 => Color.Success,   // #4CAF50 (green)
-            2 => Color.Warning,   // #FF9800 (orange)
-            3 => Color.Error,     // #F44336 (red)
-            4 => Color.Secondary, // #9C27B0 (purple)
-            5 => Color.Tertiary,  // #00BCD4 (cyan)
-            6 => Color.Success,   // #8BC34A (light green)
-            7 => Color.Error,     // #FF5722 (deep orange)
-            8 => Color.Secondary, // #673AB7 (deep purple)
-            9 => Color.Info,      // #03A9F4 (light blue)
-            _ => Color.Default
-        };
-    }
-
-    private List<RequestStatusAggregate> GetFilteredData()
-    {
-        if (aggregatedData == null) return new List<RequestStatusAggregate>();
+        if (aggregatedData == null) return new List<TradeAggregate>();
 
         return aggregatedData
-            .Where(a => string.IsNullOrEmpty(filterRequestType) || a.RequestType == filterRequestType)
+            .Where(a => string.IsNullOrEmpty(filterSide) || a.Side == filterSide)
             .Where(a => string.IsNullOrEmpty(filterStatus) || a.Status == filterStatus)
+            .Where(a => string.IsNullOrEmpty(filterSymbol) || a.Symbol == filterSymbol)
+            .Where(a => string.IsNullOrEmpty(filterRegion) || a.Region == filterRegion)
             .ToList();
     }
 
-    private List<string> GetUniqueRequestTypes()
+    private List<string> GetUniqueSides()
     {
         if (aggregatedData == null) return new List<string>();
-        return aggregatedData.Select(a => a.RequestType).Distinct().OrderBy(t => t).ToList();
+        return aggregatedData.Select(a => a.Side).Distinct().OrderBy(t => t).ToList();
     }
 
     private List<string> GetUniqueStatuses()
@@ -531,65 +575,65 @@
         return aggregatedData.Select(a => a.Status).Distinct().OrderBy(s => s).ToList();
     }
 
-    private void ClearFilters()
+    private List<string> GetUniqueSymbols()
     {
-        filterRequestType = "";
-        filterStatus = "";
+        if (aggregatedData == null) return new List<string>();
+        return aggregatedData.Select(a => a.Symbol).Distinct().OrderBy(s => s).ToList();
     }
 
-    private async Task ShowRequestDetails(RequestStatusAggregate aggregate)
+    private List<string> GetUniqueRegions()
+    {
+        if (aggregatedData == null) return new List<string>();
+        return aggregatedData.Select(a => a.Region).Distinct().OrderBy(r => r).ToList();
+    }
+
+    private void ClearFilters()
+    {
+        filterSide = "";
+        filterStatus = "";
+        filterSymbol = "";
+        filterRegion = "";
+    }
+
+    private void OnChartClicked(int index)
+    {
+        if (index >= 0 && chartSeries.Count > 0)
+        {
+            // MudChart returns flattened index by x-axis position, then by series
+            // Index 0 = Symbol 0/Series 0 (AAPL/BUY), Index 1 = Symbol 0/Series 1 (AAPL/SELL)
+            // Index 2 = Symbol 1/Series 0 (AMZN/BUY), Index 3 = Symbol 1/Series 1 (AMZN/SELL)
+            int symbolIndex = index / chartSeries.Count;
+            int seriesIndex = index % chartSeries.Count;
+
+            if (symbolIndex < chartLabels.Length && seriesIndex < chartSeries.Count)
+            {
+                filterSymbol = chartLabels[symbolIndex];
+                filterSide = chartSeries[seriesIndex].Name;
+                selectedChartIndex = index;
+                Logger.LogInformation("Chart clicked: filtering by symbol {Symbol} and side {Side}",
+                    filterSymbol, filterSide);
+            }
+        }
+    }
+
+    private async Task ShowTradeDetails(TradeAggregate aggregate)
     {
         try
         {
-            Logger.LogInformation("Fetching details for {Type}/{Status}/{Region}",
-                aggregate.RequestType, aggregate.Status, aggregate.Region);
+            Logger.LogInformation("Fetching trade details for {Side}/{Status}/{Symbol}/{Region}",
+                aggregate.Side, aggregate.Status, aggregate.Symbol, aggregate.Region);
 
-            currentRegion = aggregate.Region;
-
-            var details = await PaginationService.FetchRequestDetailsAsync(
+            var details = await PaginationService.FetchTradeDetailsAsync(
                 aggregate.Region,
-                aggregate.RequestType,
+                aggregate.Side,
                 aggregate.Status,
+                aggregate.Symbol,
                 limit: 100);
 
             var parameters = new DialogParameters
             {
                 ["Aggregate"] = aggregate,
-                ["Details"] = details,
-                ["OnRequestSelected"] = EventCallback.Factory.Create<Guid>(this, ShowEventLogHistory)
-            };
-
-            var options = new DialogOptions
-            {
-                MaxWidth = MaxWidth.Large,
-                FullWidth = true,
-                CloseButton = true
-            };
-
-            await DialogService.ShowAsync<RequestDetailsDialog>("Request Details", parameters, options);
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Failed to load request details");
-            errorMessage = $"Failed to load details: {ex.Message}";
-        }
-    }
-
-    private async Task ShowEventLogHistory(Guid requestId)
-    {
-        try
-        {
-            Logger.LogInformation("Fetching event log history for request {RequestId} in region {Region}",
-                requestId, currentRegion);
-
-            var eventLogs = await PaginationService.FetchEventLogHistoryAsync(
-                currentRegion,
-                requestId);
-
-            var parameters = new DialogParameters
-            {
-                ["RequestId"] = requestId,
-                ["EventLogs"] = eventLogs
+                ["Details"] = details
             };
 
             var options = new DialogOptions
@@ -599,32 +643,12 @@
                 CloseButton = true
             };
 
-            await DialogService.ShowAsync<EventLogHistoryDialog>("Event Log History", parameters, options);
+            await DialogService.ShowAsync<TradeDetailsDialog>("Trade Details", parameters, options);
         }
         catch (Exception ex)
         {
-            Logger.LogError(ex, "Failed to load event log history");
-            errorMessage = $"Failed to load event history: {ex.Message}";
-        }
-    }
-
-    private void OnChartClicked(int index)
-    {
-        if (index >= 0 && chartSeries.Count > 0)
-        {
-            // MudChart returns flattened index by x-axis position, then by series
-            // Index 0 = Type 0/Series 0, Index 1 = Type 0/Series 1, etc.
-            int requestTypeIndex = index / chartSeries.Count;
-            int seriesIndex = index % chartSeries.Count;
-
-            if (requestTypeIndex < chartLabels.Length && seriesIndex < chartSeries.Count)
-            {
-                filterRequestType = chartLabels[requestTypeIndex];
-                filterStatus = chartSeries[seriesIndex].Name;
-                selectedChartIndex = index;
-                Logger.LogInformation("Chart clicked: filtering by request type {RequestType} and status {Status}",
-                    filterRequestType, filterStatus);
-            }
+            Logger.LogError(ex, "Failed to load trade details");
+            errorMessage = $"Failed to load details: {ex.Message}";
         }
     }
 }

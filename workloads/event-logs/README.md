@@ -521,7 +521,7 @@ docker-compose up -d analytics
 
 Access the UI at: **http://localhost:5080**
 
-Navigate to **Request Status Analytics** from the menu.
+Navigate to **Account Analytics** from the menu.
 
 **Features:**
 - Configure page size (100-10000) and concurrent tasks per region (1-50)

@@ -1,0 +1,128 @@
+@using EventLogs.Analytics.Models
+@using MudBlazor
+@inject ILogger<TradeDetailsDialog> Logger
+
+<MudDialog>
+    <DialogContent>
+        <MudContainer MaxWidth="MaxWidth.ExtraLarge">
+            <MudText Typo="Typo.h6" GutterBottom="true">
+                @Aggregate?.Symbol - @Aggregate?.Side (@Aggregate?.Status) in @Aggregate?.Region
+            </MudText>
+            <MudText Typo="Typo.body2" Class="mb-4">
+                Showing @Details?.Count of @Aggregate?.Count trades
+            </MudText>
+
+            @if (Details != null && Details.Any())
+            {
+                <!-- Summary Stats -->
+                <MudGrid Class="mb-4">
+                    <MudItem xs="12" sm="3">
+                        <MudCard Outlined="true">
+                            <MudCardContent>
+                                <MudText Typo="Typo.caption">Total Trades</MudText>
+                                <MudText Typo="Typo.h5">@Details.Count.ToString("N0")</MudText>
+                            </MudCardContent>
+                        </MudCard>
+                    </MudItem>
+                    <MudItem xs="12" sm="3">
+                        <MudCard Outlined="true">
+                            <MudCardContent>
+                                <MudText Typo="Typo.caption">Total Quantity</MudText>
+                                <MudText Typo="Typo.h5">@Details.Sum(d => d.Quantity).ToString("N2")</MudText>
+                            </MudCardContent>
+                        </MudCard>
+                    </MudItem>
+                    <MudItem xs="12" sm="3">
+                        <MudCard Outlined="true">
+                            <MudCardContent>
+                                <MudText Typo="Typo.caption">Avg Price</MudText>
+                                <MudText Typo="Typo.h5">
+                                    @if (Details.Any(d => d.Price.HasValue))
+                                    {
+                                        @Details.Where(d => d.Price.HasValue).Average(d => d.Price!.Value).ToString("C2")
+                                    }
+                                    else
+                                    {
+                                        <text>N/A</text>
+                                    }
+                                </MudText>
+                            </MudCardContent>
+                        </MudCard>
+                    </MudItem>
+                    <MudItem xs="12" sm="3">
+                        <MudCard Outlined="true">
+                            <MudCardContent>
+                                <MudText Typo="Typo.caption">Unique Accounts</MudText>
+                                <MudText Typo="Typo.h5">@Details.Select(d => d.AccountId).Distinct().Count()</MudText>
+                            </MudCardContent>
+                        </MudCard>
+                    </MudItem>
+                </MudGrid>
+
+                <!-- Trade Details Table -->
+                <MudTable Items="@Details" Hover="true" Striped="true" Dense="true" T="TradeDetail"
+                    FixedHeader="true" Height="500px">
+                    <HeaderContent>
+                        <MudTh>Trade ID</MudTh>
+                        <MudTh>Request ID</MudTh>
+                        <MudTh>Account ID</MudTh>
+                        <MudTh>Quantity</MudTh>
+                        <MudTh>Price</MudTh>
+                        <MudTh>Currency</MudTh>
+                        <MudTh>Created At</MudTh>
+                    </HeaderContent>
+                    <RowTemplate>
+                        <MudTd DataLabel="Trade ID">
+                            <MudText Typo="Typo.caption" Style="font-family: monospace;">
+                                @context.TradeId.ToString().Substring(0, 8)...
+                            </MudText>
+                        </MudTd>
+                        <MudTd DataLabel="Request ID">
+                            <MudText Typo="Typo.caption" Style="font-family: monospace;">
+                                @context.RequestId.ToString().Substring(0, 8)...
+                            </MudText>
+                        </MudTd>
+                        <MudTd DataLabel="Account ID">
+                            <MudText Typo="Typo.caption" Style="font-family: monospace;">
+                                @context.AccountId.ToString().Substring(0, 8)...
+                            </MudText>
+                        </MudTd>
+                        <MudTd DataLabel="Quantity">@context.Quantity.ToString("N2")</MudTd>
+                        <MudTd DataLabel="Price">
+                            @if (context.Price.HasValue)
+                            {
+                                @context.Price.Value.ToString("C2")
+                            }
+                            else
+                            {
+                                <text>-</text>
+                            }
+                        </MudTd>
+                        <MudTd DataLabel="Currency">@(context.Currency ?? "-")</MudTd>
+                        <MudTd DataLabel="Created At">@context.CreatedAt.ToString("yyyy-MM-dd HH:mm:ss")</MudTd>
+                    </RowTemplate>
+                </MudTable>
+            }
+            else
+            {
+                <MudAlert Severity="Severity.Info">No trades found for this filter.</MudAlert>
+            }
+        </MudContainer>
+    </DialogContent>
+    <DialogActions>
+        <MudButton OnClick="Close">Close</MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code {
+    [Parameter]
+    public TradeAggregate? Aggregate { get; set; }
+
+    [Parameter]
+    public List<TradeDetail>? Details { get; set; }
+
+    private void Close()
+    {
+        // Dialog will close automatically when user clicks the X or Close button
+    }
+}

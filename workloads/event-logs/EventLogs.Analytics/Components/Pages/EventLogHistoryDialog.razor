@@ -1,0 +1,91 @@
+@using EventLogs.Analytics.Models
+@using MudBlazor
+@inject ILogger<EventLogHistoryDialog> Logger
+
+<MudDialog>
+    <DialogContent>
+        <MudContainer MaxWidth="MaxWidth.Large">
+            <MudText Typo="Typo.h6" GutterBottom="true">
+                Event Log History for Request
+            </MudText>
+            <MudText Typo="Typo.caption" Class="mb-4" Style="font-family: monospace;">
+                @RequestId
+            </MudText>
+
+            @if (EventLogs != null && EventLogs.Any())
+            {
+                <MudTimeline TimelineOrientation="TimelineOrientation.Vertical" TimelinePosition="TimelinePosition.Start">
+                    @foreach (var log in EventLogs)
+                    {
+                        <MudTimelineItem Color="@GetEventColor(log.Status)" Size="Size.Small">
+                            <ItemOpposite>
+                                <MudText Typo="Typo.caption">@log.EventTimestamp.ToString("yyyy-MM-dd HH:mm:ss.fff")</MudText>
+                            </ItemOpposite>
+                            <ItemContent>
+                                <MudCard Outlined="true">
+                                    <MudCardContent>
+                                        <MudText Typo="Typo.subtitle1" Style="font-weight: bold;">
+                                            @log.EventType
+                                        </MudText>
+                                        <MudText Typo="Typo.body2">
+                                            Status: <MudChip T="string" Size="Size.Small" Color="@GetEventColor(log.Status)">@log.Status</MudChip>
+                                        </MudText>
+                                        <MudText Typo="Typo.caption">Sequence: @log.SequenceNumber</MudText>
+                                        @if (!string.IsNullOrEmpty(log.EventData))
+                                        {
+                                            <MudExpansionPanels Class="mt-2">
+                                                <MudExpansionPanel Text="Event Data" Dense="true">
+                                                    <MudText Typo="Typo.caption" Style="font-family: monospace; white-space: pre-wrap;">
+                                                        @log.EventData
+                                                    </MudText>
+                                                </MudExpansionPanel>
+                                            </MudExpansionPanels>
+                                        }
+                                        @if (!string.IsNullOrEmpty(log.ErrorMessage))
+                                        {
+                                            <MudAlert Severity="Severity.Error" Dense="true" Class="mt-2">
+                                                @log.ErrorMessage
+                                            </MudAlert>
+                                        }
+                                    </MudCardContent>
+                                </MudCard>
+                            </ItemContent>
+                        </MudTimelineItem>
+                    }
+                </MudTimeline>
+            }
+            else
+            {
+                <MudAlert Severity="Severity.Info">No event logs found for this request.</MudAlert>
+            }
+        </MudContainer>
+    </DialogContent>
+    <DialogActions>
+        <MudButton OnClick="Close">Close</MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code {
+    [Parameter]
+    public Guid RequestId { get; set; }
+
+    [Parameter]
+    public List<EventLogEntry>? EventLogs { get; set; }
+
+    private void Close()
+    {
+        // Dialog will close automatically when user clicks the X or Close button
+    }
+
+    private Color GetEventColor(string status)
+    {
+        return status.ToUpper() switch
+        {
+            "PENDING" => Color.Default,
+            "IN_PROGRESS" or "IN PROGRESS" => Color.Warning,
+            "COMPLETE" or "COMPLETED" => Color.Success,
+            "FAILED" or "ERROR" => Color.Error,
+            _ => Color.Info
+        };
+    }
+}
