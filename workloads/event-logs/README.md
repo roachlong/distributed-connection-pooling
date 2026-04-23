@@ -18,7 +18,7 @@ This workload demonstrates a **hybrid geo-partitioning strategy** for a multi-re
 - **Smart client partitioning** for batch-loaded account data (computed locality hash)
 - **Multi-region abstractions** (REGIONAL BY ROW) for transactional data that auto-homes via gateway locality
 - **CDC-driven event orchestration** using regional Kafka topics
-- **Keyset pagination** for efficient large-scale data processing
+- **Parallel keyset pagination** for efficient large-scale data processing with concurrent page fetching
 
 The system models the full lifecycle of account management requests: from onboarding and profile updates, through compliance workflows and trade generation, to completion and analytics.
 
@@ -27,9 +27,9 @@ The system models the full lifecycle of account management requests: from onboar
 - **Data locality alignment** - Account data stays in its home region across all related tables
 - **Regional app deployment** - Each app instance connects through regional LTM → PgBouncer → CRDB Gateway
 - **Event-driven workflows** - CDC publishes to regional Kafka topics, consumers process locally
-- **Keyset pagination** - Efficient traversal of large datasets without offset/skip anti-patterns
+- **Parallel keyset pagination** - Two-phase cursor pre-computation with concurrent page fetching (see [Parallel Keyset Pagination Pattern](#parallel-keyset-pagination-pattern))
 - **Manual offset management** - `EnableAutoCommit=true` + `EnableAutoOffsetStore=false` pattern for reliable replay
-- **Cross-region analytics** - Parallel queries across all localities for global insights
+- **Cross-region analytics** - Parallel queries across all localities for global insights with real-time progress metrics
 
 ## Components
 
@@ -592,9 +592,140 @@ For in-depth design patterns, rationale, and best practices, see:
 1. **Hybrid locality** - `account_info` uses computed hash; transactional tables use REGIONAL BY ROW
 2. **Regional CDC topics** - 3 changefeeds with `WHERE crdb_region = ...` predicates
 3. **Kafka offset pattern** - `EnableAutoCommit=true` + `EnableAutoOffsetStore=false` for safe replay
-4. **Keyset pagination** - Cursor-based (not offset) for efficient large dataset traversal
-5. **Trigger-maintained status** - `request_status_head` updated via trigger on `request_event_log`
-6. **Error handling** - Common retry helper (`DatabaseRetryHelper`) handles serialization (40001), ambiguous (40003), connection (08xx/57xx), and duplicate key (23505) errors
+4. **Parallel keyset pagination** - Two-phase cursor-based pagination with concurrent page fetching (see below)
+5. **Follower reads for analytics** - Uses `AS OF SYSTEM TIME follower_read_timestamp()` to distribute load across all replicas
+6. **Trigger-maintained status** - `request_status_head` updated via trigger on `request_event_log`
+7. **Error handling** - Common retry helper (`DatabaseRetryHelper`) handles serialization (40001), ambiguous (40003), connection (08xx/57xx), and duplicate key (23505) errors
+
+### Parallel Keyset Pagination Pattern
+
+The analytics service implements a **two-phase parallel pagination strategy** that dramatically improves performance for large dataset queries across multiple regions.
+
+#### Traditional Keyset Pagination (Sequential)
+
+```csharp
+// ❌ Sequential - pages fetched one at a time
+Guid? lastId = null;
+while (true) {
+    var page = await FetchPage(lastId, pageSize);
+    if (page.Count == 0) break;
+    lastId = page.LastId;  // Need this for next iteration
+}
+```
+
+**Problem**: Each page query must wait for the previous one to complete, wasting time when you could be fetching multiple pages in parallel.
+
+#### Our Approach: Pre-Computed Cursors + Parallel Fetch
+
+**Phase 1: Pre-Compute All Page Cursors**
+
+Uses window functions to find page boundaries **without fetching actual data**:
+
+```sql
+SELECT
+    t.trade_id,
+    t.rn,
+    ((t.rn - 1) / @pageSize) + 1 as page_number
+FROM (
+    SELECT
+        ti.trade_id,
+        row_number() OVER (ORDER BY ti.trade_id) as rn
+    FROM trade_info ti
+    WHERE ti.crdb_region = @region
+) t AS OF SYSTEM TIME follower_read_timestamp()
+WHERE (t.rn - 1) % @pageSize = 0  -- Only first row of each page
+ORDER BY t.trade_id
+```
+
+**Result**: A lightweight list of cursor positions (e.g., 10 cursors for 100K rows with 10K page size).
+
+**Phase 2: Fetch All Pages in Parallel**
+
+```csharp
+// ✅ Parallel - all pages execute concurrently
+var pageCursors = await GetPageCursorsAsync(region, pageSize);  // Fast query
+var semaphore = new SemaphoreSlim(maxConcurrentTasks);
+
+var pageTasks = pageCursors.Select(cursor => Task.Run(async () => {
+    await semaphore.WaitAsync();
+    try {
+        return await FetchPageAsync(cursor);  // Each task gets its own cursor
+    }
+    finally {
+        semaphore.Release();
+    }
+}));
+
+var results = await Task.WhenAll(pageTasks);  // Wait for all pages
+```
+
+**Key Benefits**:
+- **Parallelism**: All pages execute simultaneously (controlled by semaphore)
+- **Connection pooling**: Each task gets its own connection from the pool
+- **Real-time progress**: Metrics update as each page completes
+- **No sequential dependency**: Don't need page N-1 to fetch page N
+
+#### Performance Comparison
+
+**Example**: 100K rows, 10K page size = 10 pages, 50ms per page query
+
+| Strategy | Execution | Total Time |
+|----------|-----------|------------|
+| **Sequential Keyset** | Page 1 → wait → Page 2 → wait → ... | 10 × 50ms = **500ms** |
+| **Parallel Cursors** | Cursor query (5ms) + max(50ms) for all pages | **~55ms** |
+
+**~9x faster** for this workload!
+
+#### Multi-Region Parallelism
+
+The analytics service applies this pattern at **two levels**:
+
+1. **Region-level parallelism**: 3 regions fetch in parallel via `Task.WhenAll`
+2. **Page-level parallelism**: Within each region, N pages fetch in parallel (controlled by `maxConcurrentTasks`)
+
+```
+us-east (10 pages)     us-central (12 pages)    us-west (8 pages)
+    ├─ Page 1              ├─ Page 1                ├─ Page 1
+    ├─ Page 2              ├─ Page 2                ├─ Page 2
+    ├─ ... (parallel)      ├─ ... (parallel)        ├─ ... (parallel)
+    └─ Page 10             └─ Page 12               └─ Page 8
+```
+
+All 30 pages across all regions can execute concurrently!
+
+#### Implementation Details
+
+See `EventLogs.Analytics/Services/RegionalPaginationService.cs`:
+
+- `GetPageCursorsAsync()` / `GetTradePageCursorsAsync()` - Phase 1 cursor discovery
+- `FetchPageAsync()` / `FetchTradePageAsync()` - Individual page fetch with retry logic
+- `FetchRegionalDataAsync()` / `FetchRegionalTradeDataAsync()` - Orchestrates parallel execution
+- `DatabaseRetryHelper` - Wraps each query with exponential backoff retry for transient errors
+
+**Follower Reads for Analytics**:
+
+All analytics queries use `AS OF SYSTEM TIME follower_read_timestamp()` to enable **follower reads**:
+
+```sql
+SELECT ... 
+FROM trade_info ti
+AS OF SYSTEM TIME follower_read_timestamp()
+WHERE ti.crdb_region = @region
+```
+
+**Why follower reads?**
+- Analytics don't need real-time data (stale reads are acceptable)
+- Queries can be served by **any replica** in the region (not just leaseholders)
+- Distributes load across all 3 replicas per range (3x more capacity)
+- Reduces contention on leaseholder nodes
+- Lower latency when closest replica is not the leaseholder
+
+**Staleness**: `follower_read_timestamp()` returns current time minus 4.8 seconds (default closed timestamp target). For analytics dashboards, this staleness is negligible.
+
+**Connection Pool Configuration**:
+- App pool: `Minimum Pool Size=5; Maximum Pool Size=50` per region
+- PgBouncer: `default_pool_size=20-50` (backend connections)
+- Result: 50 app connections share 20-50 backend connections efficiently
 
 ---
 
