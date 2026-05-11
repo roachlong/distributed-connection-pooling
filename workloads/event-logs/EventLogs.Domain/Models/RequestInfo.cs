@@ -4,7 +4,7 @@ using System.Collections.Generic;
 namespace EventLogs.Domain.Models;
 
 /// <summary>
-/// Calculates slope of the least-squares-fit linear equation determined by the (X, Y) pairs.
+/// Request information tracking workflow state.
 /// </summary>
 public partial class RequestInfo
 {
@@ -12,7 +12,7 @@ public partial class RequestInfo
 
     public int RequestTypeId { get; set; }
 
-    public Guid PrimaryAccountId { get; set; }
+    public string PrimaryAccountNumber { get; set; } = null!;
 
     public DateTime CreatedTs { get; set; }
 

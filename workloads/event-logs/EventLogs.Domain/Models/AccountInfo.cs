@@ -4,12 +4,11 @@ using System.Collections.Generic;
 namespace EventLogs.Domain.Models;
 
 /// <summary>
-/// Calculates slope of the least-squares-fit linear equation determined by the (X, Y) pairs.
+/// Account information with manual hash-based partitioning.
+/// locality is auto-computed from account_number via CRC32 hash.
 /// </summary>
 public partial class AccountInfo
 {
-    public Guid AccountId { get; set; }
-
     public string AccountNumber { get; set; } = null!;
 
     public string AccountName { get; set; } = null!;
@@ -18,5 +17,6 @@ public partial class AccountInfo
 
     public string? BaseCurrency { get; set; }
 
+    // Read-only: computed by database from account_number
     public short Locality { get; set; }
 }

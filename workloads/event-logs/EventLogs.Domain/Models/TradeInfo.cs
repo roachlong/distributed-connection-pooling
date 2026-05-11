@@ -4,7 +4,7 @@ using System.Collections.Generic;
 namespace EventLogs.Domain.Models;
 
 /// <summary>
-/// Calculates slope of the least-squares-fit linear equation determined by the (X, Y) pairs.
+/// Trade instructions generated from requests.
 /// </summary>
 public partial class TradeInfo
 {
@@ -12,7 +12,7 @@ public partial class TradeInfo
 
     public Guid RequestId { get; set; }
 
-    public Guid AccountId { get; set; }
+    public string AccountNumber { get; set; } = null!;
 
     public string Symbol { get; set; } = null!;
 

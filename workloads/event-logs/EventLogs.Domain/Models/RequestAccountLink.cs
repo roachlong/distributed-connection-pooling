@@ -4,13 +4,13 @@ using System.Collections.Generic;
 namespace EventLogs.Domain.Models;
 
 /// <summary>
-/// Calculates slope of the least-squares-fit linear equation determined by the (X, Y) pairs.
+/// Links requests to multiple accounts (many-to-many relationship).
 /// </summary>
 public partial class RequestAccountLink
 {
     public Guid RequestId { get; set; }
 
-    public Guid AccountId { get; set; }
+    public string AccountNumber { get; set; } = null!;
 
     public string? Role { get; set; }
 

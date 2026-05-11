@@ -62,19 +62,16 @@ public partial class EventLogsContext : DbContext
 
         modelBuilder.Entity<AccountInfo>(entity =>
         {
-            entity.HasKey(e => new { e.Locality, e.AccountId });
+            entity.HasKey(e => new { e.Locality, e.AccountNumber });
 
             entity.ToTable("account_info")
                 .HasAnnotation("Npgsql:StorageParameter:schema_locked", "true");
 
-            entity.Property(e => e.AccountId)
-                .HasDefaultValueSql("gen_random_uuid()")
-                .HasColumnName("account_id");
-            entity.Property(e => e.AccountName).HasColumnName("account_name");
             entity.Property(e => e.AccountNumber).HasColumnName("account_number");
+            entity.Property(e => e.AccountName).HasColumnName("account_name");
             entity.Property(e => e.BaseCurrency).HasColumnName("base_currency");
             entity.Property(e => e.Locality)
-                .HasComputedColumnSql("mod(crc32ieee(account_id::BYTES), 30)::INT2", stored: true)
+                .HasComputedColumnSql("mod(crc32ieee(account_number), 30)::INT2", stored: true)
                 .ValueGeneratedOnAdd()  // Only generated on insert, not update (required for key columns)
                 .HasColumnName("locality");
             entity.Property(e => e.Strategy).HasColumnName("strategy");
@@ -104,14 +101,14 @@ public partial class EventLogsContext : DbContext
 
         modelBuilder.Entity<RequestAccountLink>(entity =>
         {
-            entity.HasKey(e => new { e.RequestId, e.AccountId }).HasName("request_account_link_pkey");
+            entity.HasKey(e => new { e.RequestId, e.AccountNumber }).HasName("request_account_link_pkey");
 
             entity
-                .ToTable("request_account_link", tb => tb.HasComment("Calculates slope of the least-squares-fit linear equation determined by the (X, Y) pairs."))
+                .ToTable("request_account_link", tb => tb.HasComment("Links requests to multiple accounts."))
                 .HasAnnotation("Npgsql:StorageParameter:schema_locked", "true");
 
             entity.Property(e => e.RequestId).HasColumnName("request_id");
-            entity.Property(e => e.AccountId).HasColumnName("account_id");
+            entity.Property(e => e.AccountNumber).HasColumnName("account_number");
             entity.Property(e => e.AllocationPct)
                 .HasPrecision(5, 2)
                 .HasColumnName("allocation_pct");
@@ -216,14 +213,14 @@ public partial class EventLogsContext : DbContext
         {
             entity
                 .HasNoKey()
-                .ToTable("request_info", tb => tb.HasComment("Calculates slope of the least-squares-fit linear equation determined by the (X, Y) pairs."))
+                .ToTable("request_info", tb => tb.HasComment("Request information tracking workflow state."))
                 .HasAnnotation("Npgsql:StorageParameter:schema_locked", "true");
 
             entity.Property(e => e.CreatedTs)
                 .HasDefaultValueSql("now()")
                 .HasColumnName("created_ts");
             entity.Property(e => e.Description).HasColumnName("description");
-            entity.Property(e => e.PrimaryAccountId).HasColumnName("primary_account_id");
+            entity.Property(e => e.PrimaryAccountNumber).HasColumnName("primary_account_number");
             entity.Property(e => e.RequestId)
                 .HasDefaultValueSql("gen_random_uuid()")
                 .HasColumnName("request_id");
@@ -341,10 +338,10 @@ public partial class EventLogsContext : DbContext
         {
             entity
                 .HasNoKey()
-                .ToTable("trade_info", tb => tb.HasComment("Calculates slope of the least-squares-fit linear equation determined by the (X, Y) pairs."))
+                .ToTable("trade_info", tb => tb.HasComment("Trade instructions generated from requests."))
                 .HasAnnotation("Npgsql:StorageParameter:schema_locked", "true");
 
-            entity.Property(e => e.AccountId).HasColumnName("account_id");
+            entity.Property(e => e.AccountNumber).HasColumnName("account_number");
             entity.Property(e => e.CreatedTs)
                 .HasDefaultValueSql("now()")
                 .HasColumnName("created_ts");
