@@ -1,283 +1,422 @@
-# Geo-Partitioning Design: Hybrid Locality Strategy
+# Geo-Partitioning Design: Hybrid Strategy with Migration Path
 
-This document explains the **hybrid geo-partitioning strategy** used in the Event Logs workload, combining manual locality partitioning with CockroachDB's multi-region abstractions.
+This document explains the **hybrid geo-partitioning strategy** used in the Event Logs workload, demonstrating a progressive migration from manual partitioning to CockroachDB's multi-region abstractions.
 
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Two Approaches to Geo-Partitioning](#two-approaches-to-geo-partitioning)
-3. [Design Decision: When to Use Each Approach](#design-decision-when-to-use-each-approach)
-4. [Implementation Details](#implementation-details)
-5. [Key Differences](#key-differences)
-6. [Performance Implications](#performance-implications)
-7. [Best Practices](#best-practices)
+2. [Migration Path: Three Phases](#migration-path-three-phases)
+3. [Two Approaches to Geo-Partitioning](#two-approaches-to-geo-partitioning)
+4. [Design Decision: When to Use Each Approach](#design-decision-when-to-use-each-approach)
+5. [Implementation Details](#implementation-details)
+6. [Key Differences](#key-differences)
+7. [Performance Implications](#performance-implications)
+8. [Best Practices](#best-practices)
 
 ## Overview
 
-The workload demonstrates a **hybrid strategy** that uses different geo-partitioning approaches for different tables:
+This workload demonstrates **progressive adoption** of multi-region abstractions with a final **hybrid strategy**:
 
-| Table | Partitioning Strategy | UUID Generation | Region Assignment |
-|-------|----------------------|-----------------|-------------------|
-| `account_info` | **Computed Locality** | Client-side (`gen_random_uuid()`) | Hash-based: `crc32ieee(account_id) % 30` |
-| `request_info` | **REGIONAL BY ROW** | CockroachDB (`gen_random_uuid()`) | Auto-homed to gateway region |
-| `request_event_log` | **REGIONAL BY ROW** | CockroachDB (`gen_random_uuid()`) | Auto-homed to gateway region |
-| `trade_info` | **REGIONAL BY ROW** | CockroachDB (`gen_random_uuid()`) | Auto-homed to gateway region |
-| `request_status_head` | **REGIONAL BY ROW** | Inherited from `request_info` | Follows request region |
+**Final State (Phase 3 - Hybrid Strategy)**:
 
-**Why hybrid?** Each approach solves different problems:
-- **Computed locality**: Control data placement for batch-loaded immutable data
-- **REGIONAL BY ROW**: Auto-home transactional data based on where writes originate
+| Table | Partitioning Strategy | Primary Key | Region Assignment |
+|-------|----------------------|-------------|-------------------|
+| `account_info` | **REGIONAL BY ROW** (computed region) | `(locality, account_number)` | Computed from account_number hash |
+| `request_info` | **REGIONAL BY ROW** (gateway region) | `request_id` | Auto-set by gateway |
+| `request_event_log` | **REGIONAL BY ROW** (gateway region) | `(request_id, seq_num)` | Auto-set by gateway |
+| `trade_info` | **REGIONAL BY ROW** (gateway region) | `trade_id` | Auto-set by gateway |
+| `request_status_head` | **REGIONAL BY ROW** (gateway region) | `request_id` | Auto-set by gateway |
+
+**Why hybrid?**
+- **account_info**: Computed region from business key → deterministic placement, no cross-region PK checks
+- **Other tables**: Gateway region → dynamic placement, CRDB-generated UUIDs
+
+**Why progressive migration?**
+- Start simple with manual partitioning (no multi-region database)
+- Enable multi-region and migrate tables incrementally
+- Measure performance impact at each phase
+- Zero application code changes throughout
+
+---
+
+## Migration Path: Three Phases
+
+### Phase 1: Manual Partitioning (No Multi-Region Database)
+
+**Database Configuration**: NO multi-region setup (required for `PARTITION BY`)
+
+```sql
+-- Database is NOT multi-region configured
+SHOW REGIONS FROM DATABASE defaultdb;  -- Returns 0 rows
+```
+
+**account_info Schema**:
+```sql
+CREATE TABLE account_info (
+    account_number  STRING NOT NULL,
+    account_name    STRING NOT NULL,
+    strategy        STRING NULL,
+    base_currency   STRING NULL,
+
+    -- Hash-based locality bucket [0..29] derived from account_number
+    locality INT2 NOT NULL AS (
+        mod(crc32ieee(account_number), 30:::INT8)::INT2
+    ) STORED,
+
+    PRIMARY KEY (locality, account_number)
+) PARTITION BY LIST (locality) (
+    PARTITION us_east VALUES IN ((0), (1), (2), (3), (4), (5), (6), (7), (8), (9)),
+    PARTITION us_central VALUES IN ((10), (11), (12), (13), (14), (15), (16), (17), (18), (19)),
+    PARTITION us_west VALUES IN ((20), (21), (22), (23), (24), (25), (26), (27), (28), (29))
+);
+
+-- Manual zone configs for regional placement
+ALTER PARTITION us_east OF INDEX account_info@pk_account_info CONFIGURE ZONE USING
+    num_replicas = 5,
+    constraints = '{+region=us-east: 1, +region=us-central: 1, +region=us-west: 1}',
+    lease_preferences = '[[+region=us-east], [+region=us-central], [+region=us-west]]';
+-- (repeat for us_central and us_west partitions)
+```
+
+**Other Tables**: Regular tables, no partitioning
+
+**Characteristics**:
+- Manual zone config management
+- Cannot use `REGIONAL BY ROW` (requires multi-region database)
+- Deterministic placement via locality hash
+- No cross-region primary key checks (locality partitions keyspace)
+
+---
+
+### Phase 2: Enable Multi-Region + Hybrid (account_info)
+
+**Database Configuration**: Multi-region ENABLED
+
+```sql
+ALTER DATABASE defaultdb SET PRIMARY REGION "us-east";
+ALTER DATABASE defaultdb ADD REGION "us-central";
+ALTER DATABASE defaultdb ADD REGION "us-west";
+ALTER DATABASE defaultdb SURVIVE REGION FAILURE;
+```
+
+**account_info Migration**: Convert to `REGIONAL BY ROW` with **computed region**
+
+```sql
+CREATE TABLE account_info (
+    account_number  STRING NOT NULL,
+    account_name    STRING NOT NULL,
+    strategy        STRING NULL,
+    base_currency   STRING NULL,
+    
+    -- Computed locality (still part of primary key)
+    locality INT2 NOT NULL AS (
+        mod(crc32ieee(account_number), 30:::INT8)::INT2
+    ) STORED,
+    
+    -- Computed region (maps locality to region)
+    computed_region crdb_internal_region NOT NULL AS (
+        CASE 
+            WHEN locality BETWEEN 0 AND 9 THEN 'us-east'::crdb_internal_region
+            WHEN locality BETWEEN 10 AND 19 THEN 'us-central'::crdb_internal_region
+            ELSE 'us-west'::crdb_internal_region
+        END
+    ) STORED,
+    
+    PRIMARY KEY (locality, account_number)
+) LOCALITY REGIONAL BY ROW AS computed_region;
+--                            ^^^^^^^^^^^^^^^^
+--                            Uses computed column, NOT gateway_region()
+```
+
+**Key Points**:
+- ✅ Still uses `(locality, account_number)` as primary key
+- ✅ Both `locality` and `computed_region` are computed from `account_number`
+- ✅ Client provides business key → deterministic placement
+- ✅ **No cross-region primary key checks** (locality partitions the keyspace)
+- ✅ No manual zone configs (CockroachDB manages via `computed_region`)
+- ❌ **NOT** using `gateway_region()` - region is deterministic from hash
+
+**Other Tables**: Still regular (not migrated yet)
+
+**Benefits**:
+- Simplified schema (no manual zone configs)
+- CockroachDB auto-manages placement based on computed region
+- Same deterministic placement behavior as Phase 1
+- Zero application code changes
+
+---
+
+### Phase 3: Full Multi-Region + Regional CDC
+
+**All Other Tables Migrated**: Use gateway-based `REGIONAL BY ROW`
+
+```sql
+-- Pure REGIONAL BY ROW (gateway-based region assignment)
+CREATE TABLE request_info (
+    request_id          UUID NOT NULL DEFAULT gen_random_uuid(),
+    request_type_id     INT4 NOT NULL,
+    primary_account_number  STRING NOT NULL,
+    created_ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    requested_by        STRING NOT NULL,
+    request_status_id   INT4 NOT NULL,
+    
+    PRIMARY KEY (request_id)
+) LOCALITY REGIONAL BY ROW;
+--           ^^^^^^^^^^^^^^^^^
+--           Uses implicit gateway_region(), NOT computed
+```
+
+**Key Differences from account_info**:
+- ❌ No locality column
+- ❌ No computed region column
+- ✅ `crdb_region` set by `gateway_region()` at insert time
+- ✅ CockroachDB generates UUID (no client-provided key)
+- ✅ Dynamic placement based on which gateway processes the write
+- ⚠️ Primary key uniqueness checked within region (acceptable for UUIDs)
+
+**Regional Changefeeds**: One per region per table
+
+```sql
+-- us-east changefeed
+CREATE CHANGEFEED ... 
+AS SELECT * FROM request_event_log WHERE crdb_region = 'us-east';
+-- (repeat for us-central, us-west)
+```
+
+**Benefits**:
+- Auto-homing for transactional data
+- Regional CDC reduces cross-region traffic
+- Simplified schema across all tables
+
+---
 
 ## Two Approaches to Geo-Partitioning
 
-### Approach 1: Computed Locality (Manual Partitioning)
+### Approach 1: REGIONAL BY ROW with Computed Region (Hybrid)
 
-**Use Case**: `account_info` - batch-loaded account master data
+**Use Case**: `account_info` - batch-loaded data with client-provided business keys
 
-**Schema**:
+**Schema Pattern**:
 ```sql
 CREATE TABLE account_info (
-    account_id UUID PRIMARY KEY,
-    account_number TEXT UNIQUE NOT NULL,
-    account_name TEXT NOT NULL,
-    strategy TEXT,
-    base_currency TEXT NOT NULL,
-    locality INT NOT NULL AS (crc32ieee(account_id) % 30) STORED,
-    crdb_region crdb_internal_region AS (
+    account_number STRING NOT NULL,
+    locality INT2 AS (mod(crc32ieee(account_number), 30)::INT2) STORED,
+    computed_region crdb_internal_region AS (
         CASE 
-            WHEN locality BETWEEN 0 AND 9 THEN 'us-east'
-            WHEN locality BETWEEN 10 AND 19 THEN 'us-central'
-            ELSE 'us-west'
+            WHEN locality BETWEEN 0 AND 9 THEN 'us-east'::crdb_internal_region
+            WHEN locality BETWEEN 10 AND 19 THEN 'us-central'::crdb_internal_region
+            ELSE 'us-west'::crdb_internal_region
         END
     ) STORED,
-    INDEX idx_locality (locality) PARTITION BY LIST (locality) (
-        PARTITION us_east VALUES IN (0,1,2,3,4,5,6,7,8,9),
-        PARTITION us_central VALUES IN (10,11,12,13,14,15,16,17,18,19),
-        PARTITION us_west VALUES IN (20,21,22,23,24,25,26,27,28,29)
-    ),
-    INDEX idx_account_number (account_number),
-    FAMILY primary_fam (account_id, account_number, account_name, strategy, base_currency, locality, crdb_region)
-) PARTITION BY LIST (locality) (
-    PARTITION us_east VALUES IN (0,1,2,3,4,5,6,7,8,9),
-    PARTITION us_central VALUES IN (10,11,12,13,14,15,16,17,18,19),
-    PARTITION us_west VALUES IN (20,21,22,23,24,25,26,27,28,29)
-);
-
-ALTER PARTITION us_east OF INDEX account_info@idx_locality 
-    CONFIGURE ZONE USING constraints = '[+region=us-east]';
-ALTER PARTITION us_central OF INDEX account_info@idx_locality 
-    CONFIGURE ZONE USING constraints = '[+region=us-central]';
-ALTER PARTITION us_west OF INDEX account_info@idx_locality 
-    CONFIGURE ZONE USING constraints = '[+region=us-west]';
+    PRIMARY KEY (locality, account_number)
+) LOCALITY REGIONAL BY ROW AS computed_region;
 ```
 
 **How it works**:
-1. **Client generates UUID** using `gen_random_uuid()` before INSERT
-2. **Computed column** `locality = crc32ieee(account_id) % 30` creates 30 buckets (0-29)
-3. **Computed column** `crdb_region` maps locality to region (0-9 → us-east, 10-19 → us-central, 20-29 → us-west)
-4. **Manual partitions** pin each locality range to its home region via zone configs
-5. **Application knows** which locality values belong to which region:
-   ```csharp
-   // Environment configuration
-   LOCALITIES_US_EAST=[0,1,2,3,4,5,6,7,8,9]
-   LOCALITIES_US_CENTRAL=[10,11,12,13,14,15,16,17,18,19]
-   LOCALITIES_US_WEST=[20,21,22,23,24,25,26,27,28,29]
-   ```
+1. **Client provides** `account_number` (business key)
+2. **Database computes** `locality` from hash: `crc32ieee(account_number) % 30`
+3. **Database computes** `computed_region` from locality mapping
+4. **Deterministic placement**: Same account_number always → same region
+5. **No cross-region PK checks**: Locality partitions the keyspace
 
 **Data flow**:
 ```
 AccountBatchLoader (any region):
-1. Generate UUID: account_id = Guid.NewGuid()
-2. Compute locality = crc32(account_id) % 30  (e.g., 7)
-3. INSERT with explicit account_id
-4. CockroachDB routes to us-east (locality 7 is in 0-9 range)
-5. Data stored in us-east region
-```
-
-**Querying**:
-```csharp
-// Regional RequestGenerator knows its localities
-var usEastLocalities = new[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
-
-// Query only accounts in this region's locality range
-var accounts = await context.AccountInfo
-    .Where(a => usEastLocalities.Contains(a.Locality))
-    .ToListAsync();
+1. Generate account_number = "ACCT-00000123"
+2. INSERT (account_number, account_name, ...)
+   -- locality auto-computed: crc32("ACCT-00000123") % 30 = 7
+   -- computed_region auto-set: 'us-east' (locality 7 is in 0-9)
+3. Data stored in us-east region
+4. No cross-region checks needed (locality=7 only exists in us-east)
 ```
 
 **Advantages**:
-- ✅ **Deterministic placement**: You control exactly which accounts go to which region
-- ✅ **Batch load efficiency**: Can insert 10,000 accounts in one batch, all land in correct region
-- ✅ **Portable UUIDs**: Client-generated UUIDs work across any database
-- ✅ **Explicit locality**: Easy to query "all accounts in us-east"
+- ✅ **Deterministic placement**: Hash-based, predictable
+- ✅ **No cross-region PK checks**: Locality partitions keyspace
+- ✅ **Client-controlled keys**: Use business-meaningful identifiers
+- ✅ **Batch efficiency**: Can load large batches, all land in correct regions
+- ✅ **No manual zone configs**: CockroachDB manages via computed region
+- ✅ **Follower reads**: Available in Phase 2+
 
 **Disadvantages**:
-- ❌ **Manual maintenance**: Must maintain partition list and zone configs
-- ❌ **Client complexity**: Application must understand locality mapping
-- ❌ **Limited to static data**: Not suitable for data where region changes based on transaction origin
+- ❌ **More complex schema**: Requires computed columns
+- ❌ **Composite primary key**: `(locality, account_number)` instead of single column
+- ❌ **Application awareness**: Must understand locality exists (even if not queried)
 
 ---
 
-### Approach 2: REGIONAL BY ROW (Multi-Region Abstractions)
+### Approach 2: REGIONAL BY ROW with Gateway Region (Pure)
 
-**Use Case**: `request_info`, `request_event_log`, `trade_info` - transactional data
+**Use Case**: Transactional data where origin region determines placement
 
-**Schema**:
+**Schema Pattern**:
 ```sql
 CREATE TABLE request_info (
     request_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    request_type_id INT NOT NULL REFERENCES request_type(request_type_id),
-    primary_account_id UUID NOT NULL REFERENCES account_info(account_id),
-    requested_by TEXT NOT NULL,
-    created_ts TIMESTAMPTZ NOT NULL DEFAULT current_timestamp(),
-    request_status_id INT NOT NULL REFERENCES request_status(status_id),
-    crdb_region crdb_internal_region NOT NULL DEFAULT gateway_region()::crdb_internal_region
-) LOCALITY REGIONAL BY ROW AS crdb_region;
+    primary_account_number STRING NOT NULL,
+    ...
+) LOCALITY REGIONAL BY ROW;
 ```
 
 **How it works**:
-1. **CockroachDB generates UUID** via `DEFAULT gen_random_uuid()` - no client involvement
-2. **Gateway region assignment** via `DEFAULT gateway_region()::crdb_internal_region`
-3. **Auto-homing**: Row's `crdb_region` column is set to the region of the gateway node that processed the INSERT
-4. **No manual partitions**: CockroachDB handles placement automatically
+1. **CockroachDB generates UUID** via `gen_random_uuid()`
+2. **Gateway sets region** via implicit `gateway_region()` function
+3. **Dynamic placement**: Data homes to gateway that processed the INSERT
+4. **No computed columns**: Pure multi-region abstraction
 
 **Data flow**:
 ```
 RequestGenerator (us-east instance):
-1. Connect to us-east gateway (via regional PgBouncer VIP 172.18.0.251)
-2. INSERT without specifying request_id or crdb_region
-3. Gateway generates UUID and sets crdb_region = 'us-east'
-4. Data stored in us-east region
-5. Foreign key to account_info works even if account is in different region
-```
-
-**Querying**:
-```csharp
-// Implicit locality - gateway region determines which data you see locally
-var requests = await context.RequestInfo
-    .Where(r => r.RequestedBy == "system-us-east")
-    .ToListAsync();  // Fast if run from us-east gateway
-
-// Explicit cross-region query
-var allRequests = await context.RequestInfo
-    .AsNoTracking()
-    .ToListAsync();  // May involve cross-region reads
-```
-
-**Follower reads** for analytics:
-```sql
--- Query local region data with follower reads (any replica)
-SELECT *
-FROM request_info
-AS OF SYSTEM TIME follower_read_timestamp()
-WHERE crdb_region = 'us-east'
+1. Connect to us-east gateway
+2. INSERT (primary_account_number, requested_by, ...)
+   -- request_id auto-generated: CockroachDB creates UUID
+   -- crdb_region auto-set: 'us-east' (from gateway_region())
+3. Data stored in us-east region
+4. UUID uniqueness checked within us-east only (acceptable collision risk)
 ```
 
 **Advantages**:
-- ✅ **Zero client complexity**: App doesn't need to know anything about regions or locality
-- ✅ **Auto-homing**: Data automatically goes to the region where transaction originates
-- ✅ **Dynamic placement**: Works for data where "home region" depends on transaction origin
-- ✅ **Simpler schema**: No manual partitions or zone configs
-- ✅ **Foreign keys work**: Can reference rows in other regions (e.g., request → account)
+- ✅ **Zero client complexity**: No locality, no computed columns
+- ✅ **Simple primary key**: Single UUID column
+- ✅ **Auto-homing**: Data lands where transaction originates
+- ✅ **Clean schema**: Minimal SQL, pure multi-region abstraction
+- ✅ **Foreign keys work**: Can reference rows in other regions
 
 **Disadvantages**:
-- ❌ **Gateway dependency**: Region assignment depends on which gateway processes the write
-- ❌ **No deterministic placement**: Can't guarantee a specific row goes to a specific region
-- ❌ **CockroachDB-specific UUIDs**: UUIDs generated by CockroachDB, not portable
+- ❌ **Gateway dependency**: Placement depends on which gateway used
+- ❌ **Non-deterministic**: Same logical operation could land in different regions
+- ❌ **CRDB-generated UUIDs**: Less portable across databases
 
 ---
 
 ## Design Decision: When to Use Each Approach
 
-### Use Computed Locality When:
+### Use Computed Region (Hybrid) When:
 
-1. **Batch-loaded immutable data**
-   - Example: Account master data loaded once, rarely updated
-   - Benefit: Control placement of entire batch upfront
+1. **Client provides the business key**
+   - Account numbers, customer IDs, order numbers
+   - Keys generated by external systems
+   - Need deterministic placement based on business key
 
-2. **Client controls keys**
-   - Example: Account IDs generated by external system
-   - Benefit: Use existing UUIDs, compute locality at load time
+2. **Batch-loaded immutable data**
+   - Account master data loaded once
+   - Product catalogs, pricing tables
+   - Reference data from ETL pipelines
 
-3. **Need explicit region queries**
-   - Example: "Give me all accounts in us-east" without filtering on crdb_region
-   - Benefit: Query by locality value (0-9) instead of region enum
+3. **Need to avoid cross-region PK checks**
+   - High-volume inserts
+   - Want guaranteed single-region transactions
+   - Locality-based key partitioning eliminates cross-region validation
 
-4. **Workload doesn't require cross-region foreign keys**
-   - Example: Account data is self-contained
-   - Benefit: Simpler constraint model
+4. **Deterministic placement is critical**
+   - Regulatory requirements (data must be in specific region)
+   - Testing scenarios (need repeatable placement)
+   - Want to control exactly which records go where
 
-### Use REGIONAL BY ROW When:
+### Use Gateway Region (Pure) When:
 
-1. **Transactional data with clear "origin region"**
-   - Example: Requests created by regional application instances
-   - Benefit: Data automatically homes where transaction originates
+1. **CRDB generates the primary key**
+   - Request IDs, event IDs, transaction IDs
+   - No external key source
+   - UUIDs work fine
 
-2. **Foreign keys to reference data**
-   - Example: Requests reference accounts (possibly in different regions)
-   - Benefit: CockroachDB handles cross-region FK checks
+2. **Transactional data with origin region**
+   - Requests created by regional app instances
+   - Events, audit logs, time-series data
+   - Data homes naturally where transaction started
 
-3. **Dynamic region assignment**
-   - Example: Request can be created from any region depending on user location
-   - Benefit: No need to pre-compute or hard-code region assignment
+3. **Want simplest schema**
+   - No computed columns
+   - No composite keys
+   - Pure multi-region abstraction
 
-4. **Simplified application logic**
-   - Example: App doesn't want to know about locality or region mapping
-   - Benefit: CockroachDB handles everything automatically
+4. **Foreign keys to reference data**
+   - Requests reference accounts (possibly different regions)
+   - CockroachDB handles cross-region FK checks
+   - Acceptable FK validation overhead
 
 ---
 
 ## Implementation Details
 
-### Account Loading (Computed Locality)
+### Phase 1: Manual Partitioning
 
+**Account Loading**:
 ```csharp
 // EventLogs.AccountBatchLoader
 public async Task LoadAccountsAsync()
 {
-    var accounts = new List<AccountInfo>();
+    var batch = new List<AccountInfo>();
     
-    for (int i = 0; i < totalAccounts; i++)
+    for (int i = 0; i < batchSize; i++)
     {
-        var accountId = Guid.NewGuid();
-        var locality = CRC32.ComputeLocalityHash(accountId.ToString(), 30);
+        var accountNumber = $"ACCT-{totalLoaded + i:D8}";
         
-        accounts.Add(new AccountInfo
+        // Optional: Compute locality for metrics/routing
+        // (Database will compute it anyway)
+        var locality = LocalityHasher.ComputeLocality(accountNumber);
+        var region = LocalityHasher.LocalityToRegion(locality);
+        
+        batch.Add(new AccountInfo
         {
-            AccountId = accountId,  // Client-generated
-            AccountNumber = $"ACCT-{i:D8}",
+            AccountNumber = accountNumber,
             AccountName = $"Account {i}",
-            Strategy = RandomStrategy(),
+            Strategy = strategies[random.Next(strategies.Length)],
             BaseCurrency = "USD"
-            // locality and crdb_region computed automatically
+            // locality auto-computed by database
         });
     }
     
-    // Batch insert - CockroachDB routes each row to correct region
-    await context.AccountInfo.AddRangeAsync(accounts);
+    await context.AccountInfo.AddRangeAsync(batch);
     await context.SaveChangesAsync();
 }
 ```
 
-### Request Generation (REGIONAL BY ROW)
+---
 
+### Phase 2+: Hybrid (account_info) + Pure (other tables)
+
+**Account Loading** (same code as Phase 1):
+```csharp
+// No code changes from Phase 1!
+public async Task LoadAccountsAsync()
+{
+    var batch = new List<AccountInfo>();
+    
+    for (int i = 0; i < batchSize; i++)
+    {
+        batch.Add(new AccountInfo
+        {
+            AccountNumber = $"ACCT-{totalLoaded + i:D8}",
+            AccountName = $"Account {i}",
+            Strategy = strategies[random.Next(strategies.Length)],
+            BaseCurrency = "USD"
+            // locality + computed_region auto-computed
+        });
+    }
+    
+    await context.AccountInfo.AddRangeAsync(batch);
+    await context.SaveChangesAsync();
+}
+```
+
+**Request Generation** (gateway-based placement):
 ```csharp
 // EventLogs.RequestGenerator (us-east instance)
 public async Task GenerateRequestsAsync()
 {
-    // Query only accounts in this region's locality range
-    var localAccounts = await context.AccountInfo
-        .Where(a => usEastLocalities.Contains(a.Locality))
+    var accounts = await context.AccountInfo
+        .Take(100)
         .ToListAsync();
     
-    foreach (var account in localAccounts)
+    foreach (var account in accounts)
     {
         var request = new RequestInfo
         {
-            // No RequestId - CockroachDB generates it
+            // No RequestId - CockroachDB generates UUID
             // No CrdbRegion - gateway sets to 'us-east'
             RequestTypeId = requestTypeId,
-            PrimaryAccountId = account.AccountId,  // FK to account (any region)
+            PrimaryAccountNumber = account.AccountNumber,
             RequestedBy = "system-us-east",
             RequestStatusId = initialStatusId
         };
@@ -286,37 +425,26 @@ public async Task GenerateRequestsAsync()
     }
     
     await context.SaveChangesAsync();
-    // All requests auto-homed to us-east because gateway is us-east
+    // All requests auto-homed to us-east via gateway_region()
 }
 ```
-
-### Relationship Between Tables
-
-```
-account_info (computed locality)
-    └── FK ← request_info (REGIONAL BY ROW, auto-homed to gateway region)
-            └── FK ← request_event_log (REGIONAL BY ROW, follows request region)
-            └── FK ← trade_info (REGIONAL BY ROW, follows request region)
-```
-
-**Key insight**: Even though `request_info.crdb_region` may differ from `account_info.crdb_region`, the foreign key works because CockroachDB can validate across regions. The RequestGenerator ensures **semantic locality** by only creating requests for accounts in its locality range, even though **physical locality** is determined by gateway region.
 
 ---
 
 ## Key Differences
 
-| Aspect | Computed Locality | REGIONAL BY ROW |
-|--------|------------------|-----------------|
-| **UUID Generation** | Client-side (`Guid.NewGuid()` in C#) | Server-side (`gen_random_uuid()` in SQL) |
-| **Region Assignment** | Computed from UUID hash | Gateway region at insert time |
-| **Partitioning** | Manual (PARTITION BY LIST) | Automatic (LOCALITY REGIONAL BY ROW) |
-| **Zone Config** | Manual (ALTER PARTITION ... CONFIGURE ZONE) | Automatic (managed by MR system) |
-| **Application Awareness** | Must know locality mapping | No region awareness needed |
-| **Cross-Region Queries** | Use locality filter (`WHERE locality IN (...)`) | Use crdb_region filter (`WHERE crdb_region = 'us-east'`) |
-| **Data Placement** | Deterministic (based on UUID) | Dynamic (based on gateway) |
-| **Foreign Keys** | Same-region only (practical) | Cross-region supported |
-| **Schema Complexity** | Higher (partition lists, zone configs) | Lower (one LOCALITY clause) |
-| **Portability** | Database-agnostic UUID strategy | CockroachDB-specific |
+| Aspect | Computed Region (Hybrid) | Gateway Region (Pure) |
+|--------|--------------------------|----------------------|
+| **Example Table** | `account_info` | `request_info`, `trade_info` |
+| **Primary Key** | `(locality, account_number)` | `request_id` (UUID) |
+| **Key Provider** | Client | CockroachDB |
+| **Locality Column** | ✅ Computed from business key | ❌ Not present |
+| **Region Column** | `computed_region` (computed) | `crdb_region` (from gateway) |
+| **Region Assignment** | Hash-based, deterministic | Gateway-based, dynamic |
+| **Cross-Region PK Checks** | ❌ Not needed (locality partitions) | ⚠️ Within region only |
+| **Placement Control** | ✅ Fully deterministic | ❌ Depends on gateway |
+| **Schema Complexity** | Higher (computed columns) | Lower (pure MR abstraction) |
+| **Use Case** | Batch-loaded reference data | Transactional data |
 
 ---
 
@@ -324,180 +452,182 @@ account_info (computed locality)
 
 ### Writes
 
-**Computed Locality**:
-- ✅ **Batch inserts**: Efficient - all rows in batch go to correct region
-- ✅ **Single-region transactions**: If all rows hash to same region
-- ❌ **Cross-region if hash mismatch**: Rare, but possible if batch has mixed localities
+**Computed Region (account_info)**:
+- ✅ **No cross-region PK checks**: Locality partitions keyspace
+- ✅ **Deterministic routing**: App knows which gateway to use
+- ✅ **Batch efficiency**: Large batches, all land correctly
+- ✅ **Single-region transactions**: Guaranteed
 
-**REGIONAL BY ROW**:
-- ✅ **Single-region transactions**: Always - all rows written via same gateway home to that gateway's region
-- ✅ **No cross-region overhead**: For writes to the REGIONAL BY ROW table itself
-- ⚠️ **FK validation**: May require cross-region read if referenced row is in different region
+**Gateway Region (request_info, etc.)**:
+- ✅ **Single-region writes**: Data lands at gateway region
+- ✅ **Simple inserts**: No locality computation needed
+- ⚠️ **FK validation**: May cross regions (e.g., request → account)
+- ⚠️ **UUID uniqueness**: Checked within region (acceptable risk)
 
 ### Reads
 
-**Computed Locality**:
-- ✅ **Regional queries**: Very fast - `WHERE locality IN (0-9)` only scans us-east partitions
-- ❌ **No follower reads**: Standard table, requires leaseholder reads
+**Both Approaches** (Phase 2+):
+- ✅ **Follower reads**: `AS OF SYSTEM TIME follower_read_timestamp()`
+- ✅ **Regional scans**: Filter by `crdb_region` or locality
+- ✅ **Reduced leaseholder contention**: Read from any replica
 
-**REGIONAL BY ROW**:
-- ✅ **Follower reads**: Use `AS OF SYSTEM TIME follower_read_timestamp()` to read from any replica (3x capacity)
-- ✅ **Regional queries**: Fast - `WHERE crdb_region = 'us-east'` only scans us-east data
-- ⚠️ **Cross-region joins**: If joining with computed locality table, may span regions
-
-### Analytics
-
-Both approaches support efficient regional analytics:
-
+**Computed Region**:
 ```sql
--- Computed locality approach
-SELECT account_name, COUNT(*)
-FROM account_info
-WHERE locality BETWEEN 0 AND 9  -- us-east localities
-GROUP BY account_name
-
--- REGIONAL BY ROW approach (with follower reads)
-SELECT requested_by, COUNT(*)
-FROM request_info
+-- Query by computed_region (acts like crdb_region)
+SELECT * FROM account_info
 AS OF SYSTEM TIME follower_read_timestamp()
-WHERE crdb_region = 'us-east'
-GROUP BY requested_by
+WHERE computed_region = 'us-east';
 ```
 
-The REGIONAL BY ROW approach has an advantage for analytics: follower reads distribute load across all replicas.
+**Gateway Region**:
+```sql
+-- Query by crdb_region
+SELECT * FROM request_info
+AS OF SYSTEM TIME follower_read_timestamp()
+WHERE crdb_region = 'us-east';
+```
+
+### Cross-Region Operations
+
+**Computed Region → Gateway Region FK**:
+```sql
+-- request_info references account_info
+-- Request in us-east, account in us-central (possible)
+-- CockroachDB validates FK across regions (tolerable overhead)
+```
+
+This is acceptable because:
+- FK checks are infrequent (only on INSERT/UPDATE)
+- Most requests reference local accounts (semantic locality)
+- Benefit of flexibility outweighs occasional cross-region check
 
 ---
 
 ## Best Practices
 
-### 1. Use Hybrid Strategy
-
-Don't force one approach everywhere. Mix and match based on table characteristics:
+### 1. Use Hybrid Strategy for the Right Reasons
 
 ```
-✅ Computed locality for:
-  - Account master data
-  - Customer profiles
-  - Product catalogs
-  - Reference data loaded via ETL
+✅ Computed Region (account_info) when:
+  - Client provides business key
+  - Need deterministic placement
+  - Want to avoid cross-region PK checks
+  - Batch-loaded reference data
 
-✅ REGIONAL BY ROW for:
-  - Orders, requests, transactions
-  - Event logs, audit trails
-  - User-generated content
-  - Time-series data
+✅ Gateway Region (request_info, trade_info) when:
+  - CRDB generates primary key (UUID)
+  - Transactional data with origin region
+  - Want simplest schema
+  - Foreign keys to reference data
 ```
 
-### 2. Align Application Deployment with Data Locality
+### 2. Understand Primary Key Partitioning
 
-**Computed locality**: Deploy regional instances that query their locality range
+**Computed Region** (no cross-region checks):
+```sql
+PRIMARY KEY (locality, account_number)
+-- locality 7, account "ACCT-00000123" → only exists in us-east
+-- locality 15, account "ACCT-00000456" → only exists in us-central
+-- No overlap, no cross-region PK validation needed
+```
+
+**Gateway Region** (within-region checks):
+```sql
+PRIMARY KEY (request_id)
+-- UUID collision probability is negligible
+-- CRDB only checks uniqueness within the region
+-- Acceptable risk for distributed systems
+```
+
+### 3. Use Business Keys for account_info
+
+```sql
+-- ✅ Good - business-meaningful, stable hash
+account_number STRING  -- "ACCT-00000123"
+
+-- ❌ Avoid - opaque UUID, no business meaning
+account_id UUID
+```
+
+### 4. Maintain Consistent Application Architecture
+
+Keep the same app footprint across all phases:
+```
+Phase 1: 3 regional instances → manual partitioning
+Phase 2: 3 regional instances → hybrid (account_info migrated)
+Phase 3: 3 regional instances → all tables migrated
+
+Only database schema changes, not application.
+```
+
+### 5. Use Follower Reads in Analytics (Phase 2+)
+
 ```csharp
-// us-east instance
-var usEastLocalities = config["Localities_us_east"];  // [0,1,2,3,4,5,6,7,8,9]
-var accounts = context.AccountInfo
-    .Where(a => usEastLocalities.Contains(a.Locality));
-```
-
-**REGIONAL BY ROW**: Deploy regional instances that connect to regional gateway
-```csharp
-// us-east instance connects to us-east VIP
-ConnectionString = "Host=172.18.0.251;Port=5432;..."
-// All inserts auto-home to us-east
-```
-
-### 3. Use Follower Reads for Analytics
-
-For REGIONAL BY ROW tables, always use follower reads in analytics queries:
-
-```csharp
-// ✅ Good - uses follower reads
-var stats = await context.RequestInfo
+// ✅ Good - follower reads (3x capacity)
+var stats = await context.AccountInfo
     .FromSqlRaw(@"
         SELECT *
-        FROM request_info
+        FROM account_info
         AS OF SYSTEM TIME follower_read_timestamp()
-        WHERE crdb_region = {0}
+        WHERE computed_region = {0}
     ", region)
     .ToListAsync();
-
-// ❌ Bad - forces leaseholder reads
-var stats = await context.RequestInfo
-    .Where(r => r.CrdbRegion == region)
-    .ToListAsync();
 ```
 
-### 4. Document Locality Mapping
+### 6. Document Locality Mapping
 
-For computed locality approach, document the mapping clearly:
-
-```bash
-# .env file
-LOCALITIES_US_EAST=[0,1,2,3,4,5,6,7,8,9]
-LOCALITIES_US_CENTRAL=[10,11,12,13,14,15,16,17,18,19]
-LOCALITIES_US_WEST=[20,21,22,23,24,25,26,27,28,29]
+```csharp
+// LocalityHasher.cs
+public static string LocalityToRegion(short locality)
+{
+    return locality switch
+    {
+        >= 0 and <= 9 => "us-east",
+        >= 10 and <= 19 => "us-central",
+        >= 20 and <= 29 => "us-west",
+        _ => throw new ArgumentOutOfRangeException()
+    };
+}
 ```
 
-Update this when adding/removing regions.
+### 7. Measure Performance at Each Phase
 
-### 5. Validate Data Locality Alignment
-
-Run validation queries to ensure data landed in correct regions:
-
-```sql
--- For computed locality tables
-SELECT 
-    CASE 
-        WHEN locality BETWEEN 0 AND 9 THEN 'us-east'
-        WHEN locality BETWEEN 10 AND 19 THEN 'us-central'
-        ELSE 'us-west'
-    END AS expected_region,
-    crdb_region AS actual_region,
-    COUNT(*)
-FROM account_info
-GROUP BY expected_region, actual_region
-
--- For REGIONAL BY ROW tables
-SELECT 
-    ai.crdb_region AS account_region,
-    ri.crdb_region AS request_region,
-    COUNT(*)
-FROM request_info ri
-JOIN account_info ai ON ri.primary_account_id = ai.account_id
-GROUP BY account_region, request_region
-```
-
-Expected: All rows should have `expected_region = actual_region`.
-
-### 6. Consider Hybrid Foreign Keys
-
-It's OK to have foreign keys from REGIONAL BY ROW tables to computed locality tables:
-
-```sql
--- request_info (REGIONAL BY ROW) → account_info (computed locality)
--- Request might be in us-east, account might be in us-central
--- CockroachDB validates FK across regions automatically
-```
-
-This is acceptable because:
-- Reads are usually co-located (regional RequestGenerator only creates requests for local accounts)
-- Writes can tolerate occasional cross-region FK validation overhead
-- Allows flexibility in request origin (user in us-east can create request for account homed in us-central)
+Track metrics for each migration phase:
+- Query latency (p50, p95, p99)
+- Throughput (inserts/sec, reads/sec)
+- Cross-region traffic
+- Contention events
+- PK validation overhead
 
 ---
 
 ## Conclusion
 
-The **hybrid geo-partitioning strategy** combines the best of both worlds:
+The **hybrid geo-partitioning strategy** combines two REGIONAL BY ROW approaches:
 
-- **Computed locality** for control and batch efficiency on reference data
-- **REGIONAL BY ROW** for simplicity and auto-homing on transactional data
+1. **Computed Region** (account_info):
+   - Client-provided business keys
+   - Deterministic placement via hash
+   - No cross-region PK checks (locality partitions keyspace)
+   - Ideal for batch-loaded reference data
 
-This approach provides:
-- ✅ Predictable data placement for master data
-- ✅ Automatic homing for transactional data
-- ✅ Efficient regional queries for both types
-- ✅ Foreign key relationships across partitioning strategies
-- ✅ Follower reads for analytics on transactional tables
-- ✅ Clear separation of concerns: batch-load vs real-time transactions
+2. **Gateway Region** (request_info, trade_info, etc.):
+   - CRDB-generated UUIDs
+   - Dynamic placement via gateway
+   - Simpler schema, pure multi-region abstraction
+   - Ideal for transactional data
 
-When designing your own multi-region application, consider which tables fit each pattern and don't be afraid to mix approaches.
+**Key Benefits**:
+- ✅ Best of both worlds: control + simplicity
+- ✅ No cross-region PK overhead for account_info
+- ✅ Follower reads for all tables (Phase 2+)
+- ✅ Progressive migration path (measure at each step)
+- ✅ Zero application code changes
+
+**Migration Path**:
+1. Start simple (manual partitioning, no multi-region DB)
+2. Enable multi-region, migrate account_info (hybrid)
+3. Migrate other tables (pure gateway-based)
+4. Add regional CDC
+
+Choose the approach that fits your data characteristics, and don't be afraid to mix strategies within the same database.

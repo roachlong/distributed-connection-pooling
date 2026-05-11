@@ -1,302 +1,99 @@
-# Event Logs - Multi-Region Account Management Workload
+# Event Logs - Progressive Multi-Region Migration Demo
 
-1. [Overview](#overview)
-1. [Components](#components)
-1. [Prerequisites](#prerequisites)
-1. [Database Setup](#database-setup)
-1. [Kafka Setup](#kafka-setup)
-1. [CDC Changefeeds](#cdc-changefeeds)
-1. [Project Structure](#project-structure)
-1. [Running the Applications](#running-the-applications)
-1. [Validation](#validation)
-1. [Architecture Details](#architecture-details)
+Demonstrates a **phased migration** from manual partitioning to full multi-region abstractions, showing how to evolve a geo-distributed application without downtime.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Prerequisites](#prerequisites)
+- [Initial Setup](#initial-setup)
+- [Phase 1: Manual Partitioning](#phase-1-manual-partitioning--global-cdc)
+- [Phase 2: Hybrid Multi-Region](#phase-2-hybrid-multi-region--account-migration)
+- [Phase 3: Full Multi-Region](#phase-3-full-multi-region--regional-cdc)
+- [Performance Analysis](#performance-analysis)
+- [Cleanup](#cleanup)
 
 ## Overview
 
-This workload demonstrates a **hybrid geo-partitioning strategy** for a multi-region portfolio account management platform. It combines:
+This workload demonstrates **progressive migration** from manual PARTITION BY to CockroachDB multi-region abstractions:
 
-- **Smart client partitioning** for batch-loaded account data (computed locality hash)
-- **Multi-region abstractions** (REGIONAL BY ROW) for transactional data that auto-homes via gateway locality
-- **CDC-driven event orchestration** using regional Kafka topics
-- **Parallel keyset pagination** for efficient large-scale data processing with concurrent page fetching
+| Phase | Database Config | account_info | Other Tables | CDC | App Changes |
+|-------|----------------|--------------|--------------|-----|-------------|
+| **Phase 1** | No multi-region | Manual PARTITION BY | Regular tables | Global changefeed → `request-events` | None |
+| **Phase 2** | Multi-region enabled | REGIONAL BY ROW AS computed_region | Regular tables | Global changefeed → `request-events` | Set `UseGeoPartitioning=true` |
+| **Phase 3** | Multi-region enabled | REGIONAL BY ROW AS computed_region | REGIONAL BY ROW | Regional changefeeds → `request-events.{region}` | Update docker-compose topic names |
 
-The system models the full lifecycle of account management requests: from onboarding and profile updates, through compliance workflows and trade generation, to completion and analytics.
+### Key Architecture
 
-### Key Capabilities Demonstrated
-
-- **Data locality alignment** - Account data stays in its home region across all related tables
-- **Regional app deployment** - Each app instance connects through regional LTM → PgBouncer → CRDB Gateway
-- **Event-driven workflows** - CDC publishes to regional Kafka topics, consumers process locally
-- **Parallel keyset pagination** - Two-phase cursor pre-computation with concurrent page fetching (see [Parallel Keyset Pagination Pattern](#parallel-keyset-pagination-pattern))
-- **Manual offset management** - `EnableAutoCommit=true` + `EnableAutoOffsetStore=false` pattern for reliable replay
-- **Cross-region analytics** - Parallel queries across all localities for global insights with real-time progress metrics
-
-## Components
-
-| Component | Purpose | Regional Deployment |
-|-----------|---------|---------------------|
-| **AccountBatchLoader** | Loads account data with pre-computed locality hash | Single instance (any region) |
-| **RequestGenerator** | Creates account management requests via keyset pagination | **3 instances** (one per region) |
-| **WorkflowProcessor** | Consumes events from Kafka, progresses workflow state | **3 instances** (one per region) |
-| **TradeGenerator** | Monitors completed requests, generates trades | **3 instances** (one per region) |
-| **Analytics** | Blazor web UI with parallel cross-region pagination and visualizations | Single instance (web UI accessible at localhost:5080) |
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design patterns and best practices.
+- **3 regional app instances** for RequestGenerator, WorkflowProcessor, TradeGenerator
+- **Regional deployment** via docker-compose with environment variable overrides
+- **PgBouncer VIPs** per region (172.18.0.251-253) for connection routing
+- **Hybrid geo-partitioning**: account_info uses computed region, other tables use explicit crdb_region placement
+- **Performance monitoring**: query-analysis daemon collects real-time metrics from crdb_internal tables
 
 ## Prerequisites
 
-- **CockroachDB** cluster (local or multi-region) configured with:
-  - Primary region: `us-east`
-  - Additional regions: `us-central`, `us-west`
-  - Survival goal: `REGION FAILURE`
-- **Kafka** broker accessible at `localhost:9092` (or configured endpoint)
-- **PgBouncer** instances (optional, for connection pooling)
-  - Recommended: 3 instances with LTM VIPs per region
-  - See main [DCP README](../../README.md) for PgBouncer setup
-- **.NET 8 SDK** installed
-- **dotnet-ef** tool for scaffolding: `dotnet tool install --global dotnet-ef`
+### Infrastructure
 
-## Database Setup
+- **CockroachDB cluster** with regions us-east, us-central, us-west
+- **PgBouncer instances** with regional VIPs (see main [DCP README](../../README.md))
+- **Kafka** broker accessible at kafka:9093 (inside dcp-net) or localhost:9092 (from host)
+- **Docker** with dcp-net network created
+- **.NET 8 SDK** for building applications
+- **Python 3.12+** with venv for query-analysis daemon
 
-### 1. Configure Multi-Region Database
-
-If not already configured, set up the database for multi-region:
+### Software Tools
 
 ```bash
-cockroach sql --certs-dir ../../certs --url "postgresql://localhost:26257/defaultdb" <<'EOF'
-ALTER DATABASE defaultdb SET PRIMARY REGION "us-east";
-ALTER DATABASE defaultdb ADD REGION "us-central";
-ALTER DATABASE defaultdb ADD REGION "us-west";
-ALTER DATABASE defaultdb SURVIVE REGION FAILURE;
-EOF
+# CockroachDB CLI
+brew install cockroachdb/tap/cockroach
+
+# Kafka CLI tools
+brew install kafka
+
+# .NET Entity Framework Core tools
+dotnet tool install --global dotnet-ef
 ```
 
-### 2. Create Schema and Load Configuration Data
+## Initial Setup
+
+### 1. Build Docker Images
+
+**IMPORTANT**: Build images first so containers use the latest code.
 
 ```bash
-# Create tables (account_info, request_info, trade_info, etc.)
-cockroach sql --certs-dir ../../certs \
-  --url "postgresql://localhost:26257/defaultdb" \
-  -f ./schema.sql
+cd ~/workspace/distributed-connection-pooling/workloads/event-logs
 
-# Load global configuration tables (request types, statuses, workflow definitions)
-cockroach sql --certs-dir ../../certs \
-  --url "postgresql://localhost:26257/defaultdb" \
-  -f ./populate-static-data.sql
+# Build all application images with current code
+docker-compose build
+
+# This compiles .NET code and creates container images for:
+# - account-batch-loader
+# - request-generator (used for all 3 regional instances)
+# - workflow-processor (used for all 3 regional instances)
+# - trade-generator (used for all 3 regional instances)
+# - analytics
 ```
 
-### 3. Grant Permissions
+### 2. Install Dependencies (Optional - only needed if modifying code)
 
 ```bash
-cockroach sql --certs-dir ../../certs \
-  --url "postgresql://localhost:26257/defaultdb" \
-  -e "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE defaultdb.* TO pgb;"
-```
-
-## Kafka Setup
-
-### 1. Create Regional Topics
-
-Create 3 topics (one per region) with multiple partitions for parallelism:
-
-```bash
-# us-east topic
-kafka-topics --create \
-  --bootstrap-server localhost:9092 \
-  --topic request-events.us-east \
-  --partitions 24 \
-  --replication-factor 1
-
-# us-central topic
-kafka-topics --create \
-  --bootstrap-server localhost:9092 \
-  --topic request-events.us-central \
-  --partitions 24 \
-  --replication-factor 1
-
-# us-west topic
-kafka-topics --create \
-  --bootstrap-server localhost:9092 \
-  --topic request-events.us-west \
-  --partitions 24 \
-  --replication-factor 1
-```
-
-### 2. Verify Topics
-
-```bash
-kafka-topics --list --bootstrap-server localhost:9092
-
-kafka-topics --describe \
-  --bootstrap-server localhost:9092 \
-  --topic request-events.us-east
-```
-
-## CDC Changefeeds
-
-Create changefeeds to publish events from `request_event_log` to regional Kafka topics.
-
-### us-east Changefeed
-
-```bash
-cockroach sql --certs-dir ../../certs \
-  --url "postgresql://localhost:26257/defaultdb" <<'EOF'
-CREATE CHANGEFEED
-  INTO 'kafka://kafka:9093?topic_name=request-events.us-east'
-  WITH
-    initial_scan = 'no',
-    key_column = 'request_id',
-    unordered,
-    kafka_sink_config = '{"RequiredAcks": "ONE"}',
-    cursor = 'now()'
-  AS SELECT request_id, seq_num, action_state_link_id, status_id, 
-            event_ts, actor, metadata, idempotency_key, crdb_region
-  FROM request_event_log
-  WHERE crdb_region = 'us-east';
-EOF
-```
-
-### us-central Changefeed
-
-```bash
-cockroach sql --certs-dir ../../certs \
-  --url "postgresql://localhost:26257/defaultdb" <<'EOF'
-CREATE CHANGEFEED
-  INTO 'kafka://kafka:9093?topic_name=request-events.us-central'
-  WITH
-    initial_scan = 'no',
-    key_column = 'request_id',
-    unordered,
-    kafka_sink_config = '{"RequiredAcks": "ONE"}',
-    cursor = 'now()'
-  AS SELECT request_id, seq_num, action_state_link_id, status_id, 
-            event_ts, actor, metadata, idempotency_key, crdb_region
-  FROM request_event_log
-  WHERE crdb_region = 'us-central';
-EOF
-```
-
-### us-west Changefeed
-
-```bash
-cockroach sql --certs-dir ../../certs \
-  --url "postgresql://localhost:26257/defaultdb" <<'EOF'
-CREATE CHANGEFEED
-  INTO 'kafka://kafka:9093?topic_name=request-events.us-west'
-  WITH
-    initial_scan = 'no',
-    key_column = 'request_id',
-    unordered,
-    kafka_sink_config = '{"RequiredAcks": "ONE"}',
-    cursor = 'now()'
-  AS SELECT request_id, seq_num, action_state_link_id, status_id, 
-            event_ts, actor, metadata, idempotency_key, crdb_region
-  FROM request_event_log
-  WHERE crdb_region = 'us-west';
-EOF
-```
-
-### Test CDC Flow
-
-Insert a test event and verify it appears in the correct regional topic:
-
-```bash
-# Insert a test event
-cockroach sql --certs-dir ../../certs \
-  --url "postgresql://localhost:26257/defaultdb" <<'EOF'
--- Insert test account
-INSERT INTO account_info (account_id, account_number, account_name, strategy, base_currency)
-VALUES ('00000000-0000-0000-0000-000000000002', 'TEST-001', 'Test Account', 'Growth', 'USD');
-
--- Insert test request (will auto-home to region based on gateway)
-INSERT INTO request_info (request_id, request_type_id, primary_account_id, requested_by, request_status_id)
-SELECT gen_random_uuid(), 1, account_id, 'test_user', 1
-FROM account_info WHERE account_number = 'TEST-001';
-
--- Insert test event (will auto-home to same region as request)
--- Note: idempotency_key should be deterministic (not random) for proper idempotency
-WITH link AS (SELECT action_state_link_id AS id FROM request_action_state_link LIMIT 1)
-INSERT INTO request_event_log (request_id, seq_num, action_state_link_id, status_id, idempotency_key)
-SELECT request_id, 1, link.id, 1, 
-       md5(request_id::STRING || '-' || link.id::STRING || '-test-initial')
-FROM request_info, link WHERE requested_by = 'test_user';
-EOF
-
-# Check which topic received the event (based on your gateway region)
-kafka-console-consumer \
-  --bootstrap-server localhost:9092 \
-  --topic request-events.us-east \
-  --from-beginning \
-  --max-messages 1 \
-  --property print.key=true
-
-# Cleanup test data
-cockroach sql --certs-dir ../../certs \
-  --url "postgresql://localhost:26257/defaultdb" <<'EOF'
-DELETE FROM request_event_log WHERE request_id IN (
-  SELECT request_id FROM request_info WHERE requested_by = 'test_user'
-);
-DELETE FROM request_info WHERE requested_by = 'test_user';
-DELETE FROM account_info WHERE account_number = 'TEST-001';
-EOF
-```
-
-## Project Structure
-
-The solution is organized into libraries and applications:
-
-```
-EventLogsWorkflow.sln
-├── EventLogs.Common/          # Shared utilities (CRC32 hash, retry helpers, pagination)
-├── EventLogs.Domain/          # EF Core entity models (scaffolded from schema)
-├── EventLogs.Data/            # DbContext and repositories
-├── EventLogs.AccountBatchLoader/      # App 1: Batch load accounts
-├── EventLogs.RequestGenerator/        # App 2: Generate requests (3 regional instances)
-├── EventLogs.WorkflowProcessor/       # App 3: Process events (3 regional instances)
-├── EventLogs.TradeGenerator/          # App 4: Generate trades (3 regional instances)
-└── EventLogs.Analytics/               # App 5: Blazor Server web UI with cross-region analytics
-```
-
-### Add NuGet Packages
-
-```bash
-# EventLogs.Common dependencies
-dotnet add EventLogs.Common/EventLogs.Common.csproj package System.IO.Hashing
+# Install NuGet packages (Common, Data, Domain libraries)
+dotnet add EventLogs.Common/EventLogs.Common.csproj package System.IO.Hashing --version 8.0.0
 dotnet add EventLogs.Common/EventLogs.Common.csproj package Microsoft.Extensions.Logging.Abstractions --version 8.0.0
 dotnet add EventLogs.Common/EventLogs.Common.csproj package Npgsql --version 8.0.5
 
-# EventLogs.Data dependencies
 dotnet add EventLogs.Data/EventLogs.Data.csproj package Microsoft.EntityFrameworkCore
-dotnet add EventLogs.Data/EventLogs.Data.csproj package Npgsql.EntityFrameworkCore.PostgreSQL --version 8.0.10
-dotnet add EventLogs.Data/EventLogs.Data.csproj package Npgsql --version 8.0.5
-dotnet add EventLogs.Data/EventLogs.Data.csproj package Microsoft.EntityFrameworkCore.Design --version 8.0.10
+dotnet add EventLogs.Data/EventLogs.Data.csproj package Npgsql.EntityFrameworkCore.PostgreSQL
+dotnet add EventLogs.Data/EventLogs.Data.csproj package Microsoft.EntityFrameworkCore.Design
 
-# EventLogs.AccountBatchLoader dependencies
-dotnet add EventLogs.AccountBatchLoader/EventLogs.AccountBatchLoader.csproj package Microsoft.Extensions.Configuration
-dotnet add EventLogs.AccountBatchLoader/EventLogs.AccountBatchLoader.csproj package Microsoft.Extensions.Configuration.Json
-dotnet add EventLogs.AccountBatchLoader/EventLogs.AccountBatchLoader.csproj package Microsoft.Extensions.Configuration.EnvironmentVariables
-dotnet add EventLogs.AccountBatchLoader/EventLogs.AccountBatchLoader.csproj package Microsoft.Extensions.Logging.Console
-
-# Project references
-dotnet add EventLogs.Data/EventLogs.Data.csproj reference EventLogs.Domain/EventLogs.Domain.csproj
-dotnet add EventLogs.Data/EventLogs.Data.csproj reference EventLogs.Common/EventLogs.Common.csproj
-
-# Kafka consumers (WorkflowProcessor, TradeGenerator)
+# Install app-specific packages
 dotnet add EventLogs.WorkflowProcessor/EventLogs.WorkflowProcessor.csproj package Confluent.Kafka
 dotnet add EventLogs.WorkflowProcessor/EventLogs.WorkflowProcessor.csproj package Microsoft.Extensions.Hosting
-dotnet add EventLogs.WorkflowProcessor/EventLogs.WorkflowProcessor.csproj package Microsoft.Extensions.Logging.Console
-
 dotnet add EventLogs.TradeGenerator/EventLogs.TradeGenerator.csproj package Confluent.Kafka
-dotnet add EventLogs.TradeGenerator/EventLogs.TradeGenerator.csproj package Microsoft.Extensions.Hosting
-dotnet add EventLogs.TradeGenerator/EventLogs.TradeGenerator.csproj package Microsoft.Extensions.Logging.Console
-
-# Analytics Blazor Server app
 dotnet add EventLogs.Analytics/EventLogs.Analytics.csproj package MudBlazor
-dotnet add EventLogs.Analytics/EventLogs.Analytics.csproj package Microsoft.AspNetCore.SignalR.Client
-dotnet add EventLogs.Analytics/EventLogs.Analytics.csproj package Npgsql.EntityFrameworkCore.PostgreSQL --version 8.0.10
-dotnet add EventLogs.Analytics/EventLogs.Analytics.csproj package Microsoft.EntityFrameworkCore --version 8.0.10
 
-# All apps need Common, Data, and Domain
+# Add project references
 for app in AccountBatchLoader RequestGenerator WorkflowProcessor TradeGenerator Analytics; do
   dotnet add EventLogs.$app/EventLogs.$app.csproj reference EventLogs.Common/EventLogs.Common.csproj
   dotnet add EventLogs.$app/EventLogs.$app.csproj reference EventLogs.Data/EventLogs.Data.csproj
@@ -304,218 +101,195 @@ for app in AccountBatchLoader RequestGenerator WorkflowProcessor TradeGenerator 
 done
 ```
 
-### Scaffold Domain Models
+### 3. Verify Configuration Files
+
+Your `.env` file should contain:
 
 ```bash
-cd EventLogs.Data
-
-dotnet ef dbcontext scaffold \
-  "Host=localhost;Port=26257;Database=defaultdb;Username=root;SSL Mode=Prefer;Root Certificate=../../../certs/ca.crt;SSL Certificate=../../../certs/client.root.crt;SSL Key=../../../certs/client.root.key" \
-  Npgsql.EntityFrameworkCore.PostgreSQL \
-  --context EventLogsContext \
-  --context-dir . \
-  --output-dir ../EventLogs.Domain/Models \
-  --no-pluralize \
-  --force
-
-cd ..
-```
-
-## Running the Applications
-
-Applications run inside the **dcp-net** Docker network to access regional PgBouncer VIPs configured in the main DCP setup.
-
-See the main [DCP README](../../README.md) for PgBouncer and VIP setup.
-
-### Configuration
-
-#### 1. Environment Variables (.env file)
-
-Create a `.env` file in the `workloads/event-logs` directory with your VIP addresses:
-
-```bash
-# Regional PgBouncer VIP addresses (from DCP setup)
+# .env file (already exists)
 PGBOUNCER_VIP_US_EAST=172.18.0.251
 PGBOUNCER_VIP_US_CENTRAL=172.18.0.252
 PGBOUNCER_VIP_US_WEST=172.18.0.253
-
-# Kafka broker
 KAFKA_BOOTSTRAP=kafka:9093
-
-# Database credentials
-DB_NAME=defaultdb
-DB_USER=pgb
-DB_PASSWORD=secret
-
-# Locality configuration (computed locality buckets per region)
-# These arrays define which locality values (0-29) belong to each region
-# Used by AccountBatchLoader and RequestGenerator for region-aligned queries
 LOCALITIES_US_EAST=[0,1,2,3,4,5,6,7,8,9]
 LOCALITIES_US_CENTRAL=[10,11,12,13,14,15,16,17,18,19]
 LOCALITIES_US_WEST=[20,21,22,23,24,25,26,27,28,29]
 ```
 
-Docker Compose will automatically load these variables and inject them into container environments.
+Each app has a single `appsettings.json` (already exists). Docker-compose overrides settings via environment variables.
 
-**Why locality configuration?** The `account_info` table uses computed locality via `crc32ieee(account_id) % 30`, creating 30 buckets distributed across 3 regions (10 per region). Applications use these arrays to query accounts in their home region without hardcoding ranges.
-
-#### 2. Application Settings (appsettings.json)
-
-Each application needs an `appsettings.json` file. These are already created in each project directory:
-
-**EventLogs.AccountBatchLoader/appsettings.json**:
-```json
-{
-  "ConnectionStrings": {
-    "DefaultConnection": "Host=pgbouncer;Port=5432;Database=defaultdb;Username=pgb;SSL Mode=Require;Trust Server Certificate=true;Pooling=true;Minimum Pool Size=10;Maximum Pool Size=200;Connection Lifetime=600;Connection Idle Lifetime=300;Application Name=eventlogs-account-batch-loader"
-  },
-  "BatchSize": 1000,
-  "TotalAccounts": 30000,
-  "Logging": {
-    "LogLevel": {
-      "Default": "Information",
-      "Microsoft.EntityFrameworkCore": "Warning"
-    }
-  }
-}
-```
-
-**EventLogs.RequestGenerator/appsettings.json**:
-```json
-{
-  "ConnectionStrings": {
-    "DefaultConnection": "Host=localhost;Port=26257;Database=defaultdb;Username=root;SSL Mode=Prefer;Root Certificate=../../../certs/ca.crt;SSL Certificate=../../../certs/client.root.crt;SSL Key=../../../certs/client.root.key;Pooling=true;Minimum Pool Size=10;Maximum Pool Size=200;Connection Lifetime=600;Connection Idle Lifetime=300;Application Name=eventlogs-request-generator"
-  },
-  "Region": "us-east",
-  "BatchSize": 100,
-  "ThrottleMs": 1000,
-  "RequestedBy": "system"
-}
-```
-
-**Note**: The `DefaultConnection` and region-specific settings are placeholders that will be overridden by environment variables in docker-compose.yml, which includes:
-- The regional VIP from `.env` (e.g., `172.18.0.251` for us-east)
-- Client certificate paths mounted from `../../certs/` directory
-- Full SSL configuration required by PgBouncer
-- Connection pooling parameters (see section below)
-- Application Name for session identification in CockroachDB
-- Locality arrays for the specific region
-
-#### 3. Connection Pooling Configuration
-
-All applications use **Npgsql connection pooling** on the client side, even though PgBouncer provides external pooling. This is critical for performance:
-
-**Why client-side pooling matters with PgBouncer:**
-- PgBouncer does transaction pooling/multiplexing (releases backend connections quickly)
-- But apps still need TCP connections to PgBouncer
-- Opening new connections has overhead: TCP handshake + SSL handshake
-- Pre-warmed pool = fast connection acquisition for continuous workloads
-
-**Connection String Parameters:**
-```
-Pooling=true                    # Enable pooling (default)
-Minimum Pool Size=10            # Pre-warm 10 connections on startup
-Maximum Pool Size=200           # Max 200 logical connections per instance
-Connection Lifetime=600         # Refresh connections every 10 minutes
-Connection Idle Lifetime=300    # Prune idle connections after 5 minutes
-```
-
-**Why these values:**
-- **Minimum Pool Size=10**: Avoids cold start latency, keeps TCP/SSL connections ready
-- **Maximum Pool Size=200**: Plenty of headroom for EF Core to use multiple connections per complex query
-- **Connection Lifetime=600**: Balances connection reuse with periodic refresh
-- Logical connections are cheap - we don't want the app blocking waiting for a connection object
-
-These parameters are included in both `appsettings.json` defaults and docker-compose.yml environment overrides.
-
-### Build and Run with Docker Compose
-
-Applications are deployed incrementally - `docker-compose up -d` will start new services without restarting existing ones.
-
-#### 1. Load Accounts (run once)
+### 4. Setup Query Analysis Daemon
 
 ```bash
-cd /path/to/workloads/event-logs
+# Create Python virtual environment
+python3 -m venv .venv
+source .venv/bin/activate  # or .venv\Scripts\activate on Windows
+pip install psycopg psycopg-binary prometheus_client
 
-# Verify .env file exists with correct VIP addresses
-cat .env
+# Start observability daemon (collects query stats to workload_test schema)
+CERT_PATH=$(cd ../../certs && pwd)
+export DATABASE_URL="postgresql://root@localhost:26257/defaultdb?sslmode=require&sslrootcert=${CERT_PATH}$/ca.crt&sslcert=${CERT_PATH}/client.root.crt&sslkey=${CERT_PATH}/client.root.key"
+export METRICS_PORT=8001
+nohup .venv/bin/python copy_obs_data.py > nohup.out 2>&1 & disown
 
-# Build and run account batch loader
-docker-compose up -d account-batch-loader
+# Verify it's running
+ps aux | grep copy_obs_data.py
+tail -f nohup.out
 
-# Watch logs
-docker-compose logs -f account-batch-loader
-
-# Wait for completion (container will exit when done)
+# After testing you can stop the daemon with
+pkill -f copy_obs_data.py
 ```
 
-if you need to start over after running any of the following services you can
+## Phase 1: Manual Partitioning + Global CDC
 
-1. Stop all running request generators:
-```
-cd /Users/jleelong/workspace/distributed-connection-pooling/workloads/event-logs
+**Goal**: Baseline performance with manual PARTITION BY and global Kafka topic.
 
-# i.e. stop all request generator instances
-docker-compose stop request-generator-us-east request-generator-us-central request-generator-us-west
+### Step 1.1: Clean Database (if needed)
 
-# or force kill them
-docker-compose down request-generator-us-east request-generator-us-central request-generator-us-west
-```
-
-2. Clean up the database:
-```
-# Run the cleanup script (recreates the request status trigger)
+```bash
+# Remove multi-region config if it exists
+# Should return 0 rows
 cockroach sql --certs-dir ../../certs \
   --url "postgresql://localhost:26257/defaultdb" \
-  -f ./cleanup-database.sql
+  -e "SHOW REGIONS FROM DATABASE defaultdb;"
+
+# If regions exist, clean up
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" \
+  -f 00-cleanup-regions.sql
 ```
 
-3. Clear messages from Kafka topics:
-```bash
-# Uses Kafka UI REST API to clear all messages from the three regional topics
-./cleanup-kafka-topics.sh
+### Step 1.2: Initialize Schema
 
-# Or manually via Kafka UI at: http://localhost:8088/ui/clusters/local/all-topics
+```bash
+# Create tables with manual PARTITION BY for account_info
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" \
+  -f 01-initial-schema.sql
+
+# Load configuration data (request types, statuses, workflow states)
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" \
+  -f 02-populate-static-data.sql
+
+# Create Kafka partition coordination tables and functions
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" \
+  -f 03-kafka-partition-coordination-schema.sql
+
+# Initialize partition tracking for request-events topic (24 partitions)
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" \
+  -e "SELECT initialize_topic_partitions('request-events', 24);"
+
+# Grant permissions to pgb user
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" \
+  -e "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE defaultdb.* TO pgb;"
 ```
 
-4. And recreate the changefeeds above, which would have failed after truncating the data.
-
-#### 2. Generate Requests (3 regional instances)
-
-Each RequestGenerator instance:
-- Uses keyset pagination to process accounts in its locality range
-- Creates ACCOUNT_ONBOARDING requests for new accounts (no prior request_info)
-- Creates random request types for existing accounts (excluding closed accounts)
-- Writes to request_info and request_event_log (triggers CDC to Kafka)
-- Runs continuously with configurable batch size and throttle
+### Step 1.3: Create Global Kafka Topic
 
 ```bash
-# Start RequestGenerator services (one per region)
+# Single global topic for all regions (consumer group distributes partitions)
+kafka-topics --create \
+  --bootstrap-server localhost:9092 \
+  --topic request-events \
+  --partitions 24 \
+  --replication-factor 1
+
+# Verify
+kafka-topics --describe --bootstrap-server localhost:9092 --topic request-events
+```
+
+### Step 1.4: Create Global Changefeed
+
+```bash
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" <<'EOF'
+CREATE CHANGEFEED
+  INTO 'kafka://kafka:9093?topic_name=request-events'
+  WITH
+    initial_scan = 'no',
+    key_column = 'request_id',
+    unordered,
+    kafka_sink_config = '{"RequiredAcks": "ONE"}',
+    cursor = 'now()'
+  AS SELECT request_id, seq_num, action_state_link_id, status_id, 
+            event_ts, actor, metadata, idempotency_key
+  FROM request_event_log;
+EOF
+
+# Note: No WHERE crdb_region filter - this is a global changefeed
+```
+
+### Step 1.5: Register Test Run for Metrics Collection
+
+```bash
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" <<'EOF'
+INSERT INTO workload_test.test_run_configurations (
+  test_run,
+  database_name,
+  start_time,
+  end_time,
+  agg_grace_interval
+) VALUES (
+  'phase-1-manual-partition',
+  'defaultdb',
+  now(),
+  now() + interval '90 minutes',
+  interval '5 minutes'
+);
+EOF
+```
+
+### Step 1.6: Run Regional Applications
+
+**IMPORTANT**: No separate config files needed! Docker-compose uses environment variables to differentiate regions.
+
+```bash
+# Build all application images with current code
+docker-compose build
+
+# Load accounts (run once)
+docker-compose up -d account-batch-loader
+docker-compose logs -f account-batch-loader  # Wait for completion
+
+# Start 3 RequestGenerator instances (one per region)
 docker-compose up -d request-generator-us-east request-generator-us-central request-generator-us-west
+docker-compose logs -f request-generator-us-east
+# run for ~10 min
+docker-compose stop request-generator-us-east request-generator-us-central request-generator-us-west
 
-# Watch logs from all three instances
-docker-compose logs -f request-generator-us-east request-generator-us-central request-generator-us-west
-```
-
-#### 3. Process Workflows (3 regional instances)
-
-```bash
-# Add WorkflowProcessor services - will be implemented next  
+# Start 3 WorkflowProcessor instances (consume from shared topic via consumer group)
 docker-compose up -d workflow-processor-us-east workflow-processor-us-central workflow-processor-us-west
-```
+docker-compose logs -f workflow-processor-us-east
+# run for ~30 min
+docker-compose stop workflow-processor-us-east workflow-processor-us-central workflow-processor-us-west
 
-#### 4. Generate Trades (3 regional instances)
-
-```bash
-# Add TradeGenerator services - will be implemented next
+# Start 3 TradeGenerator instances
 docker-compose up -d trade-generator-us-east trade-generator-us-central trade-generator-us-west
+docker-compose logs -f trade-generator-us-east
+# run for ~30 min
+docker-compose stop trade-generator-us-east trade-generator-us-central trade-generator-us-west
 ```
 
-#### 5. Analytics Web UI
+**How regional config works**:
+- Single `appsettings.json` per app with defaults
+- `docker-compose.yml` defines 3 services per app (e.g., `workflow-processor-us-east`)
+- Each service overrides via environment variables:
+  - `ConnectionStrings__DefaultConnection` → regional VIP (from .env)
+  - `Region` → us-east, us-central, us-west
+  - `KafkaBootstrap` → kafka:9093
+  - `Localities_us_east` → [0,1,2,3,4,5,6,7,8,9]
+
+### Step 1.7: Analytics Web UI
 
 The Analytics app is a Blazor Server web application that provides interactive visualizations and metrics for request status data across all three regions. It runs in Docker with access to regional PgBouncer VIPs.
 
 ```bash
+docker restart $(docker ps -a --filter "name=^pgbouncer" --format "{{.Names}}")
 docker-compose up -d analytics
 ```
 
@@ -545,15 +319,380 @@ dotnet run
 ```
 Access at http://localhost:5000. Uses `appsettings.Development.json` which connects directly to CockroachDB (bypasses PgBouncer).
 
-### Stop All Services
+### Step 1.8: Stop Test Run
 
 ```bash
+# Mark test run complete (stops metrics collection)
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" <<'EOF'
+UPDATE workload_test.test_run_configurations
+SET end_time = now()
+WHERE test_run = 'phase-1-manual-partition';
+EOF
+
+cd ~/workspace/distributed-connection-pooling/workloads/event-logs
+docker-compose down
+```
+
+## Phase 2: Hybrid Multi-Region + Account Migration
+
+**Goal**: Enable multi-region, migrate account_info only, measure impact.
+
+### Step 2.1: Run Migration Script
+
+```bash
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" \
+  -f 04-migrate-account-to-regional.sql
+```
+
+This script:
+1. Enables multi-region database (PRIMARY REGION, ADD REGION, SURVIVE REGION FAILURE)
+2. Sets configuration tables to GLOBAL
+3. Migrates account_info to REGIONAL BY ROW AS computed_region
+4. Uses create-new, copy-data, rename-tables approach for minimal downtime
+
+### Step 2.2: Update Application Config
+
+**No code changes needed!** Just flip the UseGeoPartitioning flag:
+
+Edit `docker-compose.yml` and add to each service's environment:
+**NOTE excluding the Analytics app for now**
+```yaml
+  request-generator-us-east:
+    environment:
+      - UseGeoPartitioning=true  # Add this line
+      # ... other env vars unchanged
+
+  workflow-processor-us-east:
+    environment:
+      - UseGeoPartitioning=true  # Add this line
+      # ... other env vars unchanged
+      
+  # Repeat for all regional services
+```
+
+Or update appsettings for each app to specify the same
+```
+  "UseGeoPartitioning": true,
+```
+
+**IMPORTANT**: Then rebuild your Docker images to pick up the config changes.
+
+```bash
+cd ~/workspace/distributed-connection-pooling/workloads/event-logs
+
+# Build all application images with current code
+docker-compose build
+
+# This compiles .NET code and creates container images for:
+# - account-batch-loader
+# - request-generator (used for all 3 regional instances)
+# - workflow-processor (used for all 3 regional instances)
+# - trade-generator (used for all 3 regional instances)
+# - analytics
+```
+
+This tells analytics queries to include `crdb_region` in WHERE clauses.
+
+### Step 2.3: Register Phase 2 Test Run
+
+```bash
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" <<'EOF'
+INSERT INTO workload_test.test_run_configurations (
+  test_run,
+  database_name,
+  start_time,
+  end_time,
+  agg_grace_interval
+) VALUES (
+  'phase-2-hybrid-regional',
+  'defaultdb',
+  now(),
+  now() + interval '90 minutes',
+  interval '5 minutes'
+);
+EOF
+```
+
+### Step 2.4: Restart Applications
+
+**IMPORTANT**: No separate config files needed! Docker-compose uses environment variables to differentiate regions.
+
+```bash
+# Build all application images with current code
+docker-compose build
+
+# Load accounts (run once)
+docker-compose up -d account-batch-loader
+docker-compose logs -f account-batch-loader  # Wait for completion
+
+# Start 3 RequestGenerator instances (one per region)
+docker-compose up -d request-generator-us-east request-generator-us-central request-generator-us-west
+docker-compose logs -f request-generator-us-east
+# run for ~10 min
+docker-compose stop request-generator-us-east request-generator-us-central request-generator-us-west
+
+# Start 3 WorkflowProcessor instances (consume from shared topic via consumer group)
+docker-compose up -d workflow-processor-us-east workflow-processor-us-central workflow-processor-us-west
+docker-compose logs -f workflow-processor-us-east
+# run for ~30 min
+docker-compose stop workflow-processor-us-east workflow-processor-us-central workflow-processor-us-west
+
+# Start 3 TradeGenerator instances
+docker-compose up -d trade-generator-us-east trade-generator-us-central trade-generator-us-west
+docker-compose logs -f trade-generator-us-east
+# run for ~30 min
+docker-compose stop trade-generator-us-east trade-generator-us-central trade-generator-us-west
+```
+
+**How regional config works**:
+- Single `appsettings.json` per app with defaults
+- `docker-compose.yml` defines 3 services per app (e.g., `workflow-processor-us-east`)
+- Each service overrides via environment variables:
+  - `ConnectionStrings__DefaultConnection` → regional VIP (from .env)
+  - `Region` → us-east, us-central, us-west
+  - `KafkaBootstrap` → kafka:9093
+  - `Localities_us_east` → [0,1,2,3,4,5,6,7,8,9]
+
+### Step 2.5: Analytics Web UI
+
+The Analytics app is a Blazor Server web application that provides interactive visualizations and metrics for request status data across all three regions. It runs in Docker with access to regional PgBouncer VIPs.
+
+```bash
+docker restart $(docker ps -a --filter "name=^pgbouncer" --format "{{.Names}}")
+docker-compose up -d analytics
+```
+
+Access the UI at: **http://localhost:5080**
+
+Navigate to **Account Analytics** from the menu.
+
+**Features:**
+- Configure page size (100-10000) and concurrent tasks per region (1-50)
+- Real-time progress tracking for each region
+- Performance metrics: query count, avg response time, peak connections
+- Interactive bar chart showing request counts by type and status
+- Detailed data table with filtering
+- Parallel pagination across all three regions with streaming updates
+
+**How it works:**
+- Connects to all three regional PgBouncer VIPs simultaneously
+- Spawns configurable number of concurrent tasks per region
+- Aggregates results client-side and streams updates via SignalR
+- Tests connection pooling and parallel query performance
+
+**Local development (optional):**
+To run outside Docker for development with hot reload:
+```bash
+cd EventLogs.Analytics
+dotnet run
+```
+Access at http://localhost:5000. Uses `appsettings.Development.json` which connects directly to CockroachDB (bypasses PgBouncer).
+
+### Step 2.6: Stop Test Run
+
+```bash
+# Mark test run complete (stops metrics collection)
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" <<'EOF'
+UPDATE workload_test.test_run_configurations
+SET end_time = now()
+WHERE test_run = 'phase-2-hybrid-regional';
+EOF
+
+cd ~/workspace/distributed-connection-pooling/workloads/event-logs
+docker-compose down
+```
+
+## Phase 3: Full Multi-Region + Regional CDC
+
+**Goal**: Migrate all tables, switch to regional changefeeds and topics.
+
+### Step 3.1: Run Migration Script
+
+```bash
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" \
+  -f 05-migrate-all-to-regional.sql
+```
+
+This migrates request_info, request_event_log, request_status_head, and trade_info to REGIONAL BY ROW, **explicitly setting crdb_region** to match account's computed_region for data co-location.
+
+### Step 3.2: Create Regional Kafka Topics
+
+```bash
+kafka-topics --create --bootstrap-server localhost:9092 \
+  --topic request-events.us-east --partitions 24 --replication-factor 1
+
+kafka-topics --create --bootstrap-server localhost:9092 \
+  --topic request-events.us-central --partitions 24 --replication-factor 1
+
+kafka-topics --create --bootstrap-server localhost:9092 \
+  --topic request-events.us-west --partitions 24 --replication-factor 1
+
+# Initialize partition tracking for regional topics
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" <<'EOF'
+SELECT initialize_topic_partitions('request-events.us-east', 24);
+SELECT initialize_topic_partitions('request-events.us-central', 24);
+SELECT initialize_topic_partitions('request-events.us-west', 24);
+EOF
+```
+
+### Step 3.3: Drop Global Changefeed, Create Regional Changefeeds
+
+```bash
+# Find and cancel the global changefeed
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" \
+  -e "SELECT job_id, description FROM [SHOW CHANGEFEED JOBS] WHERE status = 'running';"
+
+# Cancel it (replace <job_id>)
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" \
+  -e "CANCEL JOB <job_id>;"
+
+# Create regional changefeeds
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" \
+  -f 06-create-regional-changefeeds.sql
+```
+
+### Step 3.4: Update Docker Compose for Regional Topics
+
+Edit `docker-compose.yml` - change Kafka topic for workflow processors:
+
+```yaml
+  workflow-processor-us-east:
+    environment:
+      - KafkaTopic=request-events.us-east  # Add this line
+      # ... other env vars
+
+  workflow-processor-us-central:
+    environment:
+      - KafkaTopic=request-events.us-central  # Add this line
+
+  workflow-processor-us-west:
+    environment:
+      - KafkaTopic=request-events.us-west  # Add this line
+```
+
+### Step 3.5: Register Phase 3 Test Run
+
+```bash
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" <<'EOF'
+INSERT INTO workload_test.test_run_configurations (
+  test_run,
+  database_name,
+  start_time,
+  end_time,
+  agg_grace_interval
+) VALUES (
+  'phase-3-full-regional',
+  'defaultdb',
+  now(),
+  now() + interval '90 minutes',
+  interval '5 minutes'
+);
+EOF
+```
+
+### Step 3.6: Restart Applications
+
+**IMPORTANT**: No separate config files needed! Docker-compose uses environment variables to differentiate regions.
+
+```bash
+# Build all application images with current code
+docker-compose build
+
+# Load accounts (run once)
+docker-compose up -d account-batch-loader
+docker-compose logs -f account-batch-loader  # Wait for completion
+
+# Start 3 RequestGenerator instances (one per region)
+docker-compose up -d request-generator-us-east request-generator-us-central request-generator-us-west
+docker-compose logs -f request-generator-us-east
+# run for ~10 min
+docker-compose stop request-generator-us-east request-generator-us-central request-generator-us-west
+
+# Start 3 WorkflowProcessor instances (consume from shared topic via consumer group)
+docker-compose up -d workflow-processor-us-east workflow-processor-us-central workflow-processor-us-west
+docker-compose logs -f workflow-processor-us-east
+# run for ~30 min
+docker-compose stop workflow-processor-us-east workflow-processor-us-central workflow-processor-us-west
+
+# Start 3 TradeGenerator instances
+docker-compose up -d trade-generator-us-east trade-generator-us-central trade-generator-us-west
+docker-compose logs -f trade-generator-us-east
+# run for ~30 min
+docker-compose stop trade-generator-us-east trade-generator-us-central trade-generator-us-west
+```
+
+**How regional config works**:
+- Single `appsettings.json` per app with defaults
+- `docker-compose.yml` defines 3 services per app (e.g., `workflow-processor-us-east`)
+- Each service overrides via environment variables:
+  - `ConnectionStrings__DefaultConnection` → regional VIP (from .env)
+  - `Region` → us-east, us-central, us-west
+  - `KafkaBootstrap` → kafka:9093
+  - `Localities_us_east` → [0,1,2,3,4,5,6,7,8,9]
+
+### Step 3.7: Analytics Web UI
+
+The Analytics app is a Blazor Server web application that provides interactive visualizations and metrics for request status data across all three regions. It runs in Docker with access to regional PgBouncer VIPs.
+
+```bash
+docker restart $(docker ps -a --filter "name=^pgbouncer" --format "{{.Names}}")
+docker-compose up -d analytics
+```
+
+Access the UI at: **http://localhost:5080**
+
+Navigate to **Account Analytics** from the menu.
+
+**Features:**
+- Configure page size (100-10000) and concurrent tasks per region (1-50)
+- Real-time progress tracking for each region
+- Performance metrics: query count, avg response time, peak connections
+- Interactive bar chart showing request counts by type and status
+- Detailed data table with filtering
+- Parallel pagination across all three regions with streaming updates
+
+**How it works:**
+- Connects to all three regional PgBouncer VIPs simultaneously
+- Spawns configurable number of concurrent tasks per region
+- Aggregates results client-side and streams updates via SignalR
+- Tests connection pooling and parallel query performance
+
+**Local development (optional):**
+To run outside Docker for development with hot reload:
+```bash
+cd EventLogs.Analytics
+dotnet run
+```
+Access at http://localhost:5000. Uses `appsettings.Development.json` which connects directly to CockroachDB (bypasses PgBouncer).
+
+### Step 3.8: Stop Test Run
+
+```bash
+# Mark test run complete (stops metrics collection)
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" <<'EOF'
+UPDATE workload_test.test_run_configurations
+SET end_time = now()
+WHERE test_run = 'phase-3-full-regional';
+EOF
+
+cd ~/workspace/distributed-connection-pooling/workloads/event-logs
 docker-compose down
 ```
 
 ## Validation
 
-After running the workload, validate data locality alignment:
+After running any phase, validate data locality alignment:
 
 ```bash
 cockroach sql --certs-dir ../../certs \
@@ -579,6 +718,62 @@ See [validation-queries.sql](validation-queries.sql) for complete validation sui
 - Row counts by region
 - Cross-region request detection
 - Replica locality verification
+
+## Performance Analysis
+
+### Compare Phases
+
+```bash
+# Query workload_test schema for collected metrics
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" <<'EOF'
+SELECT
+  test_run,
+  COUNT(*) AS query_count,
+  AVG((statistics->'statistics'->'svcLat'->>'mean')::FLOAT) * 1000 AS avg_latency_ms,
+  MAX((statistics->'statistics'->'latencyInfo'->>'max')::FLOAT) * 1000 AS max_latency_ms,
+  MIN((statistics->'statistics'->'latencyInfo'->>'min')::FLOAT) * 1000 AS min_latency_ms,
+  AVG((statistics->'statistics'->'runLat'->>'mean')::FLOAT) * 1000 AS avg_run_latency_ms
+FROM workload_test.cluster_statement_statistics
+WHERE test_run IN ('phase-1-manual-partition', 'phase-2-hybrid-regional', 'phase-3-full-regional')
+GROUP BY test_run
+ORDER BY test_run;
+EOF
+```
+
+## Cleanup
+
+```bash
+# Stop all services
+docker-compose down
+
+# Clean database
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" \
+  -f cleanup-database.sql
+
+# Clear Kafka topics
+./cleanup-kafka-topics.sh
+
+# Drop changefeeds
+cockroach sql --certs-dir ../../certs \
+  --url "postgresql://localhost:26257/defaultdb" \
+  -e "SELECT job_id FROM [SHOW CHANGEFEED JOBS];" \
+  | tail -n +2 | xargs -I {} cockroach sql --certs-dir ../../certs \
+    --url "postgresql://localhost:26257/defaultdb" -e "CANCEL JOB {};"
+```
+
+## Summary: What Changed Between Phases
+
+| Aspect | Phase 1 | Phase 2 | Phase 3 |
+|--------|---------|---------|---------|
+| **Database** | No multi-region config | PRIMARY/ADD REGION, SURVIVE REGION | Same |
+| **account_info** | PARTITION BY LIST + zone configs | REGIONAL BY ROW AS computed_region | Same |
+| **Other tables** | Regular tables | Regular tables | REGIONAL BY ROW (explicit crdb_region) |
+| **CDC** | 1 global changefeed | 1 global changefeed | 3 regional changefeeds |
+| **Kafka topics** | `request-events` (global) | `request-events` (global) | `request-events.{region}` |
+| **App config** | UseGeoPartitioning=false | UseGeoPartitioning=true | UseGeoPartitioning=true + KafkaTopic |
+| **Code changes** | None | None | None |
 
 ## Architecture Details
 
@@ -723,10 +918,6 @@ WHERE ti.crdb_region = @region
 **Staleness**: `follower_read_timestamp()` returns current time minus 4.8 seconds (default closed timestamp target). For analytics dashboards, this staleness is negligible.
 
 **Connection Pool Configuration**:
-- App pool: `Minimum Pool Size=5; Maximum Pool Size=50` per region
+- App pool: `Minimum Pool Size=2; Maximum Pool Size=150` per region
 - PgBouncer: `default_pool_size=20-50` (backend connections)
-- Result: 50 app connections share 20-50 backend connections efficiently
-
----
-
-**Next Steps**: Continue building applications following the todo list. Start with AccountBatchLoader implementation.
+- Result: 150 app connections share 20-50 backend connections efficiently
