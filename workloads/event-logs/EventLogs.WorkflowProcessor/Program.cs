@@ -21,10 +21,14 @@ var connectionString = configuration.GetConnectionString("DefaultConnection")
 var region = configuration.GetValue<string>("Region")
     ?? throw new InvalidOperationException("Region not configured");
 
+var useGeoPartitioning = configuration.GetValue<bool>("UseGeoPartitioning", false);
+
 var kafkaBootstrap = configuration.GetValue<string>("KafkaBootstrap")
     ?? throw new InvalidOperationException("KafkaBootstrap not configured");
 
-var topic = $"request-events.{region}";
+// Phase 1-2: request-events (global topic)
+// Phase 3: request-events.{region} (regional topics)
+var topic = configuration.GetValue<string>("KafkaTopic") ?? "request-events";
 var partitionCount = configuration.GetValue<int>("PartitionCount", 24);
 var batchSize = configuration.GetValue<int>("BatchSize", 128);
 var batchWindowMs = configuration.GetValue<int>("BatchWindowMs", 1000);
@@ -36,40 +40,66 @@ var logger = loggerFactory.CreateLogger<Program>();
 
 logger.LogInformation("=== Workflow Processor [{Region}] ===", region);
 logger.LogInformation("Kafka: {Bootstrap}, Topic: {Topic}", kafkaBootstrap, topic);
-logger.LogInformation("Partitions: {Count}, Batch Size: {BatchSize}, Window: {WindowMs}ms",
-    partitionCount, batchSize, batchWindowMs);
+logger.LogInformation("Partitions: {Count}, Batch Size: {BatchSize}, Window: {WindowMs}ms, GeoPartitioning: {UseGeo}",
+    partitionCount, batchSize, batchWindowMs, useGeoPartitioning);
+
+// Random startup delay to prevent thundering herd of SSL handshakes
+var startupDelay = Random.Shared.Next(0, 5000); // 0-5 seconds
+logger.LogInformation("Startup delay: {Delay}ms (prevents concurrent SSL storms)", startupDelay);
+await Task.Delay(startupDelay);
 
 // Load workflow state machine from database
-Dictionary<int, List<WorkflowTransition>> workflowTransitions;
+Dictionary<int, List<WorkflowTransition>>? workflowTransitions = null;
 var optionsBuilder = new DbContextOptionsBuilder<EventLogsContext>();
 optionsBuilder.UseNpgsql(connectionString);
 
-using (var setupContext = new EventLogsContext(optionsBuilder.Options))
+// Retry loading workflow transitions (handles SSL handshake failures during startup)
+const int startupRetries = 5;
+for (int attempt = 0; attempt < startupRetries; attempt++)
 {
-    // Load request_action_state_link data grouped by request_type_id
-    workflowTransitions = await setupContext.RequestActionStateLink
-        .OrderBy(rasl => rasl.RequestTypeId)
-        .ThenBy(rasl => rasl.SortOrder)
-        .ToListAsync()
-        .ContinueWith(task =>
-        {
-            return task.Result
-                .GroupBy(rasl => rasl.RequestTypeId)
-                .ToDictionary(
-                    g => g.Key,
-                    g => g.Select(rasl => new WorkflowTransition
-                    {
-                        ActionStateLinkId = rasl.ActionStateLinkId,
-                        ActionTypeId = rasl.ActionTypeId,
-                        StateId = rasl.StateId,
-                        SortOrder = rasl.SortOrder,
-                        IsInitial = rasl.IsInitial,
-                        IsTerminal = rasl.IsTerminal
-                    }).ToList()
-                );
-        });
+    try
+    {
+        using var setupContext = new EventLogsContext(optionsBuilder.Options);
 
-    logger.LogInformation("Loaded workflow transitions for {Count} request types", workflowTransitions.Count);
+        // Load request_action_state_link data grouped by request_type_id
+        workflowTransitions = await setupContext.RequestActionStateLink
+            .OrderBy(rasl => rasl.RequestTypeId)
+            .ThenBy(rasl => rasl.SortOrder)
+            .ToListAsync()
+            .ContinueWith(task =>
+            {
+                return task.Result
+                    .GroupBy(rasl => rasl.RequestTypeId)
+                    .ToDictionary(
+                        g => g.Key,
+                        g => g.Select(rasl => new WorkflowTransition
+                        {
+                            ActionStateLinkId = rasl.ActionStateLinkId,
+                            ActionTypeId = rasl.ActionTypeId,
+                            StateId = rasl.StateId,
+                            SortOrder = rasl.SortOrder,
+                            IsInitial = rasl.IsInitial,
+                            IsTerminal = rasl.IsTerminal
+                        }).ToList()
+                    );
+            });
+
+        logger.LogInformation("Loaded workflow transitions for {Count} request types", workflowTransitions.Count);
+        break; // Success, exit retry loop
+    }
+    catch (Exception ex) when (attempt < startupRetries - 1)
+    {
+        var delay = (int)Math.Pow(2, attempt) * 1000; // 1s, 2s, 4s, 8s, 16s
+        logger.LogWarning(ex, "Failed to load workflow transitions (attempt {Attempt}/{Max}), retrying in {Delay}ms",
+            attempt + 1, startupRetries, delay);
+        await Task.Delay(delay);
+    }
+}
+
+if (workflowTransitions == null)
+{
+    logger.LogError("Failed to load workflow transitions after {Retries} attempts", startupRetries);
+    return 1;
 }
 
 // Setup cancellation
@@ -81,26 +111,113 @@ Console.CancelKeyPress += (_, e) =>
     cts.Cancel();
 };
 
-// Start one consumer task per partition
-var tasks = new List<Task>();
-for (int partition = 0; partition < partitionCount; partition++)
-{
-    var partitionId = partition;
-    tasks.Add(Task.Run(async () =>
-        await ProcessPartition(partitionId, topic, kafkaBootstrap, connectionString,
-            workflowTransitions, batchSize, batchWindowMs, maxRetries, processingDelayMs,
-            logger, cts.Token),
-        cts.Token));
-}
+// Start partition coordinator for dynamic partition assignment
+var maxPartitionsPerConsumer = configuration.GetValue<int>("MaxPartitionsPerConsumer", 24);
+var coordinator = new KafkaPartitionCoordinator(
+    connectionString,
+    topic,
+    partitionCount,
+    maxPartitionsPerConsumer,
+    logger);
 
-logger.LogInformation("Started {Count} partition consumers", tasks.Count);
+await coordinator.StartAsync(cts.Token);
+logger.LogInformation("Partition coordinator started");
+
+// Wait for initial partition assignment
+await Task.Delay(2000, cts.Token);
+
+// Track consumer tasks by partition ID
+var partitionTasks = new Dictionary<int, (Task task, CancellationTokenSource cts)>();
+
+// Partition management loop - dynamically start/stop consumers based on ownership
+var managementTask = Task.Run(async () =>
+{
+    while (!cts.Token.IsCancellationRequested)
+    {
+        try
+        {
+            var ownedPartitions = coordinator.GetOwnedPartitions();
+            var ownedSet = new HashSet<int>(ownedPartitions);
+            var runningSet = new HashSet<int>(partitionTasks.Keys);
+
+            // Start consumers for newly claimed partitions
+            var newPartitions = ownedSet.Except(runningSet).ToList();
+            foreach (var partitionId in newPartitions)
+            {
+                var partitionCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
+                var task = Task.Run(async () =>
+                    await ProcessPartition(partitionId, topic, kafkaBootstrap, connectionString,
+                        workflowTransitions, batchSize, batchWindowMs, maxRetries, processingDelayMs,
+                        useGeoPartitioning, coordinator, logger, partitionCts.Token),
+                    partitionCts.Token);
+
+                partitionTasks[partitionId] = (task, partitionCts);
+                logger.LogInformation("Started consumer for partition {Partition} ({Count}/{Total} active)",
+                    partitionId, partitionTasks.Count, partitionCount);
+            }
+
+            // Stop consumers for released partitions
+            var releasedPartitions = runningSet.Except(ownedSet).ToList();
+            foreach (var partitionId in releasedPartitions)
+            {
+                if (partitionTasks.TryGetValue(partitionId, out var taskInfo))
+                {
+                    taskInfo.cts.Cancel();
+                    try
+                    {
+                        await taskInfo.task;
+                    }
+                    catch (OperationCanceledException) { }
+
+                    taskInfo.cts.Dispose();
+                    partitionTasks.Remove(partitionId);
+                    logger.LogInformation("Stopped consumer for partition {Partition} ({Count}/{Total} active)",
+                        partitionId, partitionTasks.Count, partitionCount);
+                }
+            }
+
+            await Task.Delay(5000, cts.Token); // Check every 5 seconds
+        }
+        catch (OperationCanceledException)
+        {
+            break;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Error in partition management loop");
+            await Task.Delay(10000, cts.Token);
+        }
+    }
+}, cts.Token);
+
+logger.LogInformation("Partition management loop started");
 
 try
 {
-    await Task.WhenAll(tasks);
+    await managementTask;
 }
 catch (OperationCanceledException)
 {
+    logger.LogInformation("Shutdown signal received, stopping consumers...");
+}
+finally
+{
+    // Stop all running partition consumers
+    foreach (var kvp in partitionTasks)
+    {
+        kvp.Value.cts.Cancel();
+    }
+
+    await Task.WhenAll(partitionTasks.Values.Select(v => v.task).Where(t => t != null));
+
+    foreach (var kvp in partitionTasks)
+    {
+        kvp.Value.cts.Dispose();
+    }
+
+    // Dispose coordinator (releases partitions gracefully)
+    await coordinator.DisposeAsync();
+
     logger.LogInformation("Workflow processor shutdown complete");
 }
 
@@ -119,13 +236,22 @@ static async Task ProcessPartition(
     int batchWindowMs,
     int maxRetries,
     int processingDelayMs,
+    bool useGeoPartitioning,
+    KafkaPartitionCoordinator coordinator,
     ILogger logger,
     CancellationToken cancellationToken)
 {
+    // Verify we own this partition before starting consumer
+    if (!coordinator.OwnsPartition(partition))
+    {
+        logger.LogWarning("[P{Partition}] Not owned by this coordinator, exiting", partition);
+        return;
+    }
+
     var consumerConfig = new ConsumerConfig
     {
         BootstrapServers = kafkaBootstrap,
-        GroupId = $"workflow-processor-{topic}-p{partition}-v3",
+        GroupId = $"workflow-processor-{topic}-p{partition}-v4",
         AutoOffsetReset = AutoOffsetReset.Earliest,
         EnableAutoCommit = true,
         EnableAutoOffsetStore = false
@@ -153,6 +279,13 @@ static async Task ProcessPartition(
             // if no message consumed then continue
             if (!cancellationToken.IsCancellationRequested && consumeResult != null && consumeResult.Message.Value != null)
             {
+                // Verify we still own this partition (defensive check)
+                if (!coordinator.OwnsPartition(partition))
+                {
+                    logger.LogWarning("[P{Partition}] Lost partition ownership, stopping consumer", partition);
+                    break;
+                }
+
                 // Parse CDC event - CRDB changefeeds send the row data directly, not wrapped in "after"
                 CDCEventData? eventData = null;
                 try
@@ -190,10 +323,13 @@ static async Task ProcessPartition(
                     // flush the events to the database if batch size or time limit exceeded
                     if (batch.Count >= batchSize || stopwatch.ElapsedMilliseconds >= batchWindowMs)
                     {
-                        await ProcessBatch(batch, connectionString, workflowTransitions, processingDelayMs, logger, partition, cancellationToken);
+                        await ProcessBatch(batch, connectionString, workflowTransitions, processingDelayMs, useGeoPartitioning, logger, partition, cancellationToken);
 
                         // commit the last message we received before flushing the internal buffer
                         consumer.StoreOffset(consumeResult);
+
+                        // Report processed offset to coordinator
+                        await coordinator.ReportMessageProcessedAsync(partition, consumeResult.Offset.Value);
 
                         // database transaction succeeded, reset state for next batch
                         processedCount += batch.Count;
@@ -217,10 +353,13 @@ static async Task ProcessPartition(
                 cancellationToken.IsCancellationRequested || stopwatch.ElapsedMilliseconds >= batchWindowMs
             ))
             {
-                await ProcessBatch(batch, connectionString, workflowTransitions, processingDelayMs, logger, partition, cancellationToken);
+                await ProcessBatch(batch, connectionString, workflowTransitions, processingDelayMs, useGeoPartitioning, logger, partition, cancellationToken);
 
                 // commit the last message we received before flushing the internal buffer
                 consumer.StoreOffset(lastConsumeResult);
+
+                // Report processed offset to coordinator
+                await coordinator.ReportMessageProcessedAsync(partition, lastConsumeResult.Offset.Value);
 
                 // database transaction succeeded, reset state for next batch
                 processedCount += batch.Count;
@@ -262,6 +401,7 @@ static async Task ProcessBatch(
     string connectionString,
     Dictionary<int, List<WorkflowTransition>> workflowTransitions,
     int processingDelayMs,
+    bool useGeoPartitioning,
     ILogger logger,
     int partition,
     CancellationToken cancellationToken)
@@ -281,7 +421,7 @@ static async Task ProcessBatch(
                 await Task.Delay(processingDelayMs, cancellationToken);
             }
 
-            await ProcessEvent(evt, connection, transaction, workflowTransitions, logger, partition, cancellationToken);
+            await ProcessEvent(evt, connection, transaction, workflowTransitions, useGeoPartitioning, logger, partition, cancellationToken);
         }
 
         await transaction.CommitAsync(cancellationToken);
@@ -296,6 +436,7 @@ static async Task ProcessEvent(
     NpgsqlConnection connection,
     NpgsqlTransaction transaction,
     Dictionary<int, List<WorkflowTransition>> workflowTransitions,
+    bool useGeoPartitioning,
     ILogger logger,
     int partition,
     CancellationToken cancellationToken)
@@ -358,18 +499,18 @@ static async Task ProcessEvent(
     if (evt.Metadata != null)
     {
         var metadata = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(evt.Metadata);
-        if (metadata != null && metadata.ContainsKey("linked_account_id"))
+        if (metadata != null && metadata.ContainsKey("linked_account_number"))
         {
-            var linkedAccountId = Guid.Parse(metadata["linked_account_id"].GetString()!);
+            var linkedAccountNumber = metadata["linked_account_number"].GetString()!;
 
             // Insert into request_account_link (idempotent)
             await using var linkCmd = new NpgsqlCommand(@"
-                INSERT INTO request_account_link (request_id, account_id, role, allocation_pct)
-                VALUES (@requestId, @accountId, 'LINKED', 100.00)
-                ON CONFLICT (request_id, account_id) DO NOTHING",
+                INSERT INTO request_account_link (request_id, account_number, role, allocation_pct)
+                VALUES (@requestId, @accountNumber, 'LINKED', 100.00)
+                ON CONFLICT (request_id, account_number) DO NOTHING",
                 connection, transaction);
             linkCmd.Parameters.AddWithValue("requestId", evt.RequestId);
-            linkCmd.Parameters.AddWithValue("accountId", linkedAccountId);
+            linkCmd.Parameters.AddWithValue("accountNumber", linkedAccountNumber);
             await linkCmd.ExecuteNonQueryAsync(cancellationToken);
         }
     }
@@ -378,14 +519,31 @@ static async Task ProcessEvent(
     var nextSeqNum = evt.SeqNum + 1;
     var idempotencyKey = $"{evt.RequestId}:{nextSeqNum}:{nextTransition.ActionStateLinkId}";
 
-    await using var insertCmd = new NpgsqlCommand(@"
-        INSERT INTO request_event_log (
-            request_id, seq_num, action_state_link_id, status_id,
-            event_ts, actor, metadata, idempotency_key
-        )
-        VALUES (@requestId, @seqNum, @actionStateLinkId, @statusId, @eventTs, @actor, @metadata, @idempotencyKey)
-        ON CONFLICT (request_id, action_state_link_id, idempotency_key) DO NOTHING",
-        connection, transaction);
+    string insertSql;
+    if (useGeoPartitioning)
+    {
+        insertSql = @"
+            INSERT INTO request_event_log (
+                request_id, seq_num, action_state_link_id, status_id,
+                event_ts, actor, metadata, idempotency_key, crdb_region
+            )
+            SELECT @requestId, @seqNum, @actionStateLinkId, @statusId, @eventTs, @actor, @metadata, @idempotencyKey, crdb_region
+            FROM request_info
+            WHERE request_id = @requestId
+            ON CONFLICT (request_id, action_state_link_id, idempotency_key) DO NOTHING";
+    }
+    else
+    {
+        insertSql = @"
+            INSERT INTO request_event_log (
+                request_id, seq_num, action_state_link_id, status_id,
+                event_ts, actor, metadata, idempotency_key
+            )
+            VALUES (@requestId, @seqNum, @actionStateLinkId, @statusId, @eventTs, @actor, @metadata, @idempotencyKey)
+            ON CONFLICT (request_id, action_state_link_id, idempotency_key) DO NOTHING";
+    }
+
+    await using var insertCmd = new NpgsqlCommand(insertSql, connection, transaction);
 
     insertCmd.Parameters.AddWithValue("requestId", evt.RequestId);
     insertCmd.Parameters.AddWithValue("seqNum", nextSeqNum);

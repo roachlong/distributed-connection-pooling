@@ -1,5 +1,6 @@
 using EventLogs.Common;
 using EventLogs.Data;
+using EventLogs.Domain.Models;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
@@ -29,64 +30,47 @@ optionsBuilder.UseNpgsql(connectionString);
 
 using var dbContext = new EventLogsContext(optionsBuilder.Options);
 
-// Test connection
+// Test connection with retry
 try
 {
-    await dbContext.Database.ExecuteSqlRawAsync("SELECT 1");
+    await DatabaseRetryHelper.ExecuteWithRetryAsync(async () =>
+    {
+        await dbContext.Database.ExecuteSqlRawAsync("SELECT 1");
+    }, logger, "connection test");
+
     logger.LogInformation("Database connection successful");
 }
 catch (Exception ex)
 {
-    logger.LogError(ex, "Database connection failed");
+    logger.LogError(ex, "Database connection failed after retries");
     return 1;
 }
 
-// Load locality configuration
-var localitiesByRegion = new Dictionary<string, List<short>>();
-foreach (var region in new[] { "us-east", "us-central", "us-west" })
+// Check total account count with retry
+var totalAccountCount = await DatabaseRetryHelper.ExecuteWithRetryAsync(async () =>
 {
-    var configKey = $"Localities_{region.Replace("-", "_")}";
-    var localitiesJson = configuration.GetValue<string>(configKey)
-        ?? throw new InvalidOperationException($"{configKey} not configured");
-    var localities = JsonSerializer.Deserialize<List<short>>(localitiesJson)
-        ?? throw new InvalidOperationException($"Failed to parse {configKey}");
-    localitiesByRegion[region] = localities;
-    logger.LogInformation("Region {Region} localities: {Localities}", region, string.Join(",", localities));
-}
+    return await dbContext.AccountInfo.CountAsync();
+}, logger, "count existing accounts");
 
-// Check total account count
-var totalAccountCount = await dbContext.AccountInfo.CountAsync();
 logger.LogInformation("Total accounts in system: {Count}", totalAccountCount);
 
-// Count "new" accounts per region (accounts without request_info records in their home region)
-logger.LogInformation("=== Counting New Accounts by Region ===");
-var newAccountsByRegion = new Dictionary<string, int>();
-
-foreach (var kvp in localitiesByRegion)
+// Count "new" accounts (accounts without request_info records) with retry
+var newCount = await DatabaseRetryHelper.ExecuteWithRetryAsync(async () =>
 {
-    var region = kvp.Key;
-    var localities = kvp.Value;
-
-    // Count accounts in this region's locality range that don't have request_info
-    var newCount = await dbContext.AccountInfo
-        .Where(a => localities.Contains(a.Locality))
-        .Where(a => !dbContext.RequestInfo.Any(r => r.PrimaryAccountId == a.AccountId))
+    return await dbContext.AccountInfo
+        .Where(a => !dbContext.RequestInfo.Any(r => r.PrimaryAccountNumber == a.AccountNumber))
         .CountAsync();
+}, logger, "count new accounts");
 
-    newAccountsByRegion[region] = newCount;
-    logger.LogInformation("{Region}: {Count} new accounts", region, newCount);
-}
+logger.LogInformation("New accounts (without requests): {Count}", newCount);
 
-var totalNewAccounts = newAccountsByRegion.Values.Sum();
-logger.LogInformation("Total new accounts across all regions: {Count}", totalNewAccounts);
-
-if (totalNewAccounts >= totalAccounts)
+if (newCount >= totalAccounts)
 {
-    logger.LogInformation("Sufficient new accounts already exist ({New}/{Target}). Exiting.", totalNewAccounts, totalAccounts);
+    logger.LogInformation("Sufficient new accounts already exist ({New}/{Target}). Exiting.", newCount, totalAccounts);
     return 0;
 }
 
-var accountsToLoad = totalAccounts - totalNewAccounts;
+var accountsToLoad = totalAccounts - newCount;
 logger.LogInformation("Loading {Count} new accounts to maintain target of {Target} new accounts...", accountsToLoad, totalAccounts);
 
 var strategies = new[] { "Growth", "Value", "Income", "Balanced", "Aggressive", "Conservative" };
@@ -95,7 +79,7 @@ var random = new Random(42); // Deterministic seed for reproducibility
 
 var loadedCount = 0;
 
-// Batch by region to avoid cross-region transactions
+// Batch by region to target correct gateway (even though locality is auto-calculated by DB)
 var regionalBatches = new Dictionary<string, List<AccountInfo>>
 {
     { "us-east", new List<AccountInfo>() },
@@ -105,17 +89,19 @@ var regionalBatches = new Dictionary<string, List<AccountInfo>>
 
 for (int i = 0; i < accountsToLoad; i++)
 {
-    var accountId = Guid.NewGuid();
-    var locality = LocalityHasher.ComputeLocality(accountId);
+    var accountNumber = $"ACCT-{totalAccountCount + i + 1:D8}";
+
+    // Compute locality to determine target region/gateway (but don't set it - DB auto-calculates)
+    var locality = LocalityHasher.ComputeLocality(accountNumber);
     var region = LocalityHasher.LocalityToRegion(locality);
 
     var account = new AccountInfo
     {
-        AccountId = accountId,
-        AccountNumber = $"ACCT-{totalAccountCount + i + 1:D8}",
+        AccountNumber = accountNumber,
         AccountName = $"Account {totalAccountCount + i + 1}",
         Strategy = strategies[random.Next(strategies.Length)],
         BaseCurrency = currencies[random.Next(currencies.Length)]
+        // locality is NOT set here - it's auto-computed by database
     };
 
     regionalBatches[region].Add(account);

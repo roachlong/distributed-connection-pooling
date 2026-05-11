@@ -1,5 +1,6 @@
 ﻿using EventLogs.Common;
 using EventLogs.Data;
+using EventLogs.Domain.Models;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
@@ -19,6 +20,7 @@ var connectionString = configuration.GetConnectionString("DefaultConnection")
 var region = configuration.GetValue<string>("Region")
     ?? throw new InvalidOperationException("Region not configured");
 
+var useGeoPartitioning = configuration.GetValue<bool>("UseGeoPartitioning", false);
 var batchSize = configuration.GetValue<int>("BatchSize", 100);
 var throttleMs = configuration.GetValue<int>("ThrottleMs", 1000);
 var requestedBy = configuration.GetValue<string>("RequestedBy", "system");
@@ -28,7 +30,7 @@ var logger = loggerFactory.CreateLogger<Program>();
 
 logger.LogInformation("=== Request Generator [{Region}] ===", region);
 logger.LogInformation("Connection: {Connection}", connectionString.Substring(0, Math.Min(50, connectionString.Length)));
-logger.LogInformation("Batch Size: {BatchSize}, Throttle: {ThrottleMs}ms", batchSize, throttleMs);
+logger.LogInformation("Batch Size: {BatchSize}, Throttle: {ThrottleMs}ms, GeoPartitioning: {UseGeo}", batchSize, throttleMs, useGeoPartitioning);
 
 // Load locality configuration for this region
 var configKey = $"Localities_{region.Replace("-", "_")}";
@@ -77,9 +79,9 @@ using (var setupContext = new EventLogsContext(optionsBuilder.Options))
     logger.LogInformation("Loaded {Count} request types", requestTypes.Count);
 }
 
-// Keyset pagination state (locality, account_id)
+// Keyset pagination state (locality, account_number)
 short? lastLocality = null;
-Guid? lastAccountId = null;
+string? lastAccountNumber = null;
 var random = new Random();
 var processedCount = 0;
 var loopCount = 0;
@@ -97,16 +99,16 @@ while (true)
         IQueryable<AccountInfo> query = dbContext.AccountInfo
             .Where(a => localities.Contains(a.Locality));
 
-        if (lastLocality.HasValue && lastAccountId.HasValue)
+        if (lastLocality.HasValue && lastAccountNumber != null)
         {
             query = query.Where(a =>
                 a.Locality > lastLocality.Value ||
-                (a.Locality == lastLocality.Value && a.AccountId > lastAccountId.Value));
+                (a.Locality == lastLocality.Value && a.AccountNumber.CompareTo(lastAccountNumber) > 0));
         }
 
         var accounts = await query
             .OrderBy(a => a.Locality)
-            .ThenBy(a => a.AccountId)
+            .ThenBy(a => a.AccountNumber)
             .Take(batchSize)
             .ToListAsync();
 
@@ -114,7 +116,7 @@ while (true)
         {
             logger.LogInformation("No more accounts in range. Resetting pagination to beginning.");
             lastLocality = null;
-            lastAccountId = null;
+            lastAccountNumber = null;
             await Task.Delay(throttleMs);
             continue;
         }
@@ -125,7 +127,7 @@ while (true)
         {
             // Check if account has been processed before (has request_info)
             var existingRequest = await dbContext.RequestInfo
-                .Where(r => r.PrimaryAccountId == account.AccountId)
+                .Where(r => r.PrimaryAccountNumber == account.AccountNumber)
                 .OrderByDescending(r => r.CreatedTs)
                 .FirstOrDefaultAsync();
 
@@ -139,7 +141,7 @@ while (true)
                 var onboardingType = requestTypes.FirstOrDefault(rt => rt.Value == "ACCOUNT_ONBOARDING");
                 if (onboardingType.Key == 0)
                 {
-                    logger.LogWarning("ACCOUNT_ONBOARDING request type not found. Skipping account {AccountId}", account.AccountId);
+                    logger.LogWarning("ACCOUNT_ONBOARDING request type not found. Skipping account {AccountNumber}", account.AccountNumber);
                     continue;
                 }
                 requestTypeId = onboardingType.Key;
@@ -173,7 +175,7 @@ while (true)
             var actionStateLinkId = actionStateLinks.First();
 
             // Generate deterministic idempotency key
-            var idempotencyKey = GenerateIdempotencyKey(account.AccountId, requestTypeId, loopCount);
+            var idempotencyKey = GenerateIdempotencyKey(account.AccountNumber, requestTypeId, loopCount);
 
             // Check if this request was already created (idempotency check)
             var existingEvent = await dbContext.RequestEventLog
@@ -195,12 +197,12 @@ while (true)
                 // Pick a random account regardless of locality
                 var randomAccount = await dbContext.AccountInfo
                     .OrderBy(a => Guid.NewGuid()) // Simple random - not efficient but works for demo
-                    .Select(a => a.AccountId)
+                    .Select(a => a.AccountNumber)
                     .FirstOrDefaultAsync();
 
-                if (randomAccount != Guid.Empty)
+                if (!string.IsNullOrEmpty(randomAccount))
                 {
-                    metadata["linked_account_id"] = randomAccount.ToString();
+                    metadata["linked_account_number"] = randomAccount;
                 }
             }
 
@@ -209,17 +211,41 @@ while (true)
             // Insert request_info and request_event_log atomically with retry logic
             await DatabaseRetryHelper.ExecuteWithRetryAsync(async () =>
             {
-                // Insert request_info
-                await dbContext.Database.ExecuteSqlRawAsync(@"
-                    INSERT INTO request_info (request_id, request_type_id, primary_account_id, requested_by, description, request_status_id, created_ts)
-                    VALUES ({0}, {1}, {2}, {3}, {4}, 1, {5})",
-                    requestId, requestTypeId, account.AccountId, requestedBy, description, now);
+                // Insert request_info (with crdb_region if geo-partitioning enabled)
+                if (useGeoPartitioning)
+                {
+                    await dbContext.Database.ExecuteSqlRawAsync(@"
+                        INSERT INTO request_info (request_id, request_type_id, primary_account_number, requested_by, description, request_status_id, created_ts, crdb_region)
+                        SELECT {0}, {1}, {2}, {3}, {4}, 1, {5}, computed_region
+                        FROM account_info
+                        WHERE account_number = {2}",
+                        requestId, requestTypeId, account.AccountNumber, requestedBy, description, now);
+                }
+                else
+                {
+                    await dbContext.Database.ExecuteSqlRawAsync(@"
+                        INSERT INTO request_info (request_id, request_type_id, primary_account_number, requested_by, description, request_status_id, created_ts)
+                        VALUES ({0}, {1}, {2}, {3}, {4}, 1, {5})",
+                        requestId, requestTypeId, account.AccountNumber, requestedBy, description, now);
+                }
 
-                // Insert request_event_log (this triggers CDC)
-                await dbContext.Database.ExecuteSqlRawAsync(@"
-                    INSERT INTO request_event_log (request_id, seq_num, action_state_link_id, status_id, event_ts, actor, metadata, idempotency_key)
-                    VALUES ({0}, 1, {1}, 1, {2}, {3}, {4}::jsonb, {5})",
-                    requestId, actionStateLinkId, now, requestedBy, metadataJson, idempotencyKey);
+                // Insert request_event_log (with crdb_region if geo-partitioning enabled)
+                if (useGeoPartitioning)
+                {
+                    await dbContext.Database.ExecuteSqlRawAsync(@"
+                        INSERT INTO request_event_log (request_id, seq_num, action_state_link_id, status_id, event_ts, actor, metadata, idempotency_key, crdb_region)
+                        SELECT {0}, 1, {1}, 1, {2}, {3}, {4}::jsonb, {5}, crdb_region
+                        FROM request_info
+                        WHERE request_id = {0}",
+                        requestId, actionStateLinkId, now, requestedBy, metadataJson, idempotencyKey);
+                }
+                else
+                {
+                    await dbContext.Database.ExecuteSqlRawAsync(@"
+                        INSERT INTO request_event_log (request_id, seq_num, action_state_link_id, status_id, event_ts, actor, metadata, idempotency_key)
+                        VALUES ({0}, 1, {1}, 1, {2}, {3}, {4}::jsonb, {5})",
+                        requestId, actionStateLinkId, now, requestedBy, metadataJson, idempotencyKey);
+                }
             }, logger, $"create request for account {account.AccountNumber}");
 
             processedCount++;
@@ -227,7 +253,7 @@ while (true)
 
         // Update pagination cursor
         lastLocality = accounts.Last().Locality;
-        lastAccountId = accounts.Last().AccountId;
+        lastAccountNumber = accounts.Last().AccountNumber;
 
         logger.LogInformation("Loop {Loop}: Created requests for {Count} accounts (total processed: {Total})",
             loopCount, accounts.Count, processedCount);
@@ -241,9 +267,9 @@ while (true)
     await Task.Delay(throttleMs);
 }
 
-static string GenerateIdempotencyKey(Guid accountId, int requestTypeId, int loopCount)
+static string GenerateIdempotencyKey(string accountNumber, int requestTypeId, int loopCount)
 {
-    var input = $"{accountId}:{requestTypeId}:{loopCount}";
+    var input = $"{accountNumber}:{requestTypeId}:{loopCount}";
     var hash = SHA256.HashData(Encoding.UTF8.GetBytes(input));
     return Convert.ToHexString(hash).ToLowerInvariant();
 }

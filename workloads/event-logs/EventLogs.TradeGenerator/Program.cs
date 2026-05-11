@@ -18,6 +18,7 @@ var connectionString = configuration.GetConnectionString("DefaultConnection")
 var region = configuration.GetValue<string>("Region")
     ?? throw new InvalidOperationException("Region not configured");
 
+var useGeoPartitioning = configuration.GetValue<bool>("UseGeoPartitioning", false);
 var batchSize = configuration.GetValue<int>("BatchSize", 100);
 var throttleMs = configuration.GetValue<int>("ThrottleMs", 1000);
 var tradesPerAccount = configuration.GetValue<int>("TradesPerAccount", 3);
@@ -27,8 +28,8 @@ var logger = loggerFactory.CreateLogger<Program>();
 
 logger.LogInformation("=== Trade Generator [{Region}] ===", region);
 logger.LogInformation("Connection: {Connection}", connectionString.Substring(0, Math.Min(50, connectionString.Length)));
-logger.LogInformation("Batch Size: {BatchSize}, Throttle: {ThrottleMs}ms, Trades Per Account: {TradesPerAccount}",
-    batchSize, throttleMs, tradesPerAccount);
+logger.LogInformation("Batch Size: {BatchSize}, Throttle: {ThrottleMs}ms, Trades Per Account: {TradesPerAccount}, GeoPartitioning: {UseGeo}",
+    batchSize, throttleMs, tradesPerAccount, useGeoPartitioning);
 
 // Load locality configuration for this region
 var configKey = $"Localities_{region.Replace("-", "_")}";
@@ -44,7 +45,7 @@ optionsBuilder.UseNpgsql(connectionString);
 
 // Keyset pagination state
 short? lastLocality = null;
-Guid? lastAccountId = null;
+string? lastAccountNumber = null;
 var random = new Random();
 var processedCount = 0;
 var loopCount = 0;
@@ -75,17 +76,21 @@ while (true)
             tradeValues.Add($"('{tradeId}', '{symbol}', '{side}', {quantity}, {price}, 'USD', 2, '{now:yyyy-MM-dd HH:mm:ss.ffffff}')");
         }
 
-        var paginationClause = lastLocality.HasValue && lastAccountId.HasValue
-            ? $"AND (ai.locality > {lastLocality.Value} OR (ai.locality = {lastLocality.Value} AND ai.account_id > '{lastAccountId.Value}'))"
+        var paginationClause = lastLocality.HasValue && lastAccountNumber != null
+            ? $"AND (ai.locality > {lastLocality.Value} OR (ai.locality = {lastLocality.Value} AND ai.account_number > '{lastAccountNumber}'))"
             : "";
 
         // Single CTE-based query: select completed accounts, insert trades, and return pagination info
+        var regionColumn = useGeoPartitioning ? ", ai.computed_region" : "";
+        var regionInsertColumn = useGeoPartitioning ? ", crdb_region" : "";
+        var regionSelectColumn = useGeoPartitioning ? ", ca.computed_region" : "";
+
         var sql = $@"
             WITH completed_accounts AS (
-                SELECT ai.locality, ai.account_id, ai.account_number, ri.request_id,
-                       ROW_NUMBER() OVER (ORDER BY ai.locality, ai.account_id) as rn
+                SELECT ai.locality, ai.account_number, ri.request_id{regionColumn},
+                       ROW_NUMBER() OVER (ORDER BY ai.locality, ai.account_number) as rn
                 FROM account_info ai
-                JOIN request_info ri ON ri.primary_account_id = ai.account_id
+                JOIN request_info ri ON ri.primary_account_number = ai.account_number
                 JOIN request_type rt ON rt.request_type_id = ri.request_type_id
                 JOIN request_status_head rsh ON rsh.request_id = ri.request_id
                 JOIN request_action_state_link rasl ON rasl.action_state_link_id = rsh.action_state_link_id
@@ -94,7 +99,7 @@ while (true)
                   AND rasl.is_terminal = true
                   AND rsh.status_id = 3
                   {paginationClause}
-                ORDER BY ai.locality, ai.account_id
+                ORDER BY ai.locality, ai.account_number
                 LIMIT {batchSize}
             ),
             trade_data AS (
@@ -107,35 +112,34 @@ while (true)
                 FROM trade_data
             ),
             inserted AS (
-                INSERT INTO trade_info (trade_id, request_id, account_id, symbol, side, quantity, price, currency, status_id, created_ts)
+                INSERT INTO trade_info (trade_id, request_id, account_number, symbol, side, quantity, price, currency, status_id, created_ts{regionInsertColumn})
                 SELECT
                     nt.trade_id::uuid,
                     ca.request_id,
-                    ca.account_id,
+                    ca.account_number,
                     nt.symbol,
                     nt.side,
                     nt.quantity,
                     nt.price,
                     nt.currency,
                     nt.status_id,
-                    nt.created_ts::timestamptz
+                    nt.created_ts::timestamptz{regionSelectColumn}
                 FROM numbered_trades nt
                 CROSS JOIN completed_accounts ca
                 WHERE nt.trade_rn BETWEEN ((ca.rn - 1) * {tradesPerAccount} + 1) AND (ca.rn * {tradesPerAccount})
                 ON CONFLICT (trade_id) DO NOTHING
-                RETURNING account_id
+                RETURNING account_number
             )
             SELECT
-                (SELECT COUNT(DISTINCT account_id) FROM inserted) as accounts_count,
+                (SELECT COUNT(DISTINCT account_number) FROM inserted) as accounts_count,
                 (SELECT COUNT(*) FROM inserted) as trades_count,
-                (SELECT locality FROM completed_accounts ORDER BY locality DESC, account_id DESC LIMIT 1) as last_locality,
-                (SELECT account_id FROM completed_accounts ORDER BY locality DESC, account_id DESC LIMIT 1) as last_account_id";
+                (SELECT locality FROM completed_accounts ORDER BY locality DESC, account_number DESC LIMIT 1) as last_locality,
+                (SELECT account_number FROM completed_accounts ORDER BY locality DESC, account_number DESC LIMIT 1) as last_account_number";
 
         var (accountsCount, tradesCount, lastLoc, lastAcct) = await DatabaseRetryHelper.ExecuteWithRetryAsync(async () =>
         {
-            await using var conn = dbContext.Database.GetDbConnection() as NpgsqlConnection;
-            if (conn == null) throw new InvalidOperationException("Expected NpgsqlConnection");
-
+            // Create fresh connection for each retry attempt (don't reuse DbContext connection)
+            await using var conn = new NpgsqlConnection(connectionString);
             await conn.OpenAsync();
             await using var cmd = new NpgsqlCommand(sql, conn);
             await using var reader = await cmd.ExecuteReaderAsync();
@@ -145,25 +149,25 @@ while (true)
                 var accountsCount = reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
                 var tradesCount = reader.IsDBNull(1) ? 0 : reader.GetInt64(1);
                 var lastLoc = reader.IsDBNull(2) ? (short?)null : reader.GetInt16(2);
-                var lastAcct = reader.IsDBNull(3) ? (Guid?)null : reader.GetGuid(3);
+                var lastAcct = reader.IsDBNull(3) ? null : reader.GetString(3);
                 return (accountsCount, tradesCount, lastLoc, lastAcct);
             }
 
-            return (0L, 0L, (short?)null, (Guid?)null);
+            return (0L, 0L, (short?)null, (string?)null);
         }, logger, $"[Loop {loopCount}] batch insert trades");
 
         if (accountsCount == 0)
         {
             logger.LogInformation("Loop {Loop}: No more accounts with completed onboarding. Resetting pagination.", loopCount);
             lastLocality = null;
-            lastAccountId = null;
+            lastAccountNumber = null;
             await Task.Delay(throttleMs);
             continue;
         }
 
         // Update pagination cursor
         lastLocality = lastLoc;
-        lastAccountId = lastAcct;
+        lastAccountNumber = lastAcct;
 
         var tradesCreated = (int)tradesCount;
         processedCount += tradesCreated;
