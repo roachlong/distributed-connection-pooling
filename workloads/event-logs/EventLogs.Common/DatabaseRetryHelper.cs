@@ -77,6 +77,41 @@ public static class DatabaseRetryHelper
                 logger.LogDebug("{Operation} duplicate key ignored (23505)", operationName);
                 return default!; // Operation already completed, treat as success
             }
+            catch (NpgsqlException ex) when (ex.InnerException is TimeoutException ||
+                                              ex.Message.Contains("Timeout") ||
+                                              ex.Message.Contains("timeout"))
+            {
+                // Network/read timeout - RETRY
+                retryAttempt++;
+                if (retryAttempt > maxRetries)
+                {
+                    logger.LogError(ex, "{Operation} failed after {MaxRetries} timeout retries",
+                        operationName, maxRetries);
+                    throw;
+                }
+
+                var delayMs = CalculateBackoffMs(retryAttempt);
+                logger.LogWarning("{Operation} timeout error, retry {Attempt}/{Max} after {Delay}ms",
+                    operationName, retryAttempt, maxRetries, delayMs);
+                await Task.Delay(delayMs, cancellationToken);
+            }
+            catch (NpgsqlException ex) when (ex.InnerException is System.IO.IOException ||
+                                              ex.InnerException is System.Net.Sockets.SocketException)
+            {
+                // Network I/O errors - RETRY
+                retryAttempt++;
+                if (retryAttempt > maxRetries)
+                {
+                    logger.LogError(ex, "{Operation} failed after {MaxRetries} network retries",
+                        operationName, maxRetries);
+                    throw;
+                }
+
+                var delayMs = CalculateBackoffMs(retryAttempt);
+                logger.LogWarning("{Operation} network I/O error, retry {Attempt}/{Max} after {Delay}ms",
+                    operationName, retryAttempt, maxRetries, delayMs);
+                await Task.Delay(delayMs, cancellationToken);
+            }
         }
 
         throw new InvalidOperationException($"{operationName} exceeded retry loop without throwing");

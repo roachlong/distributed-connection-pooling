@@ -6,15 +6,31 @@ namespace EventLogs.Common;
 /// <summary>
 /// Computes locality hash matching CockroachDB's crc32ieee() function.
 /// This allows client-side determination of which region an account belongs to.
+/// Used for routing decisions (selecting the correct gateway), but the locality
+/// value itself is auto-calculated by the database.
 /// </summary>
 public static class LocalityHasher
 {
     private const int TotalBuckets = 30;
 
     /// <summary>
-    /// Computes the locality bucket (0-29) for a given account ID.
+    /// Computes the locality bucket (0-29) for a given account number.
+    /// Matches CockroachDB's: mod(crc32ieee(account_number), 30)
+    /// </summary>
+    public static short ComputeLocality(string accountNumber)
+    {
+        var bytes = Encoding.UTF8.GetBytes(accountNumber);
+        var crc32 = Crc32.Hash(bytes);
+        var hash = BitConverter.ToUInt32(crc32, 0);
+        return (short)(hash % TotalBuckets);
+    }
+
+    /// <summary>
+    /// [DEPRECATED] Computes the locality bucket (0-29) for a given account ID (GUID).
+    /// Only used with the old UUID-based account_info schema.
     /// Matches CockroachDB's: mod(crc32ieee(account_id::BYTES), 30)
     /// </summary>
+    [Obsolete("Use ComputeLocality(string accountNumber) instead. This method is for backward compatibility with UUID-based schema only.")]
     public static short ComputeLocality(Guid accountId)
     {
         var bytes = accountId.ToByteArray();

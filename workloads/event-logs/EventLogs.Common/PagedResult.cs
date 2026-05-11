@@ -12,9 +12,9 @@ public class PagedResult<T, TCursor> where T : class
 }
 
 /// <summary>
-/// Cursor for account_info pagination (locality + account_id).
+/// Cursor for account_info pagination (locality + account_number).
 /// </summary>
-public record AccountCursor(short Locality, Guid AccountId);
+public record AccountCursor(short Locality, string AccountNumber);
 
 /// <summary>
 /// Cursor for trade_info pagination (created_ts + trade_id).

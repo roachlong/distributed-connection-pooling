@@ -8,12 +8,14 @@ public class RegionalConfig
 {
     /// <summary>
     /// The region this app instance is deployed in (us-east, us-central, us-west).
+    /// Optional when UseGeoPartitioning is false.
     /// </summary>
     public string Region { get; set; } = "us-east";
 
     /// <summary>
     /// Locality buckets owned by this region.
     /// us-east: 0-9, us-central: 10-19, us-west: 20-29
+    /// Optional when UseGeoPartitioning is false.
     /// </summary>
     public short[] LocalityBuckets { get; set; } = Array.Empty<short>();
 
@@ -34,26 +36,35 @@ public class RegionalConfig
     public string KafkaTopic { get; set; } = string.Empty;
 
     /// <summary>
+    /// Whether to use geo-partitioning features (REGIONAL BY ROW, crdb_region column).
+    /// Set to false for initial non-geo-partitioned schema, true after applying geo-partitioning migration.
+    /// </summary>
+    public bool UseGeoPartitioning { get; set; } = false;
+
+    /// <summary>
     /// Validates that the configuration is complete.
     /// </summary>
     public void Validate()
     {
-        if (string.IsNullOrWhiteSpace(Region))
-            throw new InvalidOperationException("Region must be configured");
-
-        if (LocalityBuckets == null || LocalityBuckets.Length == 0)
-            throw new InvalidOperationException("LocalityBuckets must be configured");
-
         if (string.IsNullOrWhiteSpace(ConnectionString))
             throw new InvalidOperationException("ConnectionString must be configured");
 
-        // Verify locality buckets match region
-        var expectedBuckets = LocalityHasher.GetLocalityBucketsForRegion(Region);
-        if (!LocalityBuckets.OrderBy(b => b).SequenceEqual(expectedBuckets.OrderBy(b => b)))
+        if (UseGeoPartitioning)
         {
-            throw new InvalidOperationException(
-                $"LocalityBuckets {string.Join(",", LocalityBuckets)} do not match region {Region}. " +
-                $"Expected: {string.Join(",", expectedBuckets)}");
+            if (string.IsNullOrWhiteSpace(Region))
+                throw new InvalidOperationException("Region must be configured when UseGeoPartitioning is true");
+
+            if (LocalityBuckets == null || LocalityBuckets.Length == 0)
+                throw new InvalidOperationException("LocalityBuckets must be configured when UseGeoPartitioning is true");
+
+            // Verify locality buckets match region
+            var expectedBuckets = LocalityHasher.GetLocalityBucketsForRegion(Region);
+            if (!LocalityBuckets.OrderBy(b => b).SequenceEqual(expectedBuckets.OrderBy(b => b)))
+            {
+                throw new InvalidOperationException(
+                    $"LocalityBuckets {string.Join(",", LocalityBuckets)} do not match region {Region}. " +
+                    $"Expected: {string.Join(",", expectedBuckets)}");
+            }
         }
     }
 }
