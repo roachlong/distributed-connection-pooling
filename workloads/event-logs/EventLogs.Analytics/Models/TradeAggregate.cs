@@ -15,7 +15,7 @@ public class TradeDetail
 {
     public Guid TradeId { get; set; }
     public Guid RequestId { get; set; }
-    public Guid AccountId { get; set; }
+    public string AccountNumber { get; set; } = "";
     public string Symbol { get; set; } = "";
     public string Side { get; set; } = "";
     public decimal Quantity { get; set; }

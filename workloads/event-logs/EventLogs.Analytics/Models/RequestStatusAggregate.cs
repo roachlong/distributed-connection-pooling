@@ -24,7 +24,7 @@ public class RequestDetail
     public DateTime CreatedAt { get; set; }
     public DateTime UpdatedAt { get; set; }
     public string RequestedBy { get; set; } = "";
-    public Guid AccountId { get; set; }
+    public string AccountNumber { get; set; } = "";
 }
 
 public class EventLogEntry

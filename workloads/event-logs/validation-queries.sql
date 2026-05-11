@@ -41,7 +41,7 @@ WITH alignment_check AS (
       ELSE 0
     END AS is_correct
   FROM account_info ai
-  JOIN request_info ri ON ai.account_id = ri.primary_account_id
+  JOIN request_info ri ON ai.account_number = ri.primary_account_number
 )
 SELECT
   'Request-Account Alignment' AS check_name,
@@ -61,7 +61,7 @@ FROM (
     ai.computed_region::TEXT AS expected_region,
     ri.crdb_region::TEXT AS actual_region
   FROM account_info ai
-  JOIN request_info ri ON ai.account_id = ri.primary_account_id
+  JOIN request_info ri ON ai.account_number = ri.primary_account_number
   WHERE ai.computed_region::TEXT != ri.crdb_region::TEXT
 )
 GROUP BY expected_region, actual_region
@@ -118,7 +118,7 @@ WITH trade_alignment AS (
       ELSE 0
     END AS is_correct
   FROM account_info ai
-  JOIN trade_info ti ON ai.account_id = ti.account_id
+  JOIN trade_info ti ON ai.account_number = ti.account_number
 )
 SELECT
   'Trade-Account Alignment' AS check_name,
@@ -138,7 +138,7 @@ FROM (
     ai.computed_region::TEXT AS expected_region,
     ti.crdb_region::TEXT AS actual_region
   FROM account_info ai
-  JOIN trade_info ti ON ai.account_id = ti.account_id
+  JOIN trade_info ti ON ai.account_number = ti.account_number
   WHERE ai.computed_region::TEXT != ti.crdb_region::TEXT
 )
 GROUP BY expected_region, actual_region
@@ -298,7 +298,7 @@ WITH regional_accounts AS (
     ai.computed_region::STRING AS account_region
   FROM request_info ri
   JOIN request_account_link ral ON ri.request_id = ral.request_id
-  JOIN account_info ai ON ral.account_id = ai.account_id
+  JOIN account_info ai ON ral.account_number = ai.account_number
 )
 SELECT
   request_id,
@@ -349,7 +349,7 @@ SELECT
   COUNT(*) AS trade_count,
   SUM(ti.quantity) AS total_quantity
 FROM account_info ai
-JOIN trade_info ti ON ai.account_id = ti.account_id
+JOIN trade_info ti ON ai.account_number = ti.account_number
 GROUP BY ai.computed_region, ti.side
 ORDER BY ai.computed_region, ti.side;
 
@@ -363,7 +363,7 @@ WITH request_alignment AS (
   SELECT
     CASE WHEN ai.computed_region = ri.crdb_region THEN 1 ELSE 0 END AS is_correct
   FROM account_info ai
-  JOIN request_info ri ON ai.account_id = ri.primary_account_id
+  JOIN request_info ri ON ai.account_number = ri.primary_account_number
 ),
 event_alignment AS (
   SELECT
@@ -375,7 +375,7 @@ trade_alignment AS (
   SELECT
     CASE WHEN ai.computed_region = ti.crdb_region THEN 1 ELSE 0 END AS is_correct
   FROM account_info ai
-  JOIN trade_info ti ON ai.account_id = ti.account_id
+  JOIN trade_info ti ON ai.account_number = ti.account_number
 ),
 status_head_alignment AS (
   SELECT

@@ -53,7 +53,7 @@
                         <MudCard Outlined="true">
                             <MudCardContent>
                                 <MudText Typo="Typo.caption">Unique Accounts</MudText>
-                                <MudText Typo="Typo.h5">@Details.Select(d => d.AccountId).Distinct().Count()</MudText>
+                                <MudText Typo="Typo.h5">@Details.Select(d => d.AccountNumber).Distinct().Count()</MudText>
                             </MudCardContent>
                         </MudCard>
                     </MudItem>
@@ -65,7 +65,7 @@
                     <HeaderContent>
                         <MudTh>Trade ID</MudTh>
                         <MudTh>Request ID</MudTh>
-                        <MudTh>Account ID</MudTh>
+                        <MudTh>Account Number</MudTh>
                         <MudTh>Quantity</MudTh>
                         <MudTh>Price</MudTh>
                         <MudTh>Currency</MudTh>
@@ -82,9 +82,9 @@
                                 @context.RequestId.ToString().Substring(0, 8)...
                             </MudText>
                         </MudTd>
-                        <MudTd DataLabel="Account ID">
+                        <MudTd DataLabel="Account Number">
                             <MudText Typo="Typo.caption" Style="font-family: monospace;">
-                                @context.AccountId.ToString().Substring(0, 8)...
+                                @context.AccountNumber.Substring(0, Math.Min(8, context.AccountNumber.Length))...
                             </MudText>
                         </MudTd>
                         <MudTd DataLabel="Quantity">@context.Quantity.ToString("N2")</MudTd>

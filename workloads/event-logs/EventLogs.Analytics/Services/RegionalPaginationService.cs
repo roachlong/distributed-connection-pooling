@@ -18,6 +18,7 @@ public class RegionalPaginationService
     private readonly object _metricsLock = new();
     private Action<GlobalMetrics>? _metricsCallback;
     private DateTime? _overallStartTime;
+    private readonly bool _useGeoPartitioning;
 
     public RegionalPaginationService(
         IConfiguration configuration,
@@ -25,6 +26,8 @@ public class RegionalPaginationService
     {
         _configuration = configuration;
         _logger = logger;
+        _useGeoPartitioning = configuration.GetValue<bool>("UseGeoPartitioning", false);
+        _logger.LogInformation("RegionalPaginationService initialized with UseGeoPartitioning={UseGeoPartitioning}", _useGeoPartitioning);
     }
 
     public async Task<List<RequestStatusAggregate>> FetchRequestStatusAggregatesAsync(
@@ -273,13 +276,13 @@ public class RegionalPaginationService
 
         UpdateConnectionMetrics(gateway, conn);
 
-        // Use keyset pagination with follower reads starting from cursor position - query all regions through this gateway
-        await using var cmd = new NpgsqlCommand(@"
+        // Build query conditionally - include crdb_region only if using geo-partitioning
+        var selectRegion = _useGeoPartitioning ? ", rsh.crdb_region" : "";
+        var sql = $@"
             SELECT
                 rsh.request_id,
                 rt.request_type_code,
-                rs.status_code,
-                rsh.crdb_region
+                rs.status_code{selectRegion}
             FROM request_status_head rsh
             JOIN request_info ri ON rsh.request_id = ri.request_id
             JOIN request_type rt ON ri.request_type_id = rt.request_type_id
@@ -288,7 +291,9 @@ public class RegionalPaginationService
             WHERE rsh.request_id >= @startRequestId
             ORDER BY rsh.request_id
             LIMIT @pageSize
-        ", conn);
+        ";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
 
         cmd.Parameters.AddWithValue("pageSize", pageSize);
         cmd.Parameters.AddWithValue("startRequestId", cursor.StartRequestId);
@@ -296,25 +301,51 @@ public class RegionalPaginationService
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
 
         // Count occurrences for aggregation
-        var pageCounts = new Dictionary<(string requestType, string status, string region), int>();
-        while (await reader.ReadAsync(cancellationToken))
+        if (_useGeoPartitioning)
         {
-            newLastRequestId = reader.GetGuid(0);
-            var key = (reader.GetString(1), reader.GetString(2), reader.GetString(3));
-            pageCounts[key] = pageCounts.GetValueOrDefault(key, 0) + 1;
-            rowCount++;
-        }
-
-        // Convert to aggregates
-        foreach (var kvp in pageCounts)
-        {
-            aggregates.Add(new RequestStatusAggregate
+            var pageCounts = new Dictionary<(string requestType, string status, string region), int>();
+            while (await reader.ReadAsync(cancellationToken))
             {
-                RequestType = kvp.Key.requestType,
-                Status = kvp.Key.status,
-                Region = kvp.Key.region,
-                Count = kvp.Value
-            });
+                newLastRequestId = reader.GetGuid(0);
+                var key = (reader.GetString(1), reader.GetString(2), reader.GetString(3));
+                pageCounts[key] = pageCounts.GetValueOrDefault(key, 0) + 1;
+                rowCount++;
+            }
+
+            // Convert to aggregates
+            foreach (var kvp in pageCounts)
+            {
+                aggregates.Add(new RequestStatusAggregate
+                {
+                    RequestType = kvp.Key.requestType,
+                    Status = kvp.Key.status,
+                    Region = kvp.Key.region,
+                    Count = kvp.Value
+                });
+            }
+        }
+        else
+        {
+            var pageCounts = new Dictionary<(string requestType, string status), int>();
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                newLastRequestId = reader.GetGuid(0);
+                var key = (reader.GetString(1), reader.GetString(2));
+                pageCounts[key] = pageCounts.GetValueOrDefault(key, 0) + 1;
+                rowCount++;
+            }
+
+            // Convert to aggregates (no region info)
+            foreach (var kvp in pageCounts)
+            {
+                aggregates.Add(new RequestStatusAggregate
+                {
+                    RequestType = kvp.Key.requestType,
+                    Status = kvp.Key.status,
+                    Region = "all",  // No regional partitioning
+                    Count = kvp.Value
+                });
+            }
         }
 
         sw.Stop();
@@ -461,8 +492,9 @@ public class RegionalPaginationService
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync(cancellationToken);
 
-        // Use window function to find page boundaries WITHOUT fetching actual data
-        await using var cmd = new NpgsqlCommand(@"
+        // Build query conditionally based on geo-partitioning setting
+        var whereClause = _useGeoPartitioning ? "WHERE rsh.crdb_region = @region" : "";
+        var sql = $@"
             SELECT
                 t.request_id,
                 t.rn,
@@ -472,13 +504,18 @@ public class RegionalPaginationService
                     rsh.request_id,
                     row_number() OVER (ORDER BY rsh.request_id) as rn
                 FROM request_status_head rsh
-                WHERE rsh.crdb_region = @region
+                {whereClause}
             ) t AS OF SYSTEM TIME follower_read_timestamp()
             WHERE (t.rn - 1) % @pageSize = 0
             ORDER BY t.request_id
-        ", conn);
+        ";
 
-        cmd.Parameters.AddWithValue("region", region);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+
+        if (_useGeoPartitioning)
+        {
+            cmd.Parameters.AddWithValue("region", region);
+        }
         cmd.Parameters.AddWithValue("pageSize", pageSize);
 
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
@@ -513,8 +550,12 @@ public class RegionalPaginationService
 
         UpdateConnectionMetrics(region, conn);
 
-        // Use keyset pagination with follower reads starting from cursor position
-        await using var cmd = new NpgsqlCommand(@"
+        // Build query conditionally based on geo-partitioning setting
+        var whereClause = _useGeoPartitioning
+            ? "WHERE rsh.crdb_region = @region AND rsh.request_id >= @startRequestId"
+            : "WHERE rsh.request_id >= @startRequestId";
+
+        var sql = $@"
             SELECT
                 rsh.request_id,
                 rt.request_type_code,
@@ -524,13 +565,17 @@ public class RegionalPaginationService
             JOIN request_type rt ON ri.request_type_id = rt.request_type_id
             JOIN request_status rs ON rsh.status_id = rs.status_id
             AS OF SYSTEM TIME follower_read_timestamp()
-            WHERE rsh.crdb_region = @region
-              AND rsh.request_id >= @startRequestId
+            {whereClause}
             ORDER BY rsh.request_id
             LIMIT @pageSize
-        ", conn);
+        ";
 
-        cmd.Parameters.AddWithValue("region", region);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+
+        if (_useGeoPartitioning)
+        {
+            cmd.Parameters.AddWithValue("region", region);
+        }
         cmd.Parameters.AddWithValue("pageSize", pageSize);
         cmd.Parameters.AddWithValue("startRequestId", cursor.StartRequestId);
 
@@ -639,7 +684,7 @@ public class RegionalPaginationService
                 ri.created_ts,
                 rsh.event_ts,
                 ri.requested_by,
-                ri.primary_account_id
+                ri.primary_account_number
             FROM request_status_head rsh
             JOIN request_info ri ON rsh.request_id = ri.request_id
             JOIN request_type rt ON ri.request_type_id = rt.request_type_id
@@ -670,7 +715,7 @@ public class RegionalPaginationService
                 CreatedAt = reader.GetDateTime(4),
                 UpdatedAt = reader.GetDateTime(5),
                 RequestedBy = reader.GetString(6),
-                AccountId = reader.GetGuid(7)
+                AccountNumber = reader.GetString(7)
             });
         }
 
@@ -923,8 +968,9 @@ public class RegionalPaginationService
         await using var conn = new NpgsqlConnection(connectionString);
         await conn.OpenAsync(cancellationToken);
 
-        // Use window function to find page boundaries WITHOUT fetching actual data
-        await using var cmd = new NpgsqlCommand(@"
+        // Build query conditionally based on geo-partitioning setting
+        var whereClause = _useGeoPartitioning ? "WHERE ti.crdb_region = @region" : "";
+        var sql = $@"
             SELECT
                 t.trade_id,
                 t.rn,
@@ -934,13 +980,18 @@ public class RegionalPaginationService
                     ti.trade_id,
                     row_number() OVER (ORDER BY ti.trade_id) as rn
                 FROM trade_info ti
-                WHERE ti.crdb_region = @region
+                {whereClause}
             ) t AS OF SYSTEM TIME follower_read_timestamp()
             WHERE (t.rn - 1) % @pageSize = 0
             ORDER BY t.trade_id
-        ", conn);
+        ";
 
-        cmd.Parameters.AddWithValue("region", region);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+
+        if (_useGeoPartitioning)
+        {
+            cmd.Parameters.AddWithValue("region", region);
+        }
         cmd.Parameters.AddWithValue("pageSize", pageSize);
 
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
@@ -981,63 +1032,110 @@ public class RegionalPaginationService
 
         UpdateConnectionMetrics(region, conn);
 
-        // Use keyset pagination with follower reads starting from cursor position
-        await using var cmd = new NpgsqlCommand(@"
+        // Build query conditionally based on geo-partitioning setting
+        var selectRegion = _useGeoPartitioning ? ", ti.crdb_region" : "";
+        var whereClause = _useGeoPartitioning
+            ? "WHERE ti.crdb_region = @region AND ti.trade_id >= @startTradeId"
+            : "WHERE ti.trade_id >= @startTradeId";
+
+        var sql = $@"
             SELECT
                 ti.trade_id,
                 ti.side,
                 rs.status_code,
-                ti.symbol,
-                ti.crdb_region,
+                ti.symbol{selectRegion},
                 ti.quantity,
                 ti.price
             FROM trade_info ti
             JOIN request_status rs ON ti.status_id = rs.status_id
             AS OF SYSTEM TIME follower_read_timestamp()
-            WHERE ti.crdb_region = @region
-              AND ti.trade_id >= @startTradeId
+            {whereClause}
             ORDER BY ti.trade_id
             LIMIT @pageSize
-        ", conn);
+        ";
 
-        cmd.Parameters.AddWithValue("region", region);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+
+        if (_useGeoPartitioning)
+        {
+            cmd.Parameters.AddWithValue("region", region);
+        }
         cmd.Parameters.AddWithValue("pageSize", pageSize);
         cmd.Parameters.AddWithValue("startTradeId", cursor.StartTradeId);
 
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
 
-        var pageCounts = new Dictionary<(string side, string status, string symbol, string region), (int count, decimal totalQty, decimal totalPrice, int priceCount)>();
-        while (await reader.ReadAsync(cancellationToken))
+        if (_useGeoPartitioning)
         {
-            newLastTradeId = reader.GetGuid(0);
-            var key = (reader.GetString(1), reader.GetString(2), reader.GetString(3), reader.GetString(4));
-            var quantity = reader.GetDecimal(5);
-            var price = reader.IsDBNull(6) ? 0m : reader.GetDecimal(6);
+            var pageCounts = new Dictionary<(string side, string status, string symbol, string region), (int count, decimal totalQty, decimal totalPrice, int priceCount)>();
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                newLastTradeId = reader.GetGuid(0);
+                var key = (reader.GetString(1), reader.GetString(2), reader.GetString(3), reader.GetString(4));
+                var quantity = reader.GetDecimal(5);
+                var price = reader.IsDBNull(6) ? 0m : reader.GetDecimal(6);
 
-            if (pageCounts.ContainsKey(key))
-            {
-                var current = pageCounts[key];
-                pageCounts[key] = (current.count + 1, current.totalQty + quantity, current.totalPrice + (price > 0 ? price : 0), current.priceCount + (price > 0 ? 1 : 0));
+                if (pageCounts.ContainsKey(key))
+                {
+                    var current = pageCounts[key];
+                    pageCounts[key] = (current.count + 1, current.totalQty + quantity, current.totalPrice + (price > 0 ? price : 0), current.priceCount + (price > 0 ? 1 : 0));
+                }
+                else
+                {
+                    pageCounts[key] = (1, quantity, price > 0 ? price : 0, price > 0 ? 1 : 0);
+                }
+                rowCount++;
             }
-            else
+
+            foreach (var kvp in pageCounts)
             {
-                pageCounts[key] = (1, quantity, price > 0 ? price : 0, price > 0 ? 1 : 0);
+                aggregates.Add(new TradeAggregate
+                {
+                    Side = kvp.Key.side,
+                    Status = kvp.Key.status,
+                    Symbol = kvp.Key.symbol,
+                    Region = kvp.Key.region,
+                    Count = kvp.Value.count,
+                    TotalQuantity = kvp.Value.totalQty,
+                    AveragePrice = kvp.Value.priceCount > 0 ? kvp.Value.totalPrice / kvp.Value.priceCount : 0
+                });
             }
-            rowCount++;
         }
-
-        foreach (var kvp in pageCounts)
+        else
         {
-            aggregates.Add(new TradeAggregate
+            var pageCounts = new Dictionary<(string side, string status, string symbol), (int count, decimal totalQty, decimal totalPrice, int priceCount)>();
+            while (await reader.ReadAsync(cancellationToken))
             {
-                Side = kvp.Key.side,
-                Status = kvp.Key.status,
-                Symbol = kvp.Key.symbol,
-                Region = kvp.Key.region,
-                Count = kvp.Value.count,
-                TotalQuantity = kvp.Value.totalQty,
-                AveragePrice = kvp.Value.priceCount > 0 ? kvp.Value.totalPrice / kvp.Value.priceCount : 0
-            });
+                newLastTradeId = reader.GetGuid(0);
+                var key = (reader.GetString(1), reader.GetString(2), reader.GetString(3));
+                var quantity = reader.GetDecimal(4);
+                var price = reader.IsDBNull(5) ? 0m : reader.GetDecimal(5);
+
+                if (pageCounts.ContainsKey(key))
+                {
+                    var current = pageCounts[key];
+                    pageCounts[key] = (current.count + 1, current.totalQty + quantity, current.totalPrice + (price > 0 ? price : 0), current.priceCount + (price > 0 ? 1 : 0));
+                }
+                else
+                {
+                    pageCounts[key] = (1, quantity, price > 0 ? price : 0, price > 0 ? 1 : 0);
+                }
+                rowCount++;
+            }
+
+            foreach (var kvp in pageCounts)
+            {
+                aggregates.Add(new TradeAggregate
+                {
+                    Side = kvp.Key.side,
+                    Status = kvp.Key.status,
+                    Symbol = kvp.Key.symbol,
+                    Region = region,
+                    Count = kvp.Value.count,
+                    TotalQuantity = kvp.Value.totalQty,
+                    AveragePrice = kvp.Value.priceCount > 0 ? kvp.Value.totalPrice / kvp.Value.priceCount : 0
+                });
+            }
         }
 
         sw.Stop();
@@ -1331,7 +1429,7 @@ public class RegionalPaginationService
             SELECT
                 ti.trade_id,
                 ti.request_id,
-                ti.account_id,
+                ti.account_number,
                 ti.symbol,
                 ti.side,
                 ti.quantity,
@@ -1365,7 +1463,7 @@ public class RegionalPaginationService
             {
                 TradeId = reader.GetGuid(0),
                 RequestId = reader.GetGuid(1),
-                AccountId = reader.GetGuid(2),
+                AccountNumber = reader.GetString(2),
                 Symbol = reader.GetString(3),
                 Side = reader.GetString(4),
                 Quantity = reader.GetDecimal(5),

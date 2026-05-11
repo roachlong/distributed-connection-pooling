@@ -17,7 +17,7 @@
                     FixedHeader="true" Height="500px">
                     <HeaderContent>
                         <MudTh>Request ID</MudTh>
-                        <MudTh>Account ID</MudTh>
+                        <MudTh>Account Number</MudTh>
                         <MudTh>Requested By</MudTh>
                         <MudTh>Created At</MudTh>
                         <MudTh>Updated At</MudTh>
@@ -29,9 +29,9 @@
                                 @context.RequestId.ToString().Substring(0, 8)...
                             </MudText>
                         </MudTd>
-                        <MudTd DataLabel="Account ID">
+                        <MudTd DataLabel="Account Number">
                             <MudText Typo="Typo.caption" Style="font-family: monospace;">
-                                @context.AccountId.ToString().Substring(0, 8)...
+                                @context.AccountNumber.Substring(0, Math.Min(8, context.AccountNumber.Length))...
                             </MudText>
                         </MudTd>
                         <MudTd DataLabel="Requested By">@context.RequestedBy</MudTd>
