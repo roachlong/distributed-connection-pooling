@@ -74,6 +74,7 @@ CREATE TABLE account_info_new (
     base_currency   STRING NULL,
 
     -- Hash-based locality bucket [0..29] derived from account_number
+    -- Kept for application filtering but NOT in primary key for better distribution
     locality INT2 NOT NULL AS (
         mod(
             crc32ieee(account_number),
@@ -100,12 +101,13 @@ CREATE TABLE account_info_new (
         END
     ) STORED NOT NULL,
 
-    CONSTRAINT pk_account_info_new PRIMARY KEY (locality, account_number)
+    CONSTRAINT pk_account_info_new PRIMARY KEY (account_number)
 ) LOCALITY REGIONAL BY ROW AS computed_region;
 
--- Step 3.2: Create secondary index on new table
-CREATE INDEX account_info_new_by_number
-ON account_info_new (account_number)
+-- Step 3.2: Create secondary index for locality-based filtering
+-- Used by RequestGenerator and TradeGenerator for regional data access
+CREATE INDEX account_info_new_by_locality
+ON account_info_new (locality, account_number)
 STORING (account_name, strategy, base_currency);
 
 -- Step 3.3: Copy data from old table to new table
@@ -201,10 +203,10 @@ ORDER BY computed_region;
 --    - For now, they continue to work as-is with no locality constraints
 --
 -- 4. Primary Key Design:
---    - (locality, account_number) ensures data is partitioned by locality
---    - Since locality is part of the key, CockroachDB does NOT perform
---      cross-region uniqueness checks for the primary key
---    - This is critical for performance in the hybrid approach
+--    - PRIMARY KEY (account_number) for simpler key structure and better distribution
+--    - locality column kept as STORED computed for application filtering
+--    - Secondary index on (locality, account_number) supports regional queries
+--    - CockroachDB auto-splits based on account_number distribution and load
 --
 -- 5. Hybrid Strategy in Phase 2:
 --    - account_info: REGIONAL BY ROW AS computed_region (deterministic)
