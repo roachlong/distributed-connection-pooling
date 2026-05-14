@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations  # PEP 604 style hints on Python 3.8+
+
 import argparse
 import json
 import math
@@ -9,6 +11,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# WARNING: Host-key verification is disabled for ephemeral cloud instances.
+# Do NOT use these options for persistent / production infrastructure.
 SSH_OPTS = (
     "-o StrictHostKeyChecking=no "
     "-o UserKnownHostsFile=/dev/null "
@@ -29,8 +33,14 @@ class PhasePolicy(str, Enum):
 # Shell helpers
 # ----------------------------
 
+def _redact_cmd(cmd: str) -> str:
+    """Strip passwords from commands before printing to stdout."""
+    import re
+    return re.sub(r"(PASSWORD\s+)'[^']*'", r"\1'***'", cmd)
+
+
 def run(cmd: str, cwd: Optional[str] = None, check: bool = True) -> str:
-    print(f"\n>>> {cmd}")
+    print(f"\n>>> {_redact_cmd(cmd)}")
     p = subprocess.run(
         cmd,
         shell=True,
@@ -41,7 +51,7 @@ def run(cmd: str, cwd: Optional[str] = None, check: bool = True) -> str:
     )
     print(p.stdout)
     if check and p.returncode != 0:
-        raise RuntimeError(f"Command failed: {cmd}")
+        raise RuntimeError(f"Command failed (exit {p.returncode})")
     return p.stdout.strip()
 
 
@@ -70,10 +80,15 @@ def scp_file(host: str, ssh_user: str, ssh_key: str, local_path: Path, remote_pa
 
 
 def scp_text(host: str, ssh_user: str, ssh_key: str, remote_path: str, content: str) -> None:
-    with tempfile.TemporaryDirectory() as td:
-        p = Path(td) / Path(remote_path).name
-        p.write_text(content)
-        scp_file(host, ssh_user, ssh_key, p, remote_path)
+    import os
+    old_umask = os.umask(0o077)  # temp files may contain secrets — restrict permissions
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / Path(remote_path).name
+            p.write_text(content)
+            scp_file(host, ssh_user, ssh_key, p, remote_path)
+    finally:
+        os.umask(old_umask)
 
 
 def can_ssh(host: str, ssh_user: str, ssh_key: str, timeout: int = 5) -> bool:
@@ -200,15 +215,12 @@ def wait_for_expected_nodes(
         header = lines[0].split("\t")
         rows = [l.split("\t") for l in lines[1:]]
 
-        if "is_live" not in header:
-            print(f"   Unexpected output, retrying: {header}")
-            time.sleep(5)
-            continue
-        
         try:
             is_live_idx = header.index("is_live")
         except ValueError:
-            raise RuntimeError(f"Unexpected node status header: {header}")
+            print(f"   Unexpected output (no is_live column), retrying: {header}")
+            time.sleep(5)
+            continue
 
         live = [r for r in rows if len(r) > is_live_idx and r[is_live_idx] == "true"]
 
@@ -323,18 +335,26 @@ DNS.2 = localhost
 # Remote installs
 # ----------------------------
 
-def install_crdb_certs(node: Dict[str, Any], ssh_user: str, ssh_key: str, certs_dir: Path) -> None:
+def install_crdb_certs(node: Dict[str, Any], ssh_user: str, ssh_key: str, certs_dir: Path,
+                       include_root_certs: bool = False) -> None:
     host = node["public_dns"]
     # Copy CA + node.* to node, then move into /var/lib/cockroach/certs
     run(f"scp -i {ssh_key} {SSH_OPTS} {certs_dir/'ca.crt'} {ssh_user}@{host}:/tmp/ca.crt")
     run(f"scp -i {ssh_key} {SSH_OPTS} {certs_dir/'node.crt'} {ssh_user}@{host}:/tmp/node.crt")
     run(f"scp -i {ssh_key} {SSH_OPTS} {certs_dir/'node.key'} {ssh_user}@{host}:/tmp/node.key")
-    run(f"scp -i {ssh_key} {SSH_OPTS} {certs_dir/'client.root.crt'} {ssh_user}@{host}:/tmp/client.root.crt")
-    run(f"scp -i {ssh_key} {SSH_OPTS} {certs_dir/'client.root.key'} {ssh_user}@{host}:/tmp/client.root.key")
+
+    # Only install root client certs on the seed node (for cockroach init / SQL admin).
+    # Other nodes only need the CA and their own node certs.
+    root_files = ""
+    if include_root_certs:
+        run(f"scp -i {ssh_key} {SSH_OPTS} {certs_dir/'client.root.crt'} {ssh_user}@{host}:/tmp/client.root.crt")
+        run(f"scp -i {ssh_key} {SSH_OPTS} {certs_dir/'client.root.key'} {ssh_user}@{host}:/tmp/client.root.key")
+        root_files = "/tmp/client.root.crt /tmp/client.root.key"
+
     run(f"""
 ssh -i {ssh_key} {SSH_OPTS} {ssh_user}@{host} <<'EOF'
 sudo mkdir -p /var/lib/cockroach/certs
-sudo mv /tmp/ca.crt /tmp/node.crt /tmp/node.key /tmp/client.root.crt /tmp/client.root.key /var/lib/cockroach/certs/
+sudo mv /tmp/ca.crt /tmp/node.crt /tmp/node.key {root_files} /var/lib/cockroach/certs/
 sudo chown -R cockroach:cockroach /var/lib/cockroach
 sudo chmod 0644 /var/lib/cockroach/certs/*.crt
 sudo chmod 0600 /var/lib/cockroach/certs/*.key
@@ -427,15 +447,13 @@ def init_cluster(seed_node: Dict[str, Any], ssh_user: str, ssh_key: str, db_port
         "--certs-dir=/var/lib/cockroach/certs "
         f"--host={seed}"
     )
-    out = ssh(seed_node["public_dns"], ssh_user, ssh_key, cmd)
+    out = ssh(seed_node["public_dns"], ssh_user, ssh_key, cmd, check=False)
     if "already initialized" in out.lower() or "cluster has already been initialized" in out.lower():
         print("ℹ️ Cluster already initialized, continuing")
     elif "successfully initialized" in out.lower() or "initialized" in out.lower():
         print("✅ Cluster initialized")
     else:
-        # Cockroach init can be chatty; only fail if nonzero and not the known message
-        # run(..., check=False) already; keep conservative:
-        pass
+        raise RuntimeError(f"Unexpected cockroach init output: {out}")
 
 
 # ----------------------------
@@ -557,7 +575,7 @@ def render_haproxy_cfg(pgbouncer_ips: List[str], backend_ips: List[str], pgb_por
         "  maxconn 200000",
         "  log /dev/log local0",
         "  daemon",
-        "  stats socket /run/haproxy/admin.sock mode 660 level admin"
+        "  stats socket /run/haproxy/admin.sock mode 660 level admin",
         "",
         "defaults",
         "  mode tcp",
@@ -655,10 +673,11 @@ def validate_region_cert(region: str, dns_zone: str, certs_dir: Path, pgb_client
 
 def validate_region_password(region: str, dns_zone: str, username: str, password: str, database: str, pgb_port: int) -> None:
     pgb_host = f"pgb.{region}.{dns_zone}"
-    # sslmode=require is enough for TLS-on; switch to verify-full for strict hostname checks
+    # Use PGPASSWORD env var to avoid leaking the password in ps output and run() logging.
+    # sslmode=require is enough for TLS-on; switch to verify-full for strict hostname checks.
     run(
-        "psql "
-        f"\"host={pgb_host} port={pgb_port} dbname={database} user={username} password={password} sslmode=require\" "
+        f"PGPASSWORD={json.dumps(password)} psql "
+        f"\"host={pgb_host} port={pgb_port} dbname={database} user={username} sslmode=require\" "
         "-c 'SELECT 1;'"
     )
 
@@ -711,6 +730,7 @@ def parse_args():
 
     parser.add_argument("--pgb-client-user", default="postgres")
     parser.add_argument("--pgb-server-user", default="pgb")
+    # WARNING: demo-only default — always override with a strong password in production
     parser.add_argument("--password", default="appuser-password")
 
     # Validation
@@ -779,12 +799,14 @@ def main():
 
     if args.start_nodes != PhasePolicy.SKIP:
         # 4) node certs
-        for node in nodes:
+        for i, node in enumerate(nodes):
             wait_for_ssh(node["public_dns"], args.ssh_user, args.ssh_key, timeout=300)
             wait_for_cloud_init(node["public_dns"], args.ssh_user, args.ssh_key)
             if args.node_certs:
                 create_crdb_node_cert(node, args.dns_zone, certs_dir, ca_key)
-            install_crdb_certs(node, args.ssh_user, args.ssh_key, certs_dir)
+            # Only the seed node (first) needs root client certs for init/admin SQL
+            install_crdb_certs(node, args.ssh_user, args.ssh_key, certs_dir,
+                               include_root_certs=(i == 0))
 
         # 5) start Cockroach nodes
         install_and_start_crdb_service(

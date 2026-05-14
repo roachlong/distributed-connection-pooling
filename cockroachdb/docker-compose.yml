@@ -1,7 +1,7 @@
 services:
   us-east:
-    image: cockroachdb/cockroach:${CRDB_VERSION}
-    platform: linux/arm64
+    image: cockroachdb/cockroach:${CRDB_VERSION:?Set CRDB_VERSION e.g. export CRDB_VERSION=v24.3.1}
+    # platform: linux/arm64  # Uncomment if running on Apple Silicon; omit for amd64
     container_name: us-east
     hostname: us-east
     volumes:
@@ -32,8 +32,8 @@ services:
       - dcp-net
 
   us-central:
-    image: cockroachdb/cockroach:${CRDB_VERSION}
-    platform: linux/arm64
+    image: cockroachdb/cockroach:${CRDB_VERSION:?Set CRDB_VERSION e.g. export CRDB_VERSION=v24.3.1}
+    # platform: linux/arm64  # Uncomment if running on Apple Silicon; omit for amd64
     container_name: us-central
     hostname: us-central
     volumes:
@@ -61,8 +61,8 @@ services:
       - dcp-net
 
   us-west:
-    image: cockroachdb/cockroach:${CRDB_VERSION}
-    platform: linux/arm64
+    image: cockroachdb/cockroach:${CRDB_VERSION:?Set CRDB_VERSION e.g. export CRDB_VERSION=v24.3.1}
+    # platform: linux/arm64  # Uncomment if running on Apple Silicon; omit for amd64
     container_name: us-west
     hostname: us-west
     volumes:
@@ -90,8 +90,8 @@ services:
       - dcp-net
 
   init:
-    image: cockroachdb/cockroach:${CRDB_VERSION}
-    platform: linux/arm64
+    image: cockroachdb/cockroach:${CRDB_VERSION:?Set CRDB_VERSION e.g. export CRDB_VERSION=v24.3.1}
+    # platform: linux/arm64  # Uncomment if running on Apple Silicon; omit for amd64
     container_name: init
     depends_on:
       - us-east
@@ -115,4 +115,4 @@ volumes:
 
 networks:
   dcp-net:
-    external: true
+    external: true  # Run: docker network create dcp-net  before docker-compose up
