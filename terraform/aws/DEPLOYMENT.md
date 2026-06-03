@@ -82,17 +82,169 @@ No additional tfvars required beyond `permissions_boundary_arn` and optional `co
 
 ## Prerequisites
 
-Before proceeding, ensure:
+### AWS Account Setup
 
-1. ✅ AWS credentials configured (`aws sso login` or similar)
-2. ✅ Route53 public hosted zone created for DNS (optional but recommended)
-3. ✅ SSH key pair generated and imported to AWS regions
-4. ✅ `jq` installed for JSON parsing: `brew install jq` (macOS) or `apt install jq` (Linux)
+<details>
+<summary>AWS CLI and SSO Configuration (click to expand)</summary>
+
+**Update AWS CLI** (if needed):
+
+```bash
+# macOS
+curl -k "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "AWSCLIV2.pkg"
+sudo installer -pkg ./AWSCLIV2.pkg -target /
+rm AWSCLIV2.pkg
+echo "alias aws='/usr/local/bin/aws'" >> ~/.bashrc
+source ~/.bashrc
+which aws
+aws --version
+```
+
+**Configure AWS SSO and verify access:**
+
+```bash
+# Login via SSO
+aws sso login --profile crl-revenue
+
+# Verify access
+aws ec2 describe-instance-types --instance-types m6i.2xlarge
+```
+
+</details>
+
+### SSH Key Pair Setup
+
+Create an SSH key pair and import it to all regions you plan to deploy to:
+
+```bash
+# Create SSH key pair
+ssh-keygen -b 2048 -f dev
+mv ./dev ./my-safe-directory/. && mv ./dev.pub ./my-safe-directory/.
+
+# Import to all target regions
+aws ec2 import-key-pair \
+  --key-name dev \
+  --public-key-material fileb://./my-safe-directory/dev.pub \
+  --region us-east-1
+
+aws ec2 import-key-pair \
+  --key-name dev \
+  --public-key-material fileb://./my-safe-directory/dev.pub \
+  --region us-east-2
+
+aws ec2 import-key-pair \
+  --key-name dev \
+  --public-key-material fileb://./my-safe-directory/dev.pub \
+  --region us-west-1
+
+aws ec2 import-key-pair \
+  --key-name dev \
+  --public-key-material fileb://./my-safe-directory/dev.pub \
+  --region us-west-2
+```
+
+### Route53 Public Hosted Zone Setup
+
+Create a public hosted zone for DNS-based access to your cluster:
+
+```bash
+# Create hosted zone
+aws route53 create-hosted-zone \
+  --name dcp-test.crdb.com \
+  --caller-reference "$(date +%s)" \
+  --hosted-zone-config Comment="Public zone for DCP / Cockroach access",PrivateZone=false
+
+# Get nameservers for domain registrar configuration
+aws route53 get-hosted-zone --id Z09942323KHF5XIP6R8IR
+
+# Create a subdomain at your domain registrar pointing to the AWS nameservers above
+# Then verify DNS propagation
+dig NS dcp-test.crdb.com
+```
+
+### IAM Permissions for EIP Management
+
+If using corporate AWS accounts with SSO, you may need to create an inline policy for EIP management (required for HA failover):
+
+<details>
+<summary>IAM Policy JSON (click to expand)</summary>
+
+Add this inline policy to your SSO role or user:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowTerraformIAMForDCP",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:PassRole",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:CreateInstanceProfile",
+        "iam:DeleteInstanceProfile",
+        "iam:AddRoleToInstanceProfile",
+        "iam:RemoveRoleFromInstanceProfile",
+        "iam:GetInstanceProfile"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:role/crdb-dcp-*",
+        "arn:aws:iam::*:instance-profile/crdb-dcp-*"
+      ]
+    },
+    {
+      "Sid": "AllowEIPManagementForDCP",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:AllocateAddress",
+        "ec2:ReleaseAddress",
+        "ec2:AssociateAddress",
+        "ec2:DisassociateAddress",
+        "ec2:DescribeAddresses",
+        "ec2:DescribeInstances",
+        "ec2:DescribeNetworkInterfaces"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+**Note:** If you cannot create IAM resources, you can:
+1. Use `existing_iam_instance_profile_name` in your tfvars to skip IAM creation
+2. OR comment out the `eni_role`, `eni_policy`, and `eni_profile` resources in the DCP module and remove the `notify_master` command from the keepalived configuration in cloud-init
+
+</details>
+
+### Additional Tools
+
+```bash
+# Install jq for JSON parsing
+brew install jq  # macOS
+# OR
+apt install jq   # Linux
+```
+
+### Checklist
+
+Before deploying, ensure:
+
+- ✅ AWS credentials configured and tested
+- ✅ SSH key pair created and imported to target regions
+- ✅ Route53 public hosted zone created (optional but recommended for DNS-based access)
+- ✅ IAM permissions configured for EIP management
+- ✅ `jq` installed for JSON parsing
 
 For manual Terraform workflow, additionally ensure:
 - ✅ `terraform apply` completed successfully
-- ✅ SSH key configured and accessible at `~/.ssh/<your-key>.pem`
-- ✅ Your SSH IP is allowed in the `ssh_ip_range` variable (for DCP and bastion access)
+- ✅ SSH key accessible at `~/.ssh/<your-key>.pem`
+- ✅ Your public IP allowed in the `ssh_ip_range` variable
 
 ---
 
@@ -308,6 +460,125 @@ terraform -chdir=terraform/aws init
 terraform -chdir=terraform/aws plan -var-file=crdb-dcp-test.tfvars
 terraform -chdir=terraform/aws apply -var-file=crdb-dcp-test.tfvars
 terraform -chdir=terraform/aws output -json | jq -r '.'
+```
+
+---
+
+## Verifying Your Deployment
+
+After deployment, verify your infrastructure and test connectivity:
+
+### Verify AWS Infrastructure
+
+```bash
+# Set your AWS region
+aws configure set region "us-east-2"
+aws configure get region
+
+# Confirm VPC exists (replace with your project tag)
+aws ec2 describe-vpcs --filters Name=tag:Project,Values=crdb-dcp-test
+
+# Check transit gateway (if using multi-region)
+aws ec2 describe-transit-gateways --query "TransitGateways[].TransitGatewayId"
+
+# Verify all instances are running
+aws ec2 describe-instances \
+  --filters "Name=tag:Project,Values=crdb-dcp-test" \
+  --query 'Reservations[].Instances[].{Name: Tags[?Key==`Name`]|[0].Value, State: State.Name}'
+```
+
+### Connect to CRDB Nodes (via Bastion)
+
+For CRDB nodes in private subnets:
+
+```bash
+# Get node IPs from Terraform
+BASTION_IP=$(terraform -chdir=terraform/aws output -json bastion_public_ips | jq -r '.["us-east-2"]')
+CRDB_NODE=$(terraform -chdir=terraform/aws output -json crdb_private_ips | jq -r '.["us-east-2"][0]')
+SSH_KEY=./my-safe-directory/dev
+
+# Connect via bastion
+ssh -i $SSH_KEY \
+  -o ProxyCommand="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -W %h:%p debian@$BASTION_IP" \
+  debian@$CRDB_NODE
+
+# On the CRDB node, verify setup
+lsblk
+df -h | grep cockroach
+ls -ltrh /var/lib/cockroach/certs
+cockroach --version
+sudo systemctl status cockroachdb
+exit
+```
+
+### Connect to DCP Nodes
+
+DCP nodes are in public subnets and directly accessible:
+
+```bash
+# Get DCP node IP
+DCP_NODE=$(terraform -chdir=terraform/aws output -json dcp_endpoints | jq -r '.["us-east-2"][0]["eip_public_ip"]')
+SSH_KEY=./my-safe-directory/dev
+
+# Connect directly
+ssh -i $SSH_KEY debian@$DCP_NODE
+
+# Verify DCP services
+ls -ltrh /etc/pgbouncer
+ls -ltrh /usr/local/bin/claim-eip.sh
+systemctl status pgbouncer-runner
+systemctl status haproxy
+systemctl status keepalived
+
+# Verify IAM permissions (should show instance role)
+aws sts get-caller-identity
+aws ec2 describe-addresses
+exit
+```
+
+### Test PgBouncer Admin Console
+
+Connect to PgBouncer's admin interface to monitor pools:
+
+```bash
+# On a DCP node
+sudo psql "host=localhost port=6432 dbname=pgbouncer user=yourusername \
+   sslmode=verify-full \
+   sslrootcert=/etc/pgbouncer/certs/ca.crt \
+   sslcert=/etc/pgbouncer/certs/client.yourusername.crt \
+   sslkey=/etc/pgbouncer/certs/client.yourusername.key"
+
+# Inside PgBouncer console
+SHOW POOLS;
+SHOW CLIENTS;
+SHOW SERVERS;
+
+# Watch pools in real-time
+\watch 1
+
+# Exit with Ctrl+C, then
+\q
+```
+
+### Verify CockroachDB Cluster
+
+Check cluster topology and region configuration:
+
+```bash
+# Show database regions
+cockroach sql --certs-dir ./certs/crdb-dcp-test \
+  --url "postgresql://db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full" \
+  -e "SHOW REGIONS FROM DATABASE defaultdb;"
+
+# Show node locality
+cockroach sql --certs-dir ./certs/crdb-dcp-test \
+  --url "postgresql://db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full" \
+  -e "SELECT node_id, locality FROM crdb_internal.gossip_nodes ORDER BY node_id;"
+
+# Check cluster health
+cockroach sql --certs-dir ./certs/crdb-dcp-test \
+  --url "postgresql://db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full" \
+  -e "SELECT node_id, address, is_live, is_available FROM crdb_internal.gossip_nodes;"
 ```
 
 ---
