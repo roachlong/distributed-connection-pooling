@@ -360,9 +360,10 @@ ALTER DATABASE defaultdb SURVIVE ZONE FAILURE;
 """
 
 # Create admin user for DB Console access
+# Note: With Windows PowerShell, use two pairs of double quotes around the username, e.g., ""admin_user""
 cockroach sql --certs-dir ./certs/crdb-dcp-test \
   --url "postgresql://db.us-east-2.dcp-test.crdb.com:26257/defaultdb?sslmode=verify-full" -e """
-CREATE ROLE admin_user WITH LOGIN PASSWORD 'secret';
+CREATE ROLE \"admin_user\" WITH LOGIN PASSWORD 'secret';
 GRANT admin TO admin_user;
 """
 
@@ -374,9 +375,13 @@ cockroach sql --certs-dir ./certs/crdb-dcp-test \
 
 ### Step 4: Monitor and operate
 
+Now you can log into the CockroachDB DB Console using the admin credentials you created above, and also review HAProxy stats to monitor TCP connections across your distributed connection pool.
+
 - **DB Console**: https://db.us-east-2.dcp-test.crdb.com:8080/
 - **HAProxy Stats**: http://pgb.us-east-2.dcp-test.crdb.com:8404/stats
-- **Connection endpoint for apps**: `postgresql://yourusername@pgb.us-east-2.dcp-test.crdb.com:5432/defaultdb?sslmode=verify-full`
+- **Connection endpoint for apps and workloads**: `postgresql://yourusername@pgb.us-east-2.dcp-test.crdb.com:5432/defaultdb?sslmode=verify-full`
+
+**Note**: Use the PgBouncer endpoint (port 5432) to execute any of the [workload tests](../../workloads/) in this repository.
 
 ### Step 5: Cleanup
 
