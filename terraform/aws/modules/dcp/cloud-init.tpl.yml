@@ -1,10 +1,36 @@
 #cloud-config
-repo_update: true
-package_update: true
-package_upgrade: true
+repo_update: false
+package_update: false
+repo_upgrade: none
 timezone: UTC
 
+apt:
+  conf: |
+    Acquire::ForceIPv4 "true";
+
 write_files:
+  #
+  # -----------------------------
+  # NTP / Clock Synchronization
+  # -----------------------------
+  #
+  - path: /etc/chrony/chrony.conf
+    permissions: "0644"
+    owner: root:root
+    content: |
+      # Amazon Time Sync Service (link-local, no internet required)
+      server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4
+      # Fallback to Debian NTP pool
+      pool 2.debian.pool.ntp.org iburst
+      # Allow large one-time correction on first boot
+      makestep 1.0 3
+      # Record frequency drift
+      driftfile /var/lib/chrony/drift
+      # Log sync activity
+      logdir /var/log/chrony
+      # Only allow localhost to query chrony
+      bindaddress 127.0.0.1
+
   #
   # -----------------------------
   # PgBouncer runner + templates
@@ -120,20 +146,28 @@ write_files:
       }
       EOF
 
-packages:
-  - awscli
-  - ca-certificates
-  - curl
-  - dnsutils
-  - gnupg2
-  - haproxy
-  - jq
-  - keepalived
-  - net-tools
-  - pgbouncer
-  - postgresql-client
-
 runcmd:
+  # Wait for network, update apt cache, then install packages
+  - |
+    echo "Waiting for NAT Gateway to be ready..."
+    for i in $(seq 1 30); do
+      if apt-get update > /tmp/apt-update.log 2>&1; then
+        echo "APT update succeeded"
+        break
+      fi
+      echo "Attempt $i: apt-get update failed, waiting..."
+      sleep 5
+    done
+    cat /tmp/apt-update.log
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y awscli ca-certificates chrony curl dnsutils haproxy jq keepalived net-tools pgbouncer postgresql-client || true
+  #
+  # Enable and start chrony, wait for clock sync
+  #
+  - systemctl enable chronyd
+  - systemctl restart chronyd
+  - chronyc makestep
+  - chronyc waitsync 30 0.1 0 1
+
   #
   # Base directories
   #

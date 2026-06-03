@@ -36,3 +36,9 @@ variable "db_port"  {
   type = number
   default = 26257
 }
+
+variable "existing_iam_instance_profile_name" {
+  type        = string
+  description = "Name of existing IAM instance profile for DCP EC2 instances (e.g., roachprod-testing). If provided, skips IAM role/profile creation for EIP failover."
+  default     = ""
+}

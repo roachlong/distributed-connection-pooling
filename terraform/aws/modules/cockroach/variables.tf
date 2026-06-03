@@ -70,3 +70,27 @@ variable "architecture" { default = "amd64" }
 
 variable "vm_user" {}
 variable "ssh_key" {}
+
+variable "s3_bucket_arns" {
+  type        = list(string)
+  description = "S3 bucket ARNs for IMPORT, BACKUP, and audit logs"
+  default     = []
+}
+
+variable "permissions_boundary_arn" {
+  type        = string
+  description = "IAM permissions boundary ARN"
+  default     = ""
+}
+
+variable "kms_key_id" {
+  type        = string
+  description = "KMS key ID for EBS volume encryption"
+  default     = ""
+}
+
+variable "existing_iam_instance_profile_name" {
+  type        = string
+  description = "Name of existing IAM instance profile to use instead of creating new one (e.g., roachprod-testing)"
+  default     = ""
+}

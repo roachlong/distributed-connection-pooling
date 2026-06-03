@@ -28,8 +28,10 @@ data "aws_iam_policy_document" "instance_assume" {
   }
 }
 
+# IAM role for DCP EIP failover - only create if existing profile not provided
 resource "aws_iam_role" "dcp_eip_role" {
-  name = "${var.name}-${var.region}-dcp-eip-role"
+  count = var.existing_iam_instance_profile_name == "" ? 1 : 0
+  name  = "${var.name}-${var.region}-dcp-eip-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -46,14 +48,13 @@ resource "aws_iam_role" "dcp_eip_role" {
 
   permissions_boundary = var.permissions_boundary_arn
 
-  tags = {
-    Name = "${var.name}-${var.region}-dcp-eip-role"
-  }
+  # Tags removed - SSO role lacks iam:TagRole permission
 }
 
 resource "aws_iam_role_policy" "dcp_eip_failover" {
-  name = "${var.name}-${var.region}-dcp-eip-policy"
-  role = aws_iam_role.dcp_eip_role.id
+  count = var.existing_iam_instance_profile_name == "" ? 1 : 0
+  name  = "${var.name}-${var.region}-dcp-eip-policy"
+  role  = aws_iam_role.dcp_eip_role[0].id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -74,8 +75,20 @@ resource "aws_iam_role_policy" "dcp_eip_failover" {
 }
 
 resource "aws_iam_instance_profile" "dcp" {
-  name = "${var.name}-${var.region}-dcp-eip-profile"
-  role = aws_iam_role.dcp_eip_role.name
+  count = var.existing_iam_instance_profile_name == "" ? 1 : 0
+  name  = "${var.name}-${var.region}-dcp-eip-profile"
+  role  = aws_iam_role.dcp_eip_role[0].name
+}
+
+# Data source to look up existing instance profile if provided
+data "aws_iam_instance_profile" "existing" {
+  count = var.existing_iam_instance_profile_name != "" ? 1 : 0
+  name  = var.existing_iam_instance_profile_name
+}
+
+# Local to determine which instance profile to use
+locals {
+  instance_profile_name = var.existing_iam_instance_profile_name != "" ? data.aws_iam_instance_profile.existing[0].name : aws_iam_instance_profile.dcp[0].name
 }
 
 # Network Interface used as VIP holder (private IP specified in tfvars or left to provider)
@@ -93,7 +106,7 @@ resource "aws_instance" "dcp_node" {
   subnet_id     = element([var.subnet_id], 0)
   vpc_security_group_ids = [var.security_group_id]
   key_name      = var.ssh_key_name
-  iam_instance_profile = aws_iam_instance_profile.dcp.name
+  iam_instance_profile = local.instance_profile_name
 
   user_data = templatefile("${path.module}/cloud-init.tpl.yml", {
     name               = var.name

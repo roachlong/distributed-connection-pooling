@@ -1,26 +1,25 @@
 #cloud-config
-repo_update: true
-package_upgrade: true
+repo_update: false
+repo_upgrade: none
 timezone: UTC
 
 write_files:
-  - path: /usr/bin/check-packages.sh
-    permissions: '0755'
+  - path: /etc/chrony/chrony.conf
+    permissions: '0644'
+    owner: root:root
     content: |
-      #!/bin/bash
-      packages=$1
-      export IFS=","
-      for package in $${packages}; do
-        name=$(echo $${package} | sed -e 's/^[[:space:]]*//')
-        count=$(dpkg-query -l "$${name}" | grep "$${name}" | wc -l)
-        attempts=0
-        while [[ $${count} -eq 0 && $${attempts} -lt 12 ]]; do
-          ((attempts++))
-          sleep 15
-          sudo apt-get install -y $(echo "$${packages}" | tr ',' ' ')
-          count=$(dpkg-query -l "$${name}" | grep "$${name}" | wc -l)
-        done
-      done
+      # Amazon Time Sync Service (link-local, no internet required)
+      server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4
+      # Fallback to Debian NTP pool
+      pool 2.debian.pool.ntp.org iburst
+      # Allow large one-time correction on first boot
+      makestep 1.0 3
+      # Record frequency drift
+      driftfile /var/lib/chrony/drift
+      # Log sync activity
+      logdir /var/log/chrony
+      # Only allow localhost to query chrony
+      bindaddress 127.0.0.1
 
   - path: /var/lib/cockroach/mount-cockroach.sh
     permissions: '0755'
@@ -59,12 +58,80 @@ write_files:
       sudo chown -R cockroach:cockroach /mnt/cockroach-data
       echo "$${device_name} /mnt/cockroach-data xfs defaults,nofail 0 2" | sudo tee -a /etc/fstab > /dev/null
 
+  - path: /var/lib/cockroach/setup-encryption.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      echo "[ENCRYPTION] Setting up CockroachDB encryption-at-rest..."
+
+      # Create encryption keys directory
+      mkdir -p /var/lib/cockroach/keys
+
+      # Generate encryption key (128-bit AES)
+      # Must be done BEFORE systemd service starts
+      /usr/local/bin/cockroach gen encryption-key -s 128 /var/lib/cockroach/keys/master.key
+
+      # Create encryption configuration file
+      # path= specifies the data directory to encrypt
+      # key= points to the encryption key file
+      # old-key=plain indicates we're transitioning from unencrypted to encrypted
+      echo 'path=/mnt/cockroach-data,key=/var/lib/cockroach/keys/master.key,old-key=plain' > /var/lib/cockroach/keys/encryption-options.cfg
+
+      # Set ownership and permissions
+      chown -R cockroach:cockroach /var/lib/cockroach/keys
+      chmod 600 /var/lib/cockroach/keys/master.key
+      chmod 644 /var/lib/cockroach/keys/encryption-options.cfg
+
+      echo "[ENCRYPTION] Encryption keys generated successfully"
+      echo "[ENCRYPTION] Key location: /var/lib/cockroach/keys/master.key"
+      echo "[ENCRYPTION] Config: /var/lib/cockroach/keys/encryption-options.cfg"
+
+  - path: /etc/systemd/system/cockroachdb.service
+    permissions: '0644'
+    owner: root:root
+    content: |
+      [Unit]
+      Description=CockroachDB
+      Requires=network-online.target
+      After=network-online.target
+
+      [Service]
+      Type=notify
+      User=cockroach
+      Group=cockroach
+      WorkingDirectory=/var/lib/cockroach
+      # NOTE: Add --join flag with comma-separated list of node addresses before starting:
+      #   --join=<node1>:26257,<node2>:26257,<node3>:26257
+      # For single-node clusters, omit --join entirely
+      ExecStart=/usr/local/bin/cockroach start \
+        --locality=region=${region},zone=${az} \
+        --store=/mnt/cockroach-data \
+        --enterprise-encryption=path=/mnt/cockroach-data,key=/var/lib/cockroach/keys/master.key,old-key=plain \
+        --certs-dir=/var/lib/cockroach/certs \
+        --advertise-addr=$(hostname -I | awk '{print $1}') \
+        --cache=.25 \
+        --max-sql-memory=.25 \
+        --max-offset=500ms
+      TimeoutStopSec=60
+      Restart=always
+      RestartSec=10
+      StandardOutput=journal
+      StandardError=journal
+      SyslogIdentifier=cockroach
+
+      [Install]
+      WantedBy=multi-user.target
+
 apt:
   sources_list: |
     deb http://deb.debian.org/debian/ $(lsb_release -a | grep Codename: | cut -f2 -d: | xargs) main contrib non-free
     deb http://deb.debian.org/debian/ $(lsb_release -a | grep Codename: | cut -f2 -d: | xargs)-updates main contrib non-free
     deb http://deb.debian.org/debian-security $(lsb_release -a | grep Codename: | cut -f2 -d: | xargs)-security main
   conf: |
+    Acquire::ForceIPv4 "true";
     APT {
       Get {
         Assume-Yes "true";
@@ -72,27 +139,37 @@ apt:
       };
     };
 
-packages:
-  - apt-transport-https
-  - bc
-  - build-essential
-  - ca-certificates
-  - curl
-  - debconf-utils
-  - dnsutils
-  - gnupg2
-  - less
-  - net-tools
-  - numactl
-  - rsync
-  - screen
-  - software-properties-common
-  - vim
-  - wget
-  - xfsprogs
-
 runcmd:
-  - /usr/bin/check-packages.sh 'apt-transport-https,bc,build-essential,ca-certificates,curl,debconf-utils,dnsutils,gnupg2,less,net-tools,numactl,rsync,screen,software-properties-common,vim,wget,xfsprogs'
+  # Wait for network, update apt cache, then install packages
+  - |
+    echo "Waiting for NAT Gateway to be ready..."
+    for i in $(seq 1 30); do
+      if apt-get update > /tmp/apt-update.log 2>&1; then
+        echo "APT update succeeded"
+        break
+      fi
+      echo "Attempt $i: apt-get update failed, waiting..."
+      sleep 5
+    done
+    cat /tmp/apt-update.log
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y apt-transport-https bc build-essential ca-certificates chrony curl dnsutils less net-tools rsync screen vim wget xfsprogs || true
+  # Enable and start chrony, wait for clock sync
+  - systemctl enable chronyd
+  - systemctl restart chronyd
+  - chronyc makestep
+  - chronyc waitsync 30 0.1 0 1
+
+  # Wait for network before downloading CockroachDB (NAT takes time to be ready)
+  - |
+    echo "Waiting for internet to download CockroachDB..."
+    for i in $(seq 1 30); do
+      if curl -m 10 -s -I https://binaries.cockroachdb.com > /dev/null 2>&1; then
+        echo "binaries.cockroachdb.com is reachable"
+        break
+      fi
+      echo "Attempt $i: cannot reach binaries.cockroachdb.com, waiting..."
+      sleep 5
+    done
 
   # Install CockroachDB binary
   - curl -fsSL https://binaries.cockroachdb.com/cockroach-v${cockroach_version}.linux-${architecture}.tgz | tar -xz
@@ -109,6 +186,13 @@ runcmd:
 
   # Mount data disk
   - /var/lib/cockroach/mount-cockroach.sh
+
+  # Setup encryption-at-rest (must be done AFTER cockroach binary install, BEFORE service start)
+  - /var/lib/cockroach/setup-encryption.sh
+
+  # Enable CockroachDB systemd service (do not start yet - requires manual cluster initialization)
+  - systemctl daemon-reload
+  - systemctl enable cockroachdb.service
 
 users:
 - default
