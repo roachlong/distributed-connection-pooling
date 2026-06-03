@@ -7,6 +7,7 @@
 1. [PgBouncer](#pgbouncer)
 1. [High Availability](#high-availability)
 1. [AWS EC2 Reference Architecture](./terraform/aws/DEPLOYMENT.md)
+1. [AWS EKS Reference Architecture](./kubernetes/eks/DEPLOYMENT.md)
 1. [Event Logs Workload](./workloads/event-logs/README.md)
 1. [Flight Schedules Workload](./workloads/flight-schedules/README.md)
 1. [Train Events Workload](./workloads/train-events/README.md)
