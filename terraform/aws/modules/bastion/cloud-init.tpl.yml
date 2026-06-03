@@ -1,0 +1,27 @@
+#cloud-config
+repo_update: true
+repo_upgrade: none
+timezone: UTC
+
+users:
+  - default
+  - name: ${vm_user}
+    gecos: Bastion User
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${ssh_key}
+  - name: root
+    lock_passwd: true
+
+packages:
+  - vim
+  - curl
+  - wget
+  - net-tools
+  - dnsutils
+  - jq
+
+runcmd:
+  - echo "Bastion host setup complete" >> /var/log/cloud-init-output.log

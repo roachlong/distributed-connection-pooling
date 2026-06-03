@@ -80,6 +80,19 @@ variable "cockroach_version" {
   default     = "25.4.3"
 }
 
+variable "cockroach_organization" {
+  type        = string
+  description = "Organization name for CockroachDB Enterprise license (optional)"
+  default     = "Workshop"
+}
+
+variable "cockroach_license" {
+  type        = string
+  description = "CockroachDB Enterprise license key (optional, enables encryption-at-rest)"
+  default     = ""
+  sensitive   = true
+}
+
 variable "cluster_profile_name" {
   description = "Which named cluster profile to deploy"
   type        = string
@@ -178,4 +191,10 @@ variable "ssh_public_key" {
 variable "permissions_boundary_arn" {
   type        = string
   description = "IAM permissions boundary ARN required by the CL revenue account"
+}
+
+variable "existing_iam_instance_profile_name" {
+  type        = string
+  description = "Name of existing IAM instance profile for CRDB EC2 instances (e.g., roachprod-testing). If provided, skips IAM role/profile creation."
+  default     = ""
 }

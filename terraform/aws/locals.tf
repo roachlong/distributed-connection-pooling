@@ -523,4 +523,11 @@ locals {
       us-west-2 = module.dcp_us_west_2[0]
     } : {}
   )
+
+  # S3 bucket ARNs for CRDB IAM permissions
+  crdb_s3_bucket_arns = [
+    aws_s3_bucket.crdb_imports.arn,
+    aws_s3_bucket.crdb_backups.arn,
+    aws_s3_bucket.crdb_audit_logs.arn
+  ]
 }

@@ -70,9 +70,36 @@ resource "aws_subnet" "private" {
   })
 }
 
-# Private route table (no internet route; TGW routes get added at top-level)
+# NAT Gateway for private subnet outbound internet access
+# Single NAT Gateway in first AZ for cost efficiency ($0.045/hr = ~$32/month per region)
+# For HA, create one per AZ by changing count logic below
+resource "aws_eip" "nat" {
+  domain = "vpc"
+
+  tags = merge(local.common_tags, {
+    Component = "nat-eip"
+  })
+}
+
+resource "aws_nat_gateway" "this" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[local.azs[0]].id
+
+  tags = merge(local.common_tags, {
+    Component = "nat-gateway"
+  })
+
+  depends_on = [aws_internet_gateway.this]
+}
+
+# Private route table with NAT Gateway route for outbound internet
 resource "aws_route_table" "private" {
   vpc_id = aws_vpc.this.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.this.id
+  }
 
   tags = merge(local.common_tags, {
     Component = "rt-private"
@@ -86,20 +113,20 @@ resource "aws_route_table_association" "private" {
   route_table_id = aws_route_table.private.id
 }
 
-# Node SG (unchanged)
+# Node SG - No direct SSH access (use bastion host)
 resource "aws_security_group" "node" {
   count       = var.create_node_security_group ? 1 : 0
   name        = "${var.name}-node-sg"
-  description = "Node SG: SSH + Cockroach ports"
+  description = "Node SG: Cockroach ports only (SSH via bastion)"
   vpc_id      = aws_vpc.this.id
 
-  # SSH from a public IP/CIDR
+  # SSH from within VPC (bastion host)
   ingress {
-    description = "SSH"
+    description = "SSH from bastion"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = [var.ssh_ip_range]
+    cidr_blocks = [var.vpc_cidr]
   }
 
   # CockroachDB SQL/KV (node-to-node)
@@ -134,16 +161,16 @@ resource "aws_security_group" "node" {
   })
 }
 
-# Proxy SG to attach to DCP instances later
+# Proxy SG to attach to DCP instances (public subnet for client access)
 resource "aws_security_group" "proxy" {
   count       = var.create_proxy_security_group ? 1 : 0
   name        = "${var.name}-proxy-sg"
   description = "Proxy SG: SSH + DCP ports"
   vpc_id      = aws_vpc.this.id
 
-  # SSH from a public IP/CIDR
+  # SSH from trusted CIDR (for controller.py management)
   ingress {
-    description = "SSH"
+    description = "SSH for DCP management"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
