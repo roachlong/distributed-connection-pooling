@@ -13,6 +13,7 @@ SSH_OPTS = (
     "-o StrictHostKeyChecking=no "
     "-o UserKnownHostsFile=/dev/null "
     "-o LogLevel=ERROR "
+    "-o ForwardAgent=yes "
     "-q"
 )
 
@@ -55,32 +56,45 @@ def terraform_output(tf_dir: str) -> Dict[str, Any]:
     return json.loads(out)
 
 
-def ssh(host: str, ssh_user: str, ssh_key: str, remote_cmd: str, check: bool = True) -> str:
+def ssh(host: str, ssh_user: str, ssh_key: str, remote_cmd: str, check: bool = True, bastion: Optional[str] = None) -> str:
+    if bastion:
+        proxy_cmd = f"-o ProxyCommand='ssh -i {ssh_key} {SSH_OPTS} -W %h:%p {ssh_user}@{bastion}'"
+    else:
+        proxy_cmd = ""
     return run(
-        f"ssh -i {ssh_key} {SSH_OPTS} {ssh_user}@{host} {json.dumps(remote_cmd)}",
+        f"ssh -i {ssh_key} {SSH_OPTS} {proxy_cmd} {ssh_user}@{host} {json.dumps(remote_cmd)}",
         check=check,
     )
 
 
-def scp_file(host: str, ssh_user: str, ssh_key: str, local_path: Path, remote_path: str) -> None:
+def scp_file(host: str, ssh_user: str, ssh_key: str, local_path: Path, remote_path: str, bastion: Optional[str] = None) -> None:
+    if bastion:
+        proxy_cmd = f"-o ProxyCommand='ssh -i {ssh_key} {SSH_OPTS} -W %h:%p {ssh_user}@{bastion}'"
+    else:
+        proxy_cmd = ""
     run(
-        f"scp -i {ssh_key} {SSH_OPTS} {local_path} {ssh_user}@{host}:/tmp/{local_path.name}"
+        f"scp -i {ssh_key} {SSH_OPTS} {proxy_cmd} {local_path} {ssh_user}@{host}:/tmp/{local_path.name}"
     )
-    ssh(host, ssh_user, ssh_key, f"sudo mv /tmp/{local_path.name} {remote_path}")
+    ssh(host, ssh_user, ssh_key, f"sudo mv /tmp/{local_path.name} {remote_path}", bastion=bastion)
 
 
-def scp_text(host: str, ssh_user: str, ssh_key: str, remote_path: str, content: str) -> None:
+def scp_text(host: str, ssh_user: str, ssh_key: str, remote_path: str, content: str, bastion: Optional[str] = None) -> None:
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / Path(remote_path).name
         p.write_text(content)
-        scp_file(host, ssh_user, ssh_key, p, remote_path)
+        scp_file(host, ssh_user, ssh_key, p, remote_path, bastion=bastion)
 
 
-def can_ssh(host: str, ssh_user: str, ssh_key: str, timeout: int = 5) -> bool:
+def can_ssh(host: str, ssh_user: str, ssh_key: str, timeout: int = 5, bastion: Optional[str] = None) -> bool:
     try:
+        if bastion:
+            proxy_cmd = f"-o ProxyCommand='ssh -i {ssh_key} {SSH_OPTS} -W %h:%p {ssh_user}@{bastion}'"
+        else:
+            proxy_cmd = ""
         run(
             f"ssh -i {ssh_key} {SSH_OPTS} "
             f"-o ConnectTimeout={timeout} "
+            f"{proxy_cmd} "
             f"{ssh_user}@{host} echo ok",
             check=True,
         )
@@ -113,14 +127,40 @@ def pick_dcp_ssh_host(
     )
 
 
+def determine_ssh_access(
+    node: Dict[str, Any],
+    bastion_by_region: Dict[str, str],
+) -> Tuple[str, Optional[str]]:
+    """
+    Determine SSH host and bastion for a node.
+
+    Returns (ssh_host, bastion):
+    - For nodes with public_dns: use public_dns directly, no bastion
+    - For nodes without public_dns (private): use private_ip via bastion
+
+    This ensures backward compatibility with Docker/local deployments
+    while supporting bastion-based access for private AWS nodes.
+    """
+    public_dns = node.get("public_dns", "").strip()
+
+    if public_dns:
+        # Direct SSH to public node (Docker/local deployment)
+        return public_dns, None
+    else:
+        # Private node, use bastion
+        region = node.get("region")
+        bastion = bastion_by_region.get(region) if region else None
+        return node["private_ip"], bastion
+
+
 # ----------------------------
 # Wait helpers
 # ----------------------------
 
-def wait_for_ssh(host: str, ssh_user: str, ssh_key: str, timeout: int = 300) -> None:
+def wait_for_ssh(host: str, ssh_user: str, ssh_key: str, timeout: int = 300, bastion: Optional[str] = None) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        out = ssh(host, ssh_user, ssh_key, "echo ok", check=False)
+        out = ssh(host, ssh_user, ssh_key, "echo ok", check=False, bastion=bastion)
         if "ok" in out:
             return
         time.sleep(5)
@@ -131,6 +171,7 @@ def wait_for_cloud_init(
     host: str,
     ssh_user: str,
     ssh_key: str,
+    bastion: Optional[str] = None,
 ) -> None:
     print(f"⏳ Waiting for cloud-init to finish on {host}...")
     try:
@@ -140,13 +181,14 @@ def wait_for_cloud_init(
             ssh_key,
             "sudo cloud-init status --wait > /dev/null",
             check=True,
+            bastion=bastion,
         )
         print("✅ cloud-init finished")
     except Exception as e:
         raise RuntimeError(f"cloud-init did not complete on {host}") from e
 
 
-def wait_for_crdb_listener(host: str, ssh_user: str, ssh_key: str, timeout=300):
+def wait_for_crdb_listener(host: str, ssh_user: str, ssh_key: str, timeout=300, bastion: Optional[str] = None):
     print(f"⏳ Waiting for CockroachDB to listen on {host}:26257...")
     deadline = time.time() + timeout
 
@@ -157,6 +199,7 @@ def wait_for_crdb_listener(host: str, ssh_user: str, ssh_key: str, timeout=300):
             ssh_key,
             "ss -ltn | grep ':26257'",
             check=False,
+            bastion=bastion,
         )
         if out.strip():
             print("✅ CockroachDB port is listening")
@@ -172,6 +215,7 @@ def wait_for_expected_nodes(
     ssh_key: str,
     expected_nodes: int,
     timeout: int = 600,
+    bastion: Optional[str] = None,
 ) -> None:
     print(f"⏳ Waiting for {expected_nodes} Cockroach nodes to be live...")
     deadline = time.time() + timeout
@@ -185,6 +229,7 @@ def wait_for_expected_nodes(
             "--certs-dir=/var/lib/cockroach/certs "
             "--format=tsv",
             check=False,
+            bastion=bastion,
         )
 
         if "cannot dial server" in out or "Failed running" in out:
@@ -204,7 +249,7 @@ def wait_for_expected_nodes(
             print(f"   Unexpected output, retrying: {header}")
             time.sleep(5)
             continue
-        
+
         try:
             is_live_idx = header.index("is_live")
         except ValueError:
@@ -323,16 +368,20 @@ DNS.2 = localhost
 # Remote installs
 # ----------------------------
 
-def install_crdb_certs(node: Dict[str, Any], ssh_user: str, ssh_key: str, certs_dir: Path) -> None:
-    host = node["public_dns"]
+def install_crdb_certs(node: Dict[str, Any], ssh_user: str, ssh_key: str, certs_dir: Path, bastion: Optional[str] = None) -> None:
+    host = node["ssh_host"]
+    if bastion:
+        proxy_cmd = f"-o ProxyCommand='ssh -i {ssh_key} {SSH_OPTS} -W %h:%p {ssh_user}@{bastion}'"
+    else:
+        proxy_cmd = ""
     # Copy CA + node.* to node, then move into /var/lib/cockroach/certs
-    run(f"scp -i {ssh_key} {SSH_OPTS} {certs_dir/'ca.crt'} {ssh_user}@{host}:/tmp/ca.crt")
-    run(f"scp -i {ssh_key} {SSH_OPTS} {certs_dir/'node.crt'} {ssh_user}@{host}:/tmp/node.crt")
-    run(f"scp -i {ssh_key} {SSH_OPTS} {certs_dir/'node.key'} {ssh_user}@{host}:/tmp/node.key")
-    run(f"scp -i {ssh_key} {SSH_OPTS} {certs_dir/'client.root.crt'} {ssh_user}@{host}:/tmp/client.root.crt")
-    run(f"scp -i {ssh_key} {SSH_OPTS} {certs_dir/'client.root.key'} {ssh_user}@{host}:/tmp/client.root.key")
+    run(f"scp -i {ssh_key} {SSH_OPTS} {proxy_cmd} {certs_dir/'ca.crt'} {ssh_user}@{host}:/tmp/ca.crt")
+    run(f"scp -i {ssh_key} {SSH_OPTS} {proxy_cmd} {certs_dir/'node.crt'} {ssh_user}@{host}:/tmp/node.crt")
+    run(f"scp -i {ssh_key} {SSH_OPTS} {proxy_cmd} {certs_dir/'node.key'} {ssh_user}@{host}:/tmp/node.key")
+    run(f"scp -i {ssh_key} {SSH_OPTS} {proxy_cmd} {certs_dir/'client.root.crt'} {ssh_user}@{host}:/tmp/client.root.crt")
+    run(f"scp -i {ssh_key} {SSH_OPTS} {proxy_cmd} {certs_dir/'client.root.key'} {ssh_user}@{host}:/tmp/client.root.key")
     run(f"""
-ssh -i {ssh_key} {SSH_OPTS} {ssh_user}@{host} <<'EOF'
+ssh -i {ssh_key} {SSH_OPTS} {proxy_cmd} {ssh_user}@{host} <<'EOF'
 sudo mkdir -p /var/lib/cockroach/certs
 sudo mv /tmp/ca.crt /tmp/node.crt /tmp/node.key /tmp/client.root.crt /tmp/client.root.key /var/lib/cockroach/certs/
 sudo chown -R cockroach:cockroach /var/lib/cockroach
@@ -349,9 +398,10 @@ def install_and_start_crdb_service(
     restart: bool,
     db_port: int,
     ui_port: int,
+    bastion: Optional[str] = None,
 ) -> None:
     """
-    Creates /etc/systemd/system/cockroach.service on each node and
+    Creates /etc/systemd/system/cockroachdb.service on each node and
     starts or restarts it depending on `restart`.
 
     - restart=False → start only if not running
@@ -363,7 +413,7 @@ def install_and_start_crdb_service(
     action = "restart" if restart else "start"
 
     for node in nodes:
-        host = node["public_dns"]
+        host = node["ssh_host"]
         name = node["name"]
         region = node.get("region", "unknown")
         az = node.get("az", "") or node.get("availability_zone", "")
@@ -390,9 +440,13 @@ def install_and_start_crdb_service(
                 f"--locality=region={region},zone={az}"
             )
 
+        if bastion:
+            proxy_cmd = f"-o ProxyCommand='ssh -i {ssh_key} {SSH_OPTS} -W %h:%p {ssh_user}@{bastion}'"
+        else:
+            proxy_cmd = ""
         run(f"""
-ssh -i {ssh_key} {SSH_OPTS} {ssh_user}@{host} <<'EOF'
-sudo tee /etc/systemd/system/cockroach.service > /dev/null <<SERVICE
+ssh -i {ssh_key} {SSH_OPTS} {proxy_cmd} {ssh_user}@{host} <<'EOF'
+sudo tee /etc/systemd/system/cockroachdb.service > /dev/null <<SERVICE
 [Unit]
 Description=CockroachDB
 After=network-online.target
@@ -410,13 +464,13 @@ WantedBy=multi-user.target
 SERVICE
 
 sudo systemctl daemon-reload
-sudo systemctl enable cockroach
-sudo systemctl {action} cockroach
+sudo systemctl enable cockroachdb
+sudo systemctl {action} cockroachdb
 EOF
 """)
 
 
-def init_cluster(seed_node: Dict[str, Any], ssh_user: str, ssh_key: str, db_port: int) -> None:
+def init_cluster(seed_node: Dict[str, Any], ssh_user: str, ssh_key: str, db_port: int, bastion: Optional[str] = None) -> None:
     """
     Idempotent init: if already initialized, ignore the error.
     We use certs_dir client certs locally (typically client.root.*).
@@ -427,7 +481,7 @@ def init_cluster(seed_node: Dict[str, Any], ssh_user: str, ssh_key: str, db_port
         "--certs-dir=/var/lib/cockroach/certs "
         f"--host={seed}"
     )
-    out = ssh(seed_node["public_dns"], ssh_user, ssh_key, cmd)
+    out = ssh(seed_node["ssh_host"], ssh_user, ssh_key, cmd, bastion=bastion)
     if "already initialized" in out.lower() or "cluster has already been initialized" in out.lower():
         print("ℹ️ Cluster already initialized, continuing")
     elif "successfully initialized" in out.lower() or "initialized" in out.lower():
@@ -442,18 +496,18 @@ def init_cluster(seed_node: Dict[str, Any], ssh_user: str, ssh_key: str, db_port
 # SQL bootstrap
 # ----------------------------
 
-def sql_exec_on_seed(seed_host: str, ssh_user: str, ssh_key: str, sql: str, db_port: int) -> None:
+def sql_exec_on_seed(seed_host: str, ssh_user: str, ssh_key: str, sql: str, db_port: int, bastion: Optional[str] = None) -> None:
     cmd = (
         "sudo -u cockroach cockroach sql "
         "--certs-dir=/var/lib/cockroach/certs "
         f"--host=localhost:{db_port} "
         f"-e {json.dumps(sql)}"
     )
-    ssh(seed_host, ssh_user, ssh_key, cmd)
+    ssh(seed_host, ssh_user, ssh_key, cmd, bastion=bastion)
 
 
 def ensure_db_and_user(seed_host: str, ssh_user: str, ssh_key: str, dbname: str, username: str,
-                       password: Optional[str], make_admin: bool, db_port: int) -> None:
+                       password: Optional[str], make_admin: bool, db_port: int, bastion: Optional[str] = None) -> None:
     stmts = [
         f"CREATE DATABASE IF NOT EXISTS {dbname};",
         f"CREATE USER IF NOT EXISTS {username};",
@@ -463,7 +517,7 @@ def ensure_db_and_user(seed_host: str, ssh_user: str, ssh_key: str, dbname: str,
         stmts.append(f"ALTER USER {username} WITH PASSWORD {json.dumps(password)};")
     if make_admin:
         stmts.append(f"GRANT admin TO {username};")
-    sql_exec_on_seed(seed_host, ssh_user, ssh_key, " ".join(stmts), db_port)
+    sql_exec_on_seed(seed_host, ssh_user, ssh_key, " ".join(stmts), db_port, bastion=bastion)
 
 
 # ----------------------------
@@ -477,6 +531,7 @@ def install_pgb_certs_on_dcp(
     certs_dir: Path,
     pgb_client_user: str,
     pgb_server_user: str,
+    bastion: Optional[str] = None,
 ) -> None:
     """
     Copy:
@@ -486,7 +541,8 @@ def install_pgb_certs_on_dcp(
     Into /etc/pgbouncer/certs on each DCP node.
     """
     ssh(dcp_host, ssh_user, ssh_key,
-        "sudo mkdir -p /etc/pgbouncer/certs && sudo chown -R postgres:postgres /etc/pgbouncer && sudo chmod 700 /etc/pgbouncer/certs")
+        "sudo mkdir -p /etc/pgbouncer/certs && sudo chown -R postgres:postgres /etc/pgbouncer && sudo chmod 700 /etc/pgbouncer/certs",
+        bastion=bastion)
 
     for f in [
         certs_dir / "ca.crt",
@@ -497,12 +553,13 @@ def install_pgb_certs_on_dcp(
         certs_dir / f"client.{pgb_client_user}.crt",
         certs_dir / f"client.{pgb_client_user}.key",
     ]:
-        scp_file(dcp_host, ssh_user, ssh_key, f, f"/etc/pgbouncer/certs/{f.name}")
+        scp_file(dcp_host, ssh_user, ssh_key, f, f"/etc/pgbouncer/certs/{f.name}", bastion=bastion)
 
     ssh(dcp_host, ssh_user, ssh_key,
         "sudo chown -R postgres:postgres /etc/pgbouncer && "
         "sudo find /etc/pgbouncer/certs -type f -name '*.crt' -exec chmod 0644 {} + && "
-        "sudo find /etc/pgbouncer/certs -type f -name '*.key' -exec chmod 0600 {} +"
+        "sudo find /etc/pgbouncer/certs -type f -name '*.key' -exec chmod 0600 {} +",
+        bastion=bastion
     )
 
 
@@ -537,17 +594,18 @@ def render_runner_env(
     return "\n".join(lines) + "\n"
 
 
-def push_runner_env(dcp_host: str, ssh_user: str, ssh_key: str, env_text: str) -> None:
+def push_runner_env(dcp_host: str, ssh_user: str, ssh_key: str, env_text: str, bastion: Optional[str] = None) -> None:
     scp_text(
         host=dcp_host,
         ssh_user=ssh_user,
         ssh_key=ssh_key,
         remote_path="/etc/pgbouncer/runner.env",
         content=env_text,
+        bastion=bastion,
     )
 
-    ssh(dcp_host, ssh_user, ssh_key, "sudo chown postgres:postgres /etc/pgbouncer/runner.env")
-    ssh(dcp_host, ssh_user, ssh_key, "sudo chmod 600 /etc/pgbouncer/runner.env")
+    ssh(dcp_host, ssh_user, ssh_key, "sudo chown postgres:postgres /etc/pgbouncer/runner.env", bastion=bastion)
+    ssh(dcp_host, ssh_user, ssh_key, "sudo chmod 600 /etc/pgbouncer/runner.env", bastion=bastion)
 
 
 def render_haproxy_cfg(pgbouncer_ips: List[str], backend_ips: List[str], pgb_port: int, db_port: int, ui_port: int) -> str:
@@ -557,7 +615,6 @@ def render_haproxy_cfg(pgbouncer_ips: List[str], backend_ips: List[str], pgb_por
         "  maxconn 200000",
         "  log /dev/log local0",
         "  daemon",
-        "  stats socket /run/haproxy/admin.sock mode 660 level admin"
         "",
         "defaults",
         "  mode tcp",
@@ -621,15 +678,15 @@ def render_haproxy_cfg(pgbouncer_ips: List[str], backend_ips: List[str], pgb_por
     return "\n".join(lines)
 
 
-def push_haproxy_cfg(dcp_host: str, ssh_user: str, ssh_key: str, cfg: str) -> None:
-    scp_text(dcp_host, ssh_user, ssh_key, "/etc/haproxy/haproxy.cfg", cfg)
-    ssh(dcp_host, ssh_user, ssh_key, "sudo haproxy -c -f /etc/haproxy/haproxy.cfg")
-    ssh(dcp_host, ssh_user, ssh_key, "sudo systemctl restart haproxy")
+def push_haproxy_cfg(dcp_host: str, ssh_user: str, ssh_key: str, cfg: str, bastion: Optional[str] = None) -> None:
+    scp_text(dcp_host, ssh_user, ssh_key, "/etc/haproxy/haproxy.cfg", cfg, bastion=bastion)
+    ssh(dcp_host, ssh_user, ssh_key, "sudo haproxy -c -f /etc/haproxy/haproxy.cfg", bastion=bastion)
+    ssh(dcp_host, ssh_user, ssh_key, "sudo systemctl restart haproxy", bastion=bastion)
 
 
-def start_pgbouncer_runner(dcp_host: str, ssh_user: str, ssh_key: str) -> None:
-    ssh(dcp_host, ssh_user, ssh_key, "sudo systemctl daemon-reload")
-    ssh(dcp_host, ssh_user, ssh_key, "sudo systemctl restart pgbouncer-runner")
+def start_pgbouncer_runner(dcp_host: str, ssh_user: str, ssh_key: str, bastion: Optional[str] = None) -> None:
+    ssh(dcp_host, ssh_user, ssh_key, "sudo systemctl daemon-reload", bastion=bastion)
+    ssh(dcp_host, ssh_user, ssh_key, "sudo systemctl restart pgbouncer-runner", bastion=bastion)
 
 
 # ----------------------------
@@ -734,11 +791,22 @@ def main():
     cockroach_nodes_by_region = outputs["cockroach_nodes"]["value"]
     dcp_endpoints_by_region = outputs["dcp_endpoints"]["value"]
 
+    # Extract bastion public IPs (may be empty for Docker/local deployments)
+    bastion_by_region: Dict[str, str] = {}
+    if "bastion_public_ips" in outputs:
+        bastion_ips = outputs["bastion_public_ips"]["value"]
+        if isinstance(bastion_ips, dict):
+            bastion_by_region = bastion_ips
+
     # Flatten nodes
     nodes: List[Dict[str, Any]] = []
     for region, region_nodes in cockroach_nodes_by_region.items():
         for n in region_nodes:
             n["region"] = region
+            # Determine SSH access strategy
+            ssh_host, bastion = determine_ssh_access(n, bastion_by_region)
+            n["ssh_host"] = ssh_host
+            n["bastion"] = bastion
             nodes.append(n)
 
     dcp_nodes: List[Dict[str, Any]] = []
@@ -780,11 +848,11 @@ def main():
     if args.start_nodes != PhasePolicy.SKIP:
         # 4) node certs
         for node in nodes:
-            wait_for_ssh(node["public_dns"], args.ssh_user, args.ssh_key, timeout=300)
-            wait_for_cloud_init(node["public_dns"], args.ssh_user, args.ssh_key)
+            wait_for_ssh(node["ssh_host"], args.ssh_user, args.ssh_key, timeout=300, bastion=node["bastion"])
+            wait_for_cloud_init(node["ssh_host"], args.ssh_user, args.ssh_key, bastion=node["bastion"])
             if args.node_certs:
                 create_crdb_node_cert(node, args.dns_zone, certs_dir, ca_key)
-            install_crdb_certs(node, args.ssh_user, args.ssh_key, certs_dir)
+            install_crdb_certs(node, args.ssh_user, args.ssh_key, certs_dir, bastion=node["bastion"])
 
         # 5) start Cockroach nodes
         install_and_start_crdb_service(
@@ -794,30 +862,33 @@ def main():
             restart=(args.start_nodes == PhasePolicy.REFRESH),
             db_port=args.db_port,
             ui_port=args.ui_port,
+            bastion=nodes[0]["bastion"],
         )
 
         wait_for_crdb_listener(
-            nodes[0]["public_dns"],
+            nodes[0]["ssh_host"],
             args.ssh_user,
             args.ssh_key,
+            bastion=nodes[0]["bastion"],
         )
 
     # 6) init cluster
     if not args.skip_init and len(nodes) > 1:
-        init_cluster(nodes[0], args.ssh_user, args.ssh_key, args.db_port)
+        init_cluster(nodes[0], args.ssh_user, args.ssh_key, args.db_port, bastion=nodes[0]["bastion"])
 
     wait_for_expected_nodes(
-        seed_host=nodes[0]["public_dns"],
+        seed_host=nodes[0]["ssh_host"],
         ssh_user=args.ssh_user,
         ssh_key=args.ssh_key,
         expected_nodes=len(nodes),
+        bastion=nodes[0]["bastion"],
     )
 
     # 7) SQL users / DBs
     if args.sql_users:
         if args.auth_mode == "cert":
             ensure_db_and_user(
-                nodes[0]["public_dns"],
+                nodes[0]["ssh_host"],
                 args.ssh_user,
                 args.ssh_key,
                 args.database,
@@ -825,9 +896,10 @@ def main():
                 password=None,
                 make_admin=True,
                 db_port=args.db_port,
+                bastion=nodes[0]["bastion"],
             )
             ensure_db_and_user(
-                nodes[0]["public_dns"],
+                nodes[0]["ssh_host"],
                 args.ssh_user,
                 args.ssh_key,
                 args.database,
@@ -835,10 +907,11 @@ def main():
                 password=None,
                 make_admin=False,
                 db_port=args.db_port,
+                bastion=nodes[0]["bastion"],
             )
         else:
             ensure_db_and_user(
-                nodes[0]["public_dns"],
+                nodes[0]["ssh_host"],
                 args.ssh_user,
                 args.ssh_key,
                 args.database,
@@ -846,6 +919,7 @@ def main():
                 password=args.password,
                 make_admin=False,
                 db_port=args.db_port,
+                bastion=nodes[0]["bastion"],
             )
 
     # 8) PgBouncer
@@ -868,9 +942,9 @@ def main():
 
             for p in region_proxies:
                 dcp_host = pick_dcp_ssh_host(p, args.ssh_user, args.ssh_key)
-                wait_for_ssh(dcp_host, args.ssh_user, args.ssh_key, timeout=300)
-                wait_for_cloud_init(dcp_host, args.ssh_user, args.ssh_key)
-                push_runner_env(dcp_host, args.ssh_user, args.ssh_key, env_text)
+                wait_for_ssh(dcp_host, args.ssh_user, args.ssh_key, timeout=300, bastion=None)
+                wait_for_cloud_init(dcp_host, args.ssh_user, args.ssh_key, bastion=None)
+                push_runner_env(dcp_host, args.ssh_user, args.ssh_key, env_text, bastion=None)
 
                 if args.auth_mode == "cert":
                     install_pgb_certs_on_dcp(
@@ -880,9 +954,10 @@ def main():
                         certs_dir,
                         args.pgb_client_user,
                         args.pgb_server_user,
+                        bastion=None,  # DCP nodes are accessible via EIP, no bastion needed
                     )
 
-                start_pgbouncer_runner(dcp_host, args.ssh_user, args.ssh_key)
+                start_pgbouncer_runner(dcp_host, args.ssh_user, args.ssh_key, bastion=None)
 
     # 9) HAProxy
     if not args.skip_haproxy:
@@ -895,7 +970,7 @@ def main():
             cfg = render_haproxy_cfg(pgb_ips, db_ips, pgb_port=args.pgb_port, db_port=args.db_port, ui_port=args.ui_port)
             for p in region_proxies:
                 dcp_host = pick_dcp_ssh_host(p, args.ssh_user, args.ssh_key)
-                push_haproxy_cfg(dcp_host, args.ssh_user, args.ssh_key, cfg)
+                push_haproxy_cfg(dcp_host, args.ssh_user, args.ssh_key, cfg, bastion=None)
 
     # 10) Validation
     if not args.skip_validation:
