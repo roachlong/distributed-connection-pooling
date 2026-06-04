@@ -1,11 +1,14 @@
-# AWS EKS Reference Architecture (GovCloud)
+# AWS EKS Reference Architecture
 
-This reference architecture deploys a **production-ready, FedRAMP-compliant** CockroachDB cluster with distributed connection pooling on AWS GovCloud using the CockroachDB Kubernetes Operator with **Physical Cluster Replication (PCR)** for disaster recovery.
+This reference architecture deploys a **production-ready** CockroachDB cluster with distributed connection pooling on AWS EKS (Elastic Kubernetes Service) using the CockroachDB Kubernetes Operator with **Physical Cluster Replication (PCR)** for disaster recovery.
+
+**Deployment Targets**: Commercial AWS (default) and AWS GovCloud (FedRAMP-compliant variant)
 
 ## Overview
 
 **Architecture Components:**
-- **Dual EKS Clusters**: Active (us-gov-east-1) and Passive (us-gov-west-1) for PCR
+- **Dual EKS Clusters**: Active (us-east-1) and Passive (us-west-2) for PCR in commercial AWS
+  - For GovCloud: Active (us-gov-east-1) and Passive (us-gov-west-1)
 - **CockroachDB Operator**: Kubernetes operator for automated CRDB lifecycle management
 - **CockroachDB StatefulSet**: Database tier with persistent volumes and 3-AZ pod anti-affinity
 - **Virtual Cluster Architecture**: PCR uses `main` virtual cluster on top of system tenant
@@ -16,10 +19,10 @@ This reference architecture deploys a **production-ready, FedRAMP-compliant** Co
 - **IAM Roles for Service Accounts (IRSA)**: S3 access for backups without hardcoded credentials
 
 **Security & Compliance Features:**
-- **Physical Cluster Replication**: Active-passive DR across GovCloud regions
-- **EBS Encryption**: Customer-managed KMS keys (CMK) for OCC compliance
+- **Physical Cluster Replication**: Active-passive DR across regions
+- **EBS Encryption**: Customer-managed KMS keys (CMK) for data-at-rest security
 - **CockroachDB Encryption-at-Rest**: Database-level encryption (Enterprise license required)
-- **FIPS 140-3**: FIPS-validated CockroachDB binary for GovCloud
+- **FIPS 140-3** (GovCloud only): FIPS-validated CockroachDB binary
 - **mTLS Everywhere**: Vault PKI-issued certificates for all cluster communication
 - **Network Policies**: Deny-all default with explicit allow rules (no pod-to-internet egress)
 - **Audit Log Pipeline**: Fluent Bit → S3 with Object Lock (WORM) for 7-year retention
@@ -39,11 +42,66 @@ This reference architecture deploys a **production-ready, FedRAMP-compliant** Co
 
 ---
 
+## Commercial AWS vs. GovCloud
+
+This reference architecture is designed to work on **both commercial AWS and AWS GovCloud**. The default configuration targets **commercial AWS** (us-east-1/us-west-2), but migrating to GovCloud requires only **changing configuration variables** in [config.env](config.env) — no architectural rework.
+
+### What's the Same
+
+Almost everything translates directly:
+- EKS cluster configuration and 3-AZ topology
+- CockroachDB Operator installation and CRDB deployment
+- Physical Cluster Replication (PCR) setup
+- Vault PKI + cert-manager integration
+- PgBouncer configuration and deployment
+- Network policies and security posture
+- Audit logging pipeline and S3 Object Lock
+- ArgoCD GitOps workflow
+- Monitoring with Prometheus and Grafana
+
+### Key Differences
+
+| Aspect | Commercial AWS | AWS GovCloud |
+|--------|---------------|--------------|
+| **Regions** | us-east-1, us-west-2, etc. | us-gov-east-1, us-gov-west-1 |
+| **ARN Format** | `arn:aws:service::...` | `arn:aws-us-gov:service::...` |
+| **Container Images** | Pull directly from public registries<br/>(public.ecr.aws, Docker Hub) | Must mirror to private ECR<br/>(restricted internet access) |
+| **CockroachDB Image** | `v25.4.11` (standard) | `v25.4.11-fips` (FIPS 140-3) |
+| **Compliance** | Industry-standard security | FedRAMP High certified |
+| **IAM Permissions Boundary** | Optional (org-specific) | Often required by policy |
+| **S3 Endpoints** | Standard AWS endpoints | GovCloud-specific endpoints |
+
+### Switching to GovCloud
+
+To deploy on GovCloud instead of commercial AWS:
+
+1. **Update [config.env](config.env)** with GovCloud values:
+   ```bash
+   export AWS_REGION_EAST="us-gov-east-1"
+   export AWS_REGION_WEST="us-gov-west-1"
+   export ENVIRONMENT="govcloud"
+   export COCKROACHDB_VERSION="v25.4.11-fips"
+   export IAM_PERMISSIONS_BOUNDARY_ARN="arn:aws-us-gov:iam::${AWS_ACCOUNT_ID}:policy/YourBoundary"
+   ```
+
+2. **Mirror container images to ECR** (see [GovCloud Pre-Requisites](#govcloud-pre-requisites))
+
+3. **Deploy as normal** — all manifests use variable substitution from config.env
+
+That's it. The architecture, manifests, and procedures remain identical.
+
+---
+
 ## Table of Contents
 
+- [Commercial AWS vs. GovCloud](#commercial-aws-vs-govcloud)
 - [Prerequisites](#prerequisites)
 - [Implementation Plan](#implementation-plan)
-- [GovCloud Pre-Requisites](#govcloud-pre-requisites)
+- [Container Image Setup](#container-image-setup)
+  - [Commercial AWS (Direct Pull)](#commercial-aws-direct-pull)
+  - [GovCloud (ECR Mirroring)](#govcloud-ecr-mirroring)
+- [Customer-Managed KMS Key (CMK)](#customer-managed-kms-key-cmk)
+- [S3 Buckets with Object Lock (WORM)](#s3-buckets-with-object-lock-worm)
 - [EKS Cluster Setup (3-AZ Topology)](#eks-cluster-setup-3-az-topology)
 - [GitOps / ArgoCD Integration](#gitops--argocd-integration)
 - [HashiCorp Vault PKI Setup](#hashicorp-vault-pki-setup)
@@ -105,8 +163,8 @@ sudo mv argocd /usr/local/bin/
 sudo apt-get install jq  # or yum install jq
 
 # cockroach CLI
-curl https://binaries.cockroachdb.com/cockroach-v25.4.3.linux-amd64.tgz | tar -xz
-sudo cp -i cockroach-v25.4.3.linux-amd64/cockroach /usr/local/bin/
+curl https://binaries.cockroachdb.com/cockroach-v25.4.11.linux-amd64.tgz | tar -xz
+sudo cp -i cockroach-v25.4.11.linux-amd64/cockroach /usr/local/bin/
 ```
 
 ### AWS GovCloud Account Setup
@@ -168,20 +226,41 @@ Before deploying, ensure:
 
 ---
 
-## GovCloud Pre-Requisites
+## Container Image Setup
 
-AWS GovCloud has specific constraints that require pre-deployment configuration.
+Container image sourcing differs between commercial AWS and GovCloud.
 
-### 1. Container Image Mirroring to ECR
+### Commercial AWS (Direct Pull)
 
-GovCloud does not have access to public container registries (`docker.io`, `public.ecr.aws`, `ghcr.io`). All images must be mirrored to a private ECR repository in GovCloud.
+**In commercial AWS, you can pull container images directly from public registries.**
 
-**Required images:**
-- `cockroachdb/cockroach:v25.4.3-fips` (FIPS 140-3 validated binary)
+No mirroring required. The manifests reference standard images:
+- `cockroachdb/cockroach:v25.4.11`
 - `cockroachdb/cockroach-operator:v2.15.0`
 - `pgbouncer/pgbouncer:1.22.1`
 - `fluent/fluent-bit:3.0.2`
-- `hashicorp/vault-k8s:1.4.0` (for Vault Agent Injector)
+- `hashicorp/vault-k8s:1.4.0`
+- `external-secrets/external-secrets:v0.9.13`
+- `jetstack/cert-manager-controller:v1.14.3`
+- `jetstack/cert-manager-webhook:v1.14.3`
+- `jetstack/cert-manager-cainjector:v1.14.3`
+
+Kubernetes will pull these from Docker Hub, `public.ecr.aws`, or `ghcr.io` automatically.
+
+**Skip to [EKS Cluster Setup](#eks-cluster-setup-3-az-topology)** if deploying on commercial AWS.
+
+---
+
+### GovCloud (ECR Mirroring)
+
+**AWS GovCloud does not have access to public container registries** (`docker.io`, `public.ecr.aws`, `ghcr.io`). All images must be mirrored to a private ECR repository in GovCloud.
+
+**Required images (GovCloud-specific versions):**
+- `cockroachdb/cockroach:v25.4.11-fips` (FIPS 140-3 validated binary)
+- `cockroachdb/cockroach-operator:v2.15.0`
+- `pgbouncer/pgbouncer:1.22.1`
+- `fluent/fluent-bit:3.0.2`
+- `hashicorp/vault-k8s:1.4.0`
 - `external-secrets/external-secrets:v0.9.13`
 - `jetstack/cert-manager-controller:v1.14.3`
 - `jetstack/cert-manager-webhook:v1.14.3`
@@ -190,24 +269,26 @@ GovCloud does not have access to public container registries (`docker.io`, `publ
 **Mirror images to GovCloud ECR:**
 
 ```bash
-# Set variables
-export AWS_ACCOUNT_ID=123456789012
+# Source configuration
+source config.env
+
+# Set GovCloud-specific variables
 export AWS_REGION=us-gov-east-1
 export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
 # Login to commercial AWS ECR public and GovCloud ECR
 aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
-aws ecr get-login-password --region ${AWS_REGION} --profile govcloud-revenue | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+aws ecr get-login-password --region ${AWS_REGION} --profile ${AWS_PROFILE} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
 
 # Create ECR repositories
 for repo in cockroachdb cockroach-operator pgbouncer fluent-bit vault-k8s external-secrets cert-manager-controller cert-manager-webhook cert-manager-cainjector; do
-  aws ecr create-repository --repository-name ${repo} --region ${AWS_REGION} --profile govcloud-revenue || true
+  aws ecr create-repository --repository-name ${repo} --region ${AWS_REGION} --profile ${AWS_PROFILE} || true
 done
 
 # Mirror CockroachDB FIPS binary
-docker pull cockroachdb/cockroach:v25.4.3-fips
-docker tag cockroachdb/cockroach:v25.4.3-fips ${ECR_REGISTRY}/cockroachdb:v25.4.3-fips
-docker push ${ECR_REGISTRY}/cockroachdb:v25.4.3-fips
+docker pull cockroachdb/cockroach:v25.4.11-fips
+docker tag cockroachdb/cockroach:v25.4.11-fips ${ECR_REGISTRY}/cockroachdb:v25.4.11-fips
+docker push ${ECR_REGISTRY}/cockroachdb:v25.4.11-fips
 
 # Mirror CockroachDB Operator
 docker pull cockroachdb/cockroach-operator:v2.15.0
@@ -224,151 +305,213 @@ docker pull fluent/fluent-bit:3.0.2
 docker tag fluent/fluent-bit:3.0.2 ${ECR_REGISTRY}/fluent-bit:3.0.2
 docker push ${ECR_REGISTRY}/fluent-bit:3.0.2
 
-# Mirror Vault, External Secrets, cert-manager (similar pattern)
-# ... (repeat for each image)
+# Mirror Vault K8s
+docker pull hashicorp/vault-k8s:1.4.0
+docker tag hashicorp/vault-k8s:1.4.0 ${ECR_REGISTRY}/vault-k8s:1.4.0
+docker push ${ECR_REGISTRY}/vault-k8s:1.4.0
+
+# Mirror External Secrets
+docker pull ghcr.io/external-secrets/external-secrets:v0.9.13
+docker tag ghcr.io/external-secrets/external-secrets:v0.9.13 ${ECR_REGISTRY}/external-secrets:v0.9.13
+docker push ${ECR_REGISTRY}/external-secrets:v0.9.13
+
+# Mirror cert-manager images
+docker pull quay.io/jetstack/cert-manager-controller:v1.14.3
+docker tag quay.io/jetstack/cert-manager-controller:v1.14.3 ${ECR_REGISTRY}/cert-manager-controller:v1.14.3
+docker push ${ECR_REGISTRY}/cert-manager-controller:v1.14.3
+
+docker pull quay.io/jetstack/cert-manager-webhook:v1.14.3
+docker tag quay.io/jetstack/cert-manager-webhook:v1.14.3 ${ECR_REGISTRY}/cert-manager-webhook:v1.14.3
+docker push ${ECR_REGISTRY}/cert-manager-webhook:v1.14.3
+
+docker pull quay.io/jetstack/cert-manager-cainjector:v1.14.3
+docker tag quay.io/jetstack/cert-manager-cainjector:v1.14.3 ${ECR_REGISTRY}/cert-manager-cainjector:v1.14.3
+docker push ${ECR_REGISTRY}/cert-manager-cainjector:v1.14.3
 ```
 
-**Repeat for us-gov-west-1** (passive cluster region).
+**Repeat for us-gov-west-1** (passive cluster region):
+```bash
+export AWS_REGION=us-gov-west-1
+export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+# ... (repeat mirror commands)
+```
 
-### 2. Customer-Managed KMS Key (CMK)
+**Verify FIPS 140-3 Binary** (GovCloud only):
+```bash
+# Check FIPS binary availability
+docker pull ${ECR_REGISTRY}/cockroachdb:v25.4.11-fips
+docker run --rm ${ECR_REGISTRY}/cockroachdb:v25.4.11-fips version
 
-Create a customer-managed KMS key in each region for EBS encryption to satisfy OCC CMK requirements.
+# Expected output should indicate FIPS mode
+# Build Tag:    v25.4.11-fips
+# FIPS Mode:    enabled
+```
+
+---
+
+## Customer-Managed KMS Key (CMK)
+
+Create a customer-managed KMS key in each region for EBS encryption. This provides defense-in-depth alongside CockroachDB's encryption-at-rest.
+
+**Note**: Phase 1 setup.sh script automates this. Manual steps below for reference.
 
 ```bash
-# Create CMK in us-gov-east-1
-aws kms create-key \
-  --description "CockroachDB EBS encryption key - us-gov-east-1" \
-  --region us-gov-east-1 \
-  --profile govcloud-revenue
+# Source configuration
+source config.env
+
+# Create CMK in primary region (us-east-1 commercial, us-gov-east-1 GovCloud)
+KEY_ID=$(aws kms create-key \
+  --description "CockroachDB EBS encryption key - ${AWS_REGION_EAST}" \
+  --region "${AWS_REGION_EAST}" \
+  --profile "${AWS_PROFILE}" \
+  --query 'KeyMetadata.KeyId' \
+  --output text)
 
 # Create alias
 aws kms create-alias \
-  --alias-name alias/crdb-ebs-east \
-  --target-key-id <key-id-from-above> \
-  --region us-gov-east-1 \
-  --profile govcloud-revenue
+  --alias-name "${KMS_KEY_ALIAS_EAST}" \
+  --target-key-id "${KEY_ID}" \
+  --region "${AWS_REGION_EAST}" \
+  --profile "${AWS_PROFILE}"
 
-# Get KMS key ARN (save for StorageClass configuration)
-export KMS_KEY_ARN_EAST=$(aws kms describe-key --key-id alias/crdb-ebs-east --region us-gov-east-1 --profile govcloud-revenue --query 'KeyMetadata.Arn' --output text)
+# Get KMS key ARN (save to config.env)
+export KMS_KEY_ARN_EAST=$(aws kms describe-key \
+  --key-id "${KMS_KEY_ALIAS_EAST}" \
+  --region "${AWS_REGION_EAST}" \
+  --profile "${AWS_PROFILE}" \
+  --query 'KeyMetadata.Arn' \
+  --output text)
 
-# Repeat for us-gov-west-1
-aws kms create-key \
-  --description "CockroachDB EBS encryption key - us-gov-west-1" \
-  --region us-gov-west-1 \
-  --profile govcloud-revenue
+echo "Update config.env with: export KMS_KEY_ARN_EAST=\"${KMS_KEY_ARN_EAST}\""
+
+# Repeat for secondary region (us-west-2 commercial, us-gov-west-1 GovCloud)
+KEY_ID=$(aws kms create-key \
+  --description "CockroachDB EBS encryption key - ${AWS_REGION_WEST}" \
+  --region "${AWS_REGION_WEST}" \
+  --profile "${AWS_PROFILE}" \
+  --query 'KeyMetadata.KeyId' \
+  --output text)
 
 aws kms create-alias \
-  --alias-name alias/crdb-ebs-west \
-  --target-key-id <key-id-from-above> \
-  --region us-gov-west-1 \
-  --profile govcloud-revenue
+  --alias-name "${KMS_KEY_ALIAS_WEST}" \
+  --target-key-id "${KEY_ID}" \
+  --region "${AWS_REGION_WEST}" \
+  --profile "${AWS_PROFILE}"
 
-export KMS_KEY_ARN_WEST=$(aws kms describe-key --key-id alias/crdb-ebs-west --region us-gov-west-1 --profile govcloud-revenue --query 'KeyMetadata.Arn' --output text)
+export KMS_KEY_ARN_WEST=$(aws kms describe-key \
+  --key-id "${KMS_KEY_ALIAS_WEST}" \
+  --region "${AWS_REGION_WEST}" \
+  --profile "${AWS_PROFILE}" \
+  --query 'KeyMetadata.Arn' \
+  --output text)
+
+echo "Update config.env with: export KMS_KEY_ARN_WEST=\"${KMS_KEY_ARN_WEST}\""
 ```
 
-### 3. S3 Buckets with Object Lock (WORM)
+---
 
-Create separate S3 buckets for backups and audit logs with Object Lock for compliance.
+## S3 Buckets with Object Lock (WORM)
+
+Create separate S3 buckets for backups and audit logs with Object Lock (Write Once Read Many) for compliance.
+
+**Retention policies:**
+- **Backups**: 365 days (1 year)
+- **Audit logs**: 2,555 days (7 years)
+
+**Note**: Phase 1 setup.sh script automates this. Manual steps below for reference.
 
 ```bash
-# Backup bucket (365-day retention)
+# Source configuration
+source config.env
+
+# Backup bucket (365-day retention) - Primary region
 aws s3api create-bucket \
-  --bucket crdb-backups-govcloud-east \
-  --region us-gov-east-1 \
-  --create-bucket-configuration LocationConstraint=us-gov-east-1 \
+  --bucket "${S3_BUCKET_BACKUPS_EAST}" \
+  --region "${AWS_REGION_EAST}" \
+  --create-bucket-configuration LocationConstraint="${AWS_REGION_EAST}" \
   --object-lock-enabled-for-bucket \
-  --profile govcloud-revenue
+  --profile "${AWS_PROFILE}"
 
 aws s3api put-object-lock-configuration \
-  --bucket crdb-backups-govcloud-east \
+  --bucket "${S3_BUCKET_BACKUPS_EAST}" \
   --object-lock-configuration 'Rule={DefaultRetention={Mode=COMPLIANCE,Days=365}}' \
-  --region us-gov-east-1 \
-  --profile govcloud-revenue
+  --region "${AWS_REGION_EAST}" \
+  --profile "${AWS_PROFILE}"
 
-# Audit log bucket (7-year retention with Object Lock)
+aws s3api put-bucket-encryption \
+  --bucket "${S3_BUCKET_BACKUPS_EAST}" \
+  --server-side-encryption-configuration "{
+    \"Rules\": [{
+      \"ApplyServerSideEncryptionByDefault\": {
+        \"SSEAlgorithm\": \"aws:kms\",
+        \"KMSMasterKeyID\": \"${KMS_KEY_ARN_EAST}\"
+      }
+    }]
+  }" \
+  --region "${AWS_REGION_EAST}" \
+  --profile "${AWS_PROFILE}"
+
+# Audit log bucket (7-year retention) - Primary region
 aws s3api create-bucket \
-  --bucket crdb-audit-logs-govcloud-east \
-  --region us-gov-east-1 \
-  --create-bucket-configuration LocationConstraint=us-gov-east-1 \
+  --bucket "${S3_BUCKET_AUDIT_EAST}" \
+  --region "${AWS_REGION_EAST}" \
+  --create-bucket-configuration LocationConstraint="${AWS_REGION_EAST}" \
   --object-lock-enabled-for-bucket \
-  --profile govcloud-revenue
+  --profile "${AWS_PROFILE}"
 
 aws s3api put-object-lock-configuration \
-  --bucket crdb-audit-logs-govcloud-east \
+  --bucket "${S3_BUCKET_AUDIT_EAST}" \
   --object-lock-configuration 'Rule={DefaultRetention={Mode=COMPLIANCE,Days=2555}}' \
-  --region us-gov-east-1 \
-  --profile govcloud-revenue
-
-# Enable server-side encryption with KMS
-aws s3api put-bucket-encryption \
-  --bucket crdb-backups-govcloud-east \
-  --server-side-encryption-configuration '{
-    "Rules": [{
-      "ApplyServerSideEncryptionByDefault": {
-        "SSEAlgorithm": "aws:kms",
-        "KMSMasterKeyID": "'${KMS_KEY_ARN_EAST}'"
-      }
-    }]
-  }' \
-  --region us-gov-east-1 \
-  --profile govcloud-revenue
+  --region "${AWS_REGION_EAST}" \
+  --profile "${AWS_PROFILE}"
 
 aws s3api put-bucket-encryption \
-  --bucket crdb-audit-logs-govcloud-east \
-  --server-side-encryption-configuration '{
-    "Rules": [{
-      "ApplyServerSideEncryptionByDefault": {
-        "SSEAlgorithm": "aws:kms",
-        "KMSMasterKeyID": "'${KMS_KEY_ARN_EAST}'"
+  --bucket "${S3_BUCKET_AUDIT_EAST}" \
+  --server-side-encryption-configuration "{
+    \"Rules\": [{
+      \"ApplyServerSideEncryptionByDefault\": {
+        \"SSEAlgorithm\": \"aws:kms\",
+        \"KMSMasterKeyID\": \"${KMS_KEY_ARN_EAST}\"
       }
     }]
-  }' \
-  --region us-gov-east-1 \
-  --profile govcloud-revenue
+  }" \
+  --region "${AWS_REGION_EAST}" \
+  --profile "${AWS_PROFILE}"
 
-# Repeat for us-gov-west-1
-```
-
-### 4. FIPS 140-3 Binary Verification
-
-Verify the CockroachDB FIPS binary is available for your target version:
-
-```bash
-# Check FIPS binary availability
-docker pull ${ECR_REGISTRY}/cockroachdb:v25.4.3-fips
-docker run --rm ${ECR_REGISTRY}/cockroachdb:v25.4.3-fips version
-
-# Expected output should indicate FIPS mode
-# Build Tag:    v25.4.3-fips
-# FIPS Mode:    enabled
+# Repeat for secondary region (us-west-2 commercial, us-gov-west-1 GovCloud)
+# ... (same commands with S3_BUCKET_*_WEST and AWS_REGION_WEST variables)
 ```
 
 ---
 
 ## EKS Cluster Setup (3-AZ Topology)
 
-Deploy EKS clusters in both us-gov-east-1 (active) and us-gov-west-1 (passive) with explicit 3-AZ node placement for local quorum.
+Deploy EKS clusters in both regions (us-east-1/us-west-2 for commercial, us-gov-east-1/us-gov-west-1 for GovCloud) with explicit 3-AZ node placement for local quorum.
 
 ### Architecture Requirements
 
 **3-AZ Topology for Local Quorum:**
-- Managed node groups spanning us-gov-east-1a, us-gov-east-1b, us-gov-east-1c
+- Managed node groups spanning 3 availability zones (e.g., us-east-1a, us-east-1b, us-east-1c)
 - Pod anti-affinity rules forcing one CockroachDB pod per AZ
 - topologySpreadConstraints for even distribution
 - `volumeBindingMode: WaitForFirstConsumer` in StorageClass for AZ-aware EBS provisioning
 
-### Option 1: Using eksctl
+**Deployment**: See [Phase 1: Foundation](manifests/phase1-foundation/README.md) for automated deployment via setup.sh script.
 
-Create `cluster-east.yaml`:
+### Manual eksctl Deployment (Reference)
+
+The actual cluster configuration is in [manifests/phase1-foundation/cluster-east.yaml](manifests/phase1-foundation/cluster-east.yaml) which uses variable substitution from config.env.
+
+**Example structure** (actual file uses ${VARIABLES}):
 
 ```yaml
 apiVersion: eksctl.io/v1alpha5
 kind: ClusterConfig
 
 metadata:
-  name: crdb-dcp-east
-  region: us-gov-east-1
-  version: "1.28"
+  name: ${CLUSTER_NAME_EAST}  # from config.env
+  region: ${AWS_REGION_EAST}  # us-east-1 (commercial) or us-gov-east-1 (GovCloud)
+  version: "${EKS_VERSION}"
 
 iam:
   withOIDC: true
@@ -901,7 +1044,7 @@ metadata:
 spec:
   # FIPS-validated binary from GovCloud ECR
   image:
-    name: 123456789012.dkr.ecr.us-gov-east-1.amazonaws.com/cockroachdb:v25.4.3-fips
+    name: 123456789012.dkr.ecr.us-gov-east-1.amazonaws.com/cockroachdb:v25.4.11-fips
   
   # 3 nodes for quorum (one per AZ)
   nodes: 3
@@ -961,7 +1104,7 @@ spec:
     - --cluster-name=crdb-east
   
   # Cluster init settings
-  cockroachDBVersion: v25.4.3
+  cockroachDBVersion: v25.4.11
   
   # Enable rangefeed for PCR (set via SQL after cluster init)
   # cluster.organization and enterprise.license injected via secret

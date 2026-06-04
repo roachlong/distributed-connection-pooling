@@ -2,6 +2,8 @@
 
 Production-ready deployment of CockroachDB with distributed connection pooling on AWS EKS using the CockroachDB Kubernetes Operator.
 
+**Deployment Targets**: Commercial AWS (default) and AWS GovCloud — migration between clouds requires only changing variables in [config.env](config.env).
+
 ## Quick Links
 
 - **[Full Deployment Guide](./DEPLOYMENT.md)** - Complete setup instructions
@@ -30,9 +32,11 @@ This reference architecture demonstrates how to deploy a highly available, cloud
 
 ## Prerequisites
 
-- AWS account with EKS permissions
+- AWS account with EKS permissions (commercial AWS or GovCloud)
 - kubectl, helm, eksctl, aws CLI installed
 - Basic Kubernetes knowledge
+- HashiCorp Vault instance (for PKI/certificate management)
+- CockroachDB Enterprise license (for encryption-at-rest and PCR)
 
 ## Getting Started
 
@@ -67,7 +71,7 @@ This reference architecture is built incrementally over 10 phases, where each ph
 
 | Phase | Component | Duration | Prerequisites |
 |-------|-----------|----------|---------------|
-| **1** | [Foundation](#phase-1-foundation) | 2-4h | AWS creds, ECR images |
+| **1** | [Foundation](#phase-1-foundation) | 2-4h | AWS creds |
 | **2** | [Certificates](#phase-2-certificates) | 2-3h | Phase 1, Vault |
 | **3** | [Operator](#phase-3-operator) | 1h | Phase 2 |
 | **4** | [CRDB Cluster](#phase-4-crdb-cluster) | 2-3h | Phase 3 |
@@ -85,18 +89,19 @@ This reference architecture is built incrementally over 10 phases, where each ph
 
 ### Phase 1: Foundation
 
-**Objective**: Deploy EKS cluster in us-gov-east-1 with 3-AZ topology
+**Objective**: Deploy EKS cluster in primary region with 3-AZ topology
 
 **Steps**:
-1. Mirror container images to GovCloud ECR
-2. Create customer-managed KMS key for EBS encryption
-3. Create S3 buckets (backups + audit logs) with Object Lock
-4. Deploy EKS cluster with 3 node groups (one per AZ)
-5. Install AWS Load Balancer Controller
-6. Create StorageClass with `volumeBindingMode: WaitForFirstConsumer`
+1. Configure variables in config.env (regions, instance types, etc.)
+2. Mirror container images to ECR (GovCloud only - skip for commercial AWS)
+3. Create customer-managed KMS key for EBS encryption
+4. Create S3 buckets (backups + audit logs) with Object Lock
+5. Deploy EKS cluster with 3 node groups (one per AZ)
+6. Install AWS Load Balancer Controller
+7. Create StorageClass with `volumeBindingMode: WaitForFirstConsumer`
 
 **Success Criteria**:
-- ✅ 3 node groups running (us-gov-east-1a/b/c)
+- ✅ 3 node groups running (one per AZ in primary region)
 - ✅ StorageClass with CMK encryption ready
 - ✅ LB controller operational
 
@@ -135,7 +140,7 @@ This reference architecture is built incrementally over 10 phases, where each ph
 **Steps**:
 1. Create cockroach-operator-system namespace
 2. Apply CockroachDB CRDs
-3. Deploy operator (GovCloud ECR image)
+3. Deploy operator
 
 **Success Criteria**:
 - ✅ CRDs installed
@@ -275,7 +280,7 @@ This reference architecture is built incrementally over 10 phases, where each ph
 **Objective**: Add West cluster and configure active-passive PCR
 
 **Steps**:
-1. Repeat Phases 1-9 for us-gov-west-1
+1. Repeat Phases 1-9 for secondary region (us-west-2 commercial / us-gov-west-1 GovCloud)
 2. Configure Transit Gateway between East/West VPCs
 3. Enable rangefeed on both clusters
 4. Create virtual cluster replication (East → West)

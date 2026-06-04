@@ -4,9 +4,11 @@ Deploy EKS cluster with 3-AZ topology, networking, and storage infrastructure.
 
 ## Prerequisites
 
-- AWS GovCloud credentials configured
+- AWS credentials configured (commercial AWS or GovCloud)
 - Tools installed: `aws`, `eksctl`, `kubectl`, `helm`, `jq`, `envsubst`
-- Container images mirrored to GovCloud ECR (see steps below)
+- Container images available:
+  - **Commercial AWS**: Pull directly from public registries (no setup required)
+  - **GovCloud**: Mirror images to private ECR (see [DEPLOYMENT.md](../../DEPLOYMENT.md#govcloud-ecr-mirroring))
 
 ## Configuration
 
@@ -25,20 +27,23 @@ vim ../../config.env
 
 1. **AWS Account & Authentication**:
    ```bash
-   export AWS_ACCOUNT_ID="123456789012"  # Your GovCloud account ID
-   export AWS_PROFILE="govcloud-revenue"  # Your AWS CLI profile name
+   export AWS_ACCOUNT_ID="123456789012"  # Your AWS account ID
+   export AWS_PROFILE="default"  # Your AWS CLI profile name
+   # For GovCloud: export AWS_PROFILE="govcloud-revenue"
    ```
 
-2. **Regions** (modify if needed):
+2. **Regions** (commercial AWS by default):
    ```bash
-   export AWS_REGION_EAST="us-gov-east-1"
-   export AWS_REGION_WEST="us-gov-west-1"
+   export AWS_REGION_EAST="us-east-1"
+   export AWS_REGION_WEST="us-west-2"
+   # For GovCloud: us-gov-east-1 / us-gov-west-1
    ```
 
 3. **Project Naming**:
    ```bash
    export PROJECT_NAME="crdb-dcp"
-   export ENVIRONMENT="govcloud"
+   export ENVIRONMENT="production"  # or "development", "staging"
+   # For GovCloud: export ENVIRONMENT="govcloud"
    ```
 
 4. **Node Configuration** (adjust sizes as needed):
@@ -49,7 +54,10 @@ vim ../../config.env
 
 5. **IAM Permissions Boundary** (if required by your organization):
    ```bash
-   export IAM_PERMISSIONS_BOUNDARY_ARN="arn:aws-us-gov:iam::123456789012:policy/YourBoundary"
+   # Usually not required in commercial AWS unless org policy mandates it
+   export IAM_PERMISSIONS_BOUNDARY_ARN=""
+   # For GovCloud or orgs with boundary requirement:
+   # export IAM_PERMISSIONS_BOUNDARY_ARN="arn:aws-us-gov:iam::123456789012:policy/YourBoundary"
    ```
 
 6. **HashiCorp Vault** (if you have Vault already):
@@ -93,7 +101,7 @@ The script will:
 2. Validate configuration
 3. Create KMS customer-managed key
 4. Create S3 buckets with Object Lock
-5. Prompt for image mirroring confirmation
+5. Prompt for image mirroring confirmation (GovCloud only - skippable for commercial AWS)
 6. Deploy EKS cluster
 7. Install AWS Load Balancer Controller
 8. Create StorageClass
@@ -192,20 +200,11 @@ aws s3api put-bucket-encryption \
   --profile "${AWS_PROFILE}"
 ```
 
-#### 3. Mirror Container Images to ECR
+#### 3. Container Images
 
-See `../../DEPLOYMENT.md` section "GovCloud Pre-Requisites" for detailed mirroring commands.
+**Commercial AWS**: Skip this step - images will be pulled directly from public registries.
 
-Required images:
-- `cockroachdb/cockroach:v25.4.3-fips`
-- `cockroachdb/cockroach-operator:v2.15.0`
-- `pgbouncer/pgbouncer:1.22.1`
-- `fluent/fluent-bit:3.0.2`
-- `jetstack/cert-manager-controller:v1.14.3`
-- `jetstack/cert-manager-webhook:v1.14.3`
-- `jetstack/cert-manager-cainjector:v1.14.3`
-- `external-secrets/external-secrets:v0.9.13`
-- `hashicorp/vault-k8s:1.4.0`
+**GovCloud only**: Mirror images to private ECR. See [DEPLOYMENT.md](../../DEPLOYMENT.md#govcloud-ecr-mirroring) for detailed commands.
 
 #### 4. Deploy EKS Cluster
 
