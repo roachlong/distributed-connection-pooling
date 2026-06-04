@@ -1,0 +1,153 @@
+# EKS Cluster Configuration - East (Active) Region
+# This file uses environment variables - source config.env before using
+# Usage: eksctl create cluster -f cluster-east.yaml
+
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: ${CLUSTER_NAME_EAST}
+  region: ${AWS_REGION_EAST}
+  version: "${EKS_VERSION}"
+  tags:
+    Project: ${TAG_PROJECT}
+    Environment: ${TAG_ENVIRONMENT}
+    ManagedBy: ${TAG_MANAGED_BY}
+
+iam:
+  withOIDC: true
+  serviceRolePermissionsBoundary: ${IAM_PERMISSIONS_BOUNDARY_ARN}
+
+vpc:
+  cidr: ${VPC_CIDR_EAST}
+  nat:
+    gateway: Single  # Single NAT gateway for cost efficiency (~$32/month)
+  clusterEndpoints:
+    privateAccess: ${EKS_ENDPOINT_PRIVATE_ACCESS}
+    publicAccess: ${EKS_ENDPOINT_PUBLIC_ACCESS}
+
+# Explicit AZ configuration for 3-AZ topology
+availabilityZones:
+  - ${AWS_AZ_EAST_1}
+  - ${AWS_AZ_EAST_2}
+  - ${AWS_AZ_EAST_3}
+
+# CockroachDB Node Groups (one per AZ for local quorum)
+managedNodeGroups:
+  - name: crdb-nodes-${AWS_AZ_EAST_1}
+    instanceType: ${CRDB_NODE_INSTANCE_TYPE}
+    desiredCapacity: ${CRDB_NODE_DESIRED_CAPACITY}
+    minSize: ${CRDB_NODE_MIN_SIZE}
+    maxSize: ${CRDB_NODE_MAX_SIZE}
+    volumeSize: ${CRDB_NODE_VOLUME_SIZE}
+    volumeType: ${CRDB_NODE_VOLUME_TYPE}
+    availabilityZones:
+      - ${AWS_AZ_EAST_1}
+    privateNetworking: true
+    labels:
+      role: cockroachdb
+      topology.kubernetes.io/zone: ${AWS_AZ_EAST_1}
+    tags:
+      k8s.io/cluster-autoscaler/enabled: "true"
+      k8s.io/cluster-autoscaler/${CLUSTER_NAME_EAST}: "owned"
+      Project: ${TAG_PROJECT}
+      Environment: ${TAG_ENVIRONMENT}
+    iam:
+      withAddonPolicies:
+        ebs: true
+        efs: false
+        fsx: false
+
+  - name: crdb-nodes-${AWS_AZ_EAST_2}
+    instanceType: ${CRDB_NODE_INSTANCE_TYPE}
+    desiredCapacity: ${CRDB_NODE_DESIRED_CAPACITY}
+    minSize: ${CRDB_NODE_MIN_SIZE}
+    maxSize: ${CRDB_NODE_MAX_SIZE}
+    volumeSize: ${CRDB_NODE_VOLUME_SIZE}
+    volumeType: ${CRDB_NODE_VOLUME_TYPE}
+    availabilityZones:
+      - ${AWS_AZ_EAST_2}
+    privateNetworking: true
+    labels:
+      role: cockroachdb
+      topology.kubernetes.io/zone: ${AWS_AZ_EAST_2}
+    tags:
+      k8s.io/cluster-autoscaler/enabled: "true"
+      k8s.io/cluster-autoscaler/${CLUSTER_NAME_EAST}: "owned"
+      Project: ${TAG_PROJECT}
+      Environment: ${TAG_ENVIRONMENT}
+    iam:
+      withAddonPolicies:
+        ebs: true
+
+  - name: crdb-nodes-${AWS_AZ_EAST_3}
+    instanceType: ${CRDB_NODE_INSTANCE_TYPE}
+    desiredCapacity: ${CRDB_NODE_DESIRED_CAPACITY}
+    minSize: ${CRDB_NODE_MIN_SIZE}
+    maxSize: ${CRDB_NODE_MAX_SIZE}
+    volumeSize: ${CRDB_NODE_VOLUME_SIZE}
+    volumeType: ${CRDB_NODE_VOLUME_TYPE}
+    availabilityZones:
+      - ${AWS_AZ_EAST_3}
+    privateNetworking: true
+    labels:
+      role: cockroachdb
+      topology.kubernetes.io/zone: ${AWS_AZ_EAST_3}
+    tags:
+      k8s.io/cluster-autoscaler/enabled: "true"
+      k8s.io/cluster-autoscaler/${CLUSTER_NAME_EAST}: "owned"
+      Project: ${TAG_PROJECT}
+      Environment: ${TAG_ENVIRONMENT}
+    iam:
+      withAddonPolicies:
+        ebs: true
+
+  # Application Node Group (multi-AZ)
+  - name: app-nodes
+    instanceType: ${APP_NODE_INSTANCE_TYPE}
+    desiredCapacity: ${APP_NODE_DESIRED_CAPACITY}
+    minSize: ${APP_NODE_MIN_SIZE}
+    maxSize: ${APP_NODE_MAX_SIZE}
+    volumeSize: ${APP_NODE_VOLUME_SIZE}
+    volumeType: ${APP_NODE_VOLUME_TYPE}
+    availabilityZones:
+      - ${AWS_AZ_EAST_1}
+      - ${AWS_AZ_EAST_2}
+      - ${AWS_AZ_EAST_3}
+    privateNetworking: true
+    labels:
+      role: application
+    tags:
+      k8s.io/cluster-autoscaler/enabled: "true"
+      k8s.io/cluster-autoscaler/${CLUSTER_NAME_EAST}: "owned"
+      Project: ${TAG_PROJECT}
+      Environment: ${TAG_ENVIRONMENT}
+    iam:
+      withAddonPolicies:
+        ebs: true
+        albIngress: true
+
+# Add-ons
+addons:
+  - name: vpc-cni
+    version: latest
+  - name: coredns
+    version: latest
+  - name: kube-proxy
+    version: latest
+  - name: aws-ebs-csi-driver
+    version: latest
+    attachPolicyARNs:
+      - arn:aws-us-gov:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+    permissionsBoundary: ${IAM_PERMISSIONS_BOUNDARY_ARN}
+
+# CloudWatch Logging
+cloudWatch:
+  clusterLogging:
+    enableTypes:
+      - api
+      - audit
+      - authenticator
+      - controllerManager
+      - scheduler
+    logRetentionInDays: 30

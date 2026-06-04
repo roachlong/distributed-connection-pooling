@@ -1,0 +1,20 @@
+# StorageClass with Customer-Managed KMS Key
+# This is a template file - run through envsubst before applying
+# Usage: envsubst < storageclass.yaml.template | kubectl apply -f -
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ${STORAGE_CLASS_NAME}
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+parameters:
+  type: ${STORAGE_TYPE}
+  iops: "${STORAGE_IOPS}"
+  throughput: "${STORAGE_THROUGHPUT}"
+  encrypted: "true"
+  kmsKeyId: "${KMS_KEY_ARN_EAST}"  # Customer-managed key for OCC compliance
+volumeBindingMode: WaitForFirstConsumer  # Critical: ensures EBS volume created in same AZ as pod
+allowVolumeExpansion: true
+reclaimPolicy: ${STORAGE_RECLAIM_POLICY}

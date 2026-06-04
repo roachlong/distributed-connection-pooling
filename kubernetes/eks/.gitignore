@@ -1,0 +1,23 @@
+# Generated files (contain user-specific configuration)
+*.generated.yaml
+*.generated.yml
+storageclass.yaml
+iam-policy.json
+
+# Sensitive configuration (user should create from config.env template)
+config.local.env
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+
+# Kubernetes secrets (should never be committed)
+*secret*.yaml
+*Secret*.yaml
+
+# Downloaded artifacts
+*.tgz
+*.tar.gz
+*.zip

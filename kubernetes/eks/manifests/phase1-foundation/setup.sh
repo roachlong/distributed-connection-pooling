@@ -1,0 +1,455 @@
+#!/usr/bin/env bash
+# Phase 1: Foundation Setup Script
+# This script guides you through the EKS cluster deployment with all configurable values
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+CONFIG_FILE="${ROOT_DIR}/config.env"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+function print_header() {
+    echo -e "\n${GREEN}===================================${NC}"
+    echo -e "${GREEN}$1${NC}"
+    echo -e "${GREEN}===================================${NC}\n"
+}
+
+function print_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+function print_warning() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+function print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+function check_prerequisites() {
+    print_header "Checking Prerequisites"
+
+    local missing=0
+
+    # Check required tools
+    for tool in aws eksctl kubectl envsubst jq; do
+        if ! command -v $tool &> /dev/null; then
+            print_error "$tool is not installed"
+            missing=1
+        else
+            print_info "$tool is installed ($(command -v $tool))"
+        fi
+    done
+
+    if [[ $missing -eq 1 ]]; then
+        print_error "Missing required tools. Please install them and try again."
+        exit 1
+    fi
+
+    print_info "All prerequisites met"
+}
+
+function load_config() {
+    print_header "Loading Configuration"
+
+    if [[ ! -f "${CONFIG_FILE}" ]]; then
+        print_error "Configuration file not found: ${CONFIG_FILE}"
+        print_info "Please create config.env from the template"
+        exit 1
+    fi
+
+    # Source the config file
+    # shellcheck disable=SC1090
+    source "${CONFIG_FILE}"
+
+    print_info "Configuration loaded from ${CONFIG_FILE}"
+    print_info "  Project: ${PROJECT_NAME}"
+    print_info "  Region: ${AWS_REGION_EAST}"
+    print_info "  Cluster: ${CLUSTER_NAME_EAST}"
+}
+
+function validate_config() {
+    print_header "Validating Configuration"
+
+    local errors=0
+
+    # Check required variables
+    if [[ -z "${AWS_ACCOUNT_ID}" ]]; then
+        print_error "AWS_ACCOUNT_ID is not set"
+        errors=1
+    else
+        print_info "AWS Account ID: ${AWS_ACCOUNT_ID}"
+    fi
+
+    if [[ -z "${AWS_REGION_EAST}" ]]; then
+        print_error "AWS_REGION_EAST is not set"
+        errors=1
+    else
+        print_info "AWS Region: ${AWS_REGION_EAST}"
+    fi
+
+    if [[ -z "${CLUSTER_NAME_EAST}" ]]; then
+        print_error "CLUSTER_NAME_EAST is not set"
+        errors=1
+    else
+        print_info "Cluster Name: ${CLUSTER_NAME_EAST}"
+    fi
+
+    # Check AWS credentials
+    if ! aws sts get-caller-identity --profile "${AWS_PROFILE}" &> /dev/null; then
+        print_error "AWS credentials not configured or profile ${AWS_PROFILE} not found"
+        print_info "Run: aws sso login --profile ${AWS_PROFILE}"
+        errors=1
+    else
+        CALLER_IDENTITY=$(aws sts get-caller-identity --profile "${AWS_PROFILE}")
+        CALLER_ACCOUNT=$(echo "${CALLER_IDENTITY}" | jq -r '.Account')
+        CALLER_ARN=$(echo "${CALLER_IDENTITY}" | jq -r '.Arn')
+        print_info "AWS Credentials OK"
+        print_info "  Account: ${CALLER_ACCOUNT}"
+        print_info "  ARN: ${CALLER_ARN}"
+
+        if [[ "${CALLER_ACCOUNT}" != "${AWS_ACCOUNT_ID}" ]]; then
+            print_warning "AWS Account ID mismatch!"
+            print_warning "  Config: ${AWS_ACCOUNT_ID}"
+            print_warning "  Actual: ${CALLER_ACCOUNT}"
+        fi
+    fi
+
+    if [[ $errors -eq 1 ]]; then
+        print_error "Configuration validation failed"
+        exit 1
+    fi
+
+    print_info "Configuration validated successfully"
+}
+
+function create_kms_key() {
+    print_header "Creating KMS Customer-Managed Key"
+
+    # Check if key already exists
+    if aws kms describe-key --key-id "${KMS_KEY_ALIAS_EAST}" --region "${AWS_REGION_EAST}" --profile "${AWS_PROFILE}" &> /dev/null; then
+        print_warning "KMS key ${KMS_KEY_ALIAS_EAST} already exists"
+        KMS_KEY_ARN_EAST=$(aws kms describe-key --key-id "${KMS_KEY_ALIAS_EAST}" --region "${AWS_REGION_EAST}" --profile "${AWS_PROFILE}" --query 'KeyMetadata.Arn' --output text)
+        print_info "Using existing key: ${KMS_KEY_ARN_EAST}"
+    else
+        print_info "Creating new KMS key..."
+
+        KEY_ID=$(aws kms create-key \
+            --description "CockroachDB EBS encryption key - ${AWS_REGION_EAST}" \
+            --region "${AWS_REGION_EAST}" \
+            --profile "${AWS_PROFILE}" \
+            --query 'KeyMetadata.KeyId' \
+            --output text)
+
+        print_info "Key created: ${KEY_ID}"
+
+        # Create alias
+        aws kms create-alias \
+            --alias-name "${KMS_KEY_ALIAS_EAST}" \
+            --target-key-id "${KEY_ID}" \
+            --region "${AWS_REGION_EAST}" \
+            --profile "${AWS_PROFILE}"
+
+        print_info "Alias created: ${KMS_KEY_ALIAS_EAST}"
+
+        KMS_KEY_ARN_EAST=$(aws kms describe-key --key-id "${KMS_KEY_ALIAS_EAST}" --region "${AWS_REGION_EAST}" --profile "${AWS_PROFILE}" --query 'KeyMetadata.Arn' --output text)
+        print_info "KMS Key ARN: ${KMS_KEY_ARN_EAST}"
+
+        # Update config.env with the KMS key ARN
+        print_warning "Please update config.env with:"
+        echo "export KMS_KEY_ARN_EAST=\"${KMS_KEY_ARN_EAST}\""
+    fi
+
+    # Export for use in this session
+    export KMS_KEY_ARN_EAST
+}
+
+function create_s3_buckets() {
+    print_header "Creating S3 Buckets with Object Lock"
+
+    # Backup bucket
+    if aws s3 ls "s3://${S3_BUCKET_BACKUPS_EAST}" --region "${AWS_REGION_EAST}" --profile "${AWS_PROFILE}" &> /dev/null 2>&1; then
+        print_warning "Backup bucket ${S3_BUCKET_BACKUPS_EAST} already exists"
+    else
+        print_info "Creating backup bucket: ${S3_BUCKET_BACKUPS_EAST}"
+
+        aws s3api create-bucket \
+            --bucket "${S3_BUCKET_BACKUPS_EAST}" \
+            --region "${AWS_REGION_EAST}" \
+            --create-bucket-configuration LocationConstraint="${AWS_REGION_EAST}" \
+            --object-lock-enabled-for-bucket \
+            --profile "${AWS_PROFILE}"
+
+        # Configure Object Lock (365-day retention)
+        aws s3api put-object-lock-configuration \
+            --bucket "${S3_BUCKET_BACKUPS_EAST}" \
+            --object-lock-configuration 'Rule={DefaultRetention={Mode=COMPLIANCE,Days=365}}' \
+            --region "${AWS_REGION_EAST}" \
+            --profile "${AWS_PROFILE}"
+
+        # Enable encryption
+        aws s3api put-bucket-encryption \
+            --bucket "${S3_BUCKET_BACKUPS_EAST}" \
+            --server-side-encryption-configuration "{
+                \"Rules\": [{
+                    \"ApplyServerSideEncryptionByDefault\": {
+                        \"SSEAlgorithm\": \"aws:kms\",
+                        \"KMSMasterKeyID\": \"${KMS_KEY_ARN_EAST}\"
+                    }
+                }]
+            }" \
+            --region "${AWS_REGION_EAST}" \
+            --profile "${AWS_PROFILE}"
+
+        print_info "Backup bucket created with Object Lock and KMS encryption"
+    fi
+
+    # Audit log bucket
+    if aws s3 ls "s3://${S3_BUCKET_AUDIT_EAST}" --region "${AWS_REGION_EAST}" --profile "${AWS_PROFILE}" &> /dev/null 2>&1; then
+        print_warning "Audit bucket ${S3_BUCKET_AUDIT_EAST} already exists"
+    else
+        print_info "Creating audit log bucket: ${S3_BUCKET_AUDIT_EAST}"
+
+        aws s3api create-bucket \
+            --bucket "${S3_BUCKET_AUDIT_EAST}" \
+            --region "${AWS_REGION_EAST}" \
+            --create-bucket-configuration LocationConstraint="${AWS_REGION_EAST}" \
+            --object-lock-enabled-for-bucket \
+            --profile "${AWS_PROFILE}"
+
+        # Configure Object Lock (7-year / 2555-day retention)
+        aws s3api put-object-lock-configuration \
+            --bucket "${S3_BUCKET_AUDIT_EAST}" \
+            --object-lock-configuration 'Rule={DefaultRetention={Mode=COMPLIANCE,Days=2555}}' \
+            --region "${AWS_REGION_EAST}" \
+            --profile "${AWS_PROFILE}"
+
+        # Enable encryption
+        aws s3api put-bucket-encryption \
+            --bucket "${S3_BUCKET_AUDIT_EAST}" \
+            --server-side-encryption-configuration "{
+                \"Rules\": [{
+                    \"ApplyServerSideEncryptionByDefault\": {
+                        \"SSEAlgorithm\": \"aws:kms\",
+                        \"KMSMasterKeyID\": \"${KMS_KEY_ARN_EAST}\"
+                    }
+                }]
+            }" \
+            --region "${AWS_REGION_EAST}" \
+            --profile "${AWS_PROFILE}"
+
+        print_info "Audit log bucket created with 7-year Object Lock and KMS encryption"
+    fi
+}
+
+function mirror_images() {
+    print_header "Container Image Mirroring to GovCloud ECR"
+
+    print_warning "This step requires manual intervention"
+    print_info "You need to mirror the following images to ${ECR_REGISTRY_EAST}:"
+    echo ""
+    echo "  - cockroachdb/cockroach:${COCKROACHDB_VERSION}"
+    echo "  - cockroachdb/cockroach-operator:${COCKROACHDB_OPERATOR_VERSION}"
+    echo "  - pgbouncer/pgbouncer:${PGBOUNCER_VERSION}"
+    echo "  - fluent/fluent-bit:${FLUENT_BIT_VERSION}"
+    echo "  - jetstack/cert-manager-controller:${CERT_MANAGER_VERSION}"
+    echo "  - jetstack/cert-manager-webhook:${CERT_MANAGER_VERSION}"
+    echo "  - jetstack/cert-manager-cainjector:${CERT_MANAGER_VERSION}"
+    echo "  - external-secrets/external-secrets:${EXTERNAL_SECRETS_VERSION}"
+    echo "  - hashicorp/vault-k8s:${VAULT_K8S_VERSION}"
+    echo ""
+    print_info "Refer to DEPLOYMENT.md 'GovCloud Pre-Requisites' section for mirroring commands"
+    echo ""
+    read -p "Have you mirrored all images? (y/n) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        print_error "Please mirror images before proceeding"
+        exit 1
+    fi
+}
+
+function deploy_eks_cluster() {
+    print_header "Deploying EKS Cluster"
+
+    # Generate cluster config with environment variables substituted
+    print_info "Generating cluster configuration..."
+    envsubst < "${SCRIPT_DIR}/cluster-east.yaml" > "${SCRIPT_DIR}/cluster-east.generated.yaml"
+
+    print_info "Cluster configuration generated: cluster-east.generated.yaml"
+    print_info "Review the configuration before proceeding"
+
+    read -p "Deploy EKS cluster ${CLUSTER_NAME_EAST}? (y/n) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        print_warning "Deployment cancelled"
+        exit 0
+    fi
+
+    print_info "Creating EKS cluster (this will take 15-20 minutes)..."
+    eksctl create cluster -f "${SCRIPT_DIR}/cluster-east.generated.yaml" --profile "${AWS_PROFILE}"
+
+    print_info "EKS cluster created successfully"
+
+    # Update kubeconfig
+    print_info "Updating kubeconfig..."
+    aws eks update-kubeconfig --name "${CLUSTER_NAME_EAST}" --region "${AWS_REGION_EAST}" --profile "${AWS_PROFILE}"
+
+    print_info "Kubeconfig updated. You can now use kubectl"
+}
+
+function install_lb_controller() {
+    print_header "Installing AWS Load Balancer Controller"
+
+    # Create IAM policy
+    print_info "Creating IAM policy for LB controller..."
+
+    curl -o iam-policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.7.1/docs/install/iam_policy.json
+
+    if ! aws iam get-policy --policy-arn "arn:aws-us-gov:iam::${AWS_ACCOUNT_ID}:policy/AWSLoadBalancerControllerIAMPolicy" --profile "${AWS_PROFILE}" &> /dev/null; then
+        aws iam create-policy \
+            --policy-name AWSLoadBalancerControllerIAMPolicy \
+            --policy-document file://iam-policy.json \
+            --region "${AWS_REGION_EAST}" \
+            --profile "${AWS_PROFILE}"
+        print_info "IAM policy created"
+    else
+        print_warning "IAM policy already exists"
+    fi
+
+    rm -f iam-policy.json
+
+    # Create IRSA
+    print_info "Creating IAM role for service account..."
+    eksctl create iamserviceaccount \
+        --cluster="${CLUSTER_NAME_EAST}" \
+        --namespace=kube-system \
+        --name=aws-load-balancer-controller \
+        --attach-policy-arn="arn:aws-us-gov:iam::${AWS_ACCOUNT_ID}:policy/AWSLoadBalancerControllerIAMPolicy" \
+        --override-existing-serviceaccounts \
+        --region "${AWS_REGION_EAST}" \
+        --profile "${AWS_PROFILE}" \
+        --approve || print_warning "IRSA may already exist"
+
+    # Install controller via Helm
+    print_info "Installing LB controller via Helm..."
+    helm repo add eks https://aws.github.io/eks-charts
+    helm repo update
+
+    helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+        -n kube-system \
+        --set clusterName="${CLUSTER_NAME_EAST}" \
+        --set serviceAccount.create=false \
+        --set serviceAccount.name=aws-load-balancer-controller \
+        --set region="${AWS_REGION_EAST}" \
+        --set vpcId="$(aws eks describe-cluster --name "${CLUSTER_NAME_EAST}" --region "${AWS_REGION_EAST}" --profile "${AWS_PROFILE}" --query 'cluster.resourcesVpcConfig.vpcId' --output text)" \
+        || print_warning "LB controller may already be installed"
+
+    print_info "AWS Load Balancer Controller installed"
+}
+
+function create_storageclass() {
+    print_header "Creating StorageClass with Customer-Managed KMS Key"
+
+    # Generate StorageClass manifest
+    print_info "Generating StorageClass manifest..."
+    envsubst < "${SCRIPT_DIR}/storageclass.yaml.template" > "${SCRIPT_DIR}/storageclass.yaml"
+
+    # Apply StorageClass
+    print_info "Creating StorageClass: ${STORAGE_CLASS_NAME}"
+    kubectl apply -f "${SCRIPT_DIR}/storageclass.yaml"
+
+    print_info "StorageClass created successfully"
+}
+
+function verify_deployment() {
+    print_header "Verifying Deployment"
+
+    print_info "Checking nodes..."
+    kubectl get nodes -L topology.kubernetes.io/zone
+
+    print_info "Checking node groups..."
+    eksctl get nodegroup --cluster="${CLUSTER_NAME_EAST}" --region "${AWS_REGION_EAST}" --profile "${AWS_PROFILE}"
+
+    print_info "Checking StorageClass..."
+    kubectl get storageclass "${STORAGE_CLASS_NAME}"
+
+    print_info "Checking AWS LB Controller..."
+    kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller
+
+    print_info "Creating test PVC..."
+    kubectl apply -f - <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: test-pvc-phase1
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: ${STORAGE_CLASS_NAME}
+  resources:
+    requests:
+      storage: 10Gi
+EOF
+
+    sleep 5
+    kubectl get pvc test-pvc-phase1
+
+    print_warning "Note: PVC will stay Pending until a pod is scheduled (WaitForFirstConsumer)"
+
+    read -p "Delete test PVC? (y/n) " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        kubectl delete pvc test-pvc-phase1
+        print_info "Test PVC deleted"
+    fi
+}
+
+function main() {
+    print_header "Phase 1: Foundation Setup"
+    print_info "This script will set up the EKS cluster infrastructure"
+    echo ""
+
+    check_prerequisites
+    load_config
+    validate_config
+
+    echo ""
+    print_info "The following resources will be created:"
+    echo "  - KMS Customer-Managed Key for EBS encryption"
+    echo "  - S3 buckets (backups + audit logs) with Object Lock"
+    echo "  - EKS cluster: ${CLUSTER_NAME_EAST} in ${AWS_REGION_EAST}"
+    echo "  - 3 CockroachDB node groups (one per AZ)"
+    echo "  - 1 Application node group (multi-AZ)"
+    echo "  - AWS Load Balancer Controller"
+    echo "  - StorageClass: ${STORAGE_CLASS_NAME}"
+    echo ""
+
+    read -p "Proceed with setup? (y/n) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        print_warning "Setup cancelled"
+        exit 0
+    fi
+
+    # Execute setup steps
+    create_kms_key
+    create_s3_buckets
+    mirror_images
+    deploy_eks_cluster
+    install_lb_controller
+    create_storageclass
+    verify_deployment
+
+    print_header "Phase 1 Complete!"
+    print_info "EKS cluster is ready"
+    print_info "Next: Proceed to Phase 2 (Certificates)"
+}
+
+# Run main function
+main "$@"
