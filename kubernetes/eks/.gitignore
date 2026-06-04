@@ -21,3 +21,5 @@ config.local.env
 *.tgz
 *.tar.gz
 *.zip
+
+*.env
