@@ -418,6 +418,89 @@ function deploy_eks_cluster() {
     fi
 }
 
+function install_ebs_csi_driver() {
+    print_header "Installing AWS EBS CSI Driver"
+
+    # Check if addon already exists
+    if eksctl get addon --cluster="${CLUSTER_NAME_EAST}" --region="${AWS_REGION_EAST}" --profile="${AWS_PROFILE}" --name aws-ebs-csi-driver &>/dev/null 2>&1; then
+        print_warning "EBS CSI driver addon already installed"
+        return 0
+    fi
+
+    # Create IAM role for EBS CSI driver
+    print_info "Creating IAM role for EBS CSI driver..."
+    set +e
+    eksctl create iamserviceaccount \
+        --cluster="${CLUSTER_NAME_EAST}" \
+        --name=ebs-csi-controller-sa \
+        --namespace=kube-system \
+        --attach-policy-arn=arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy \
+        --override-existing-serviceaccounts \
+        --region="${AWS_REGION_EAST}" \
+        --profile="${AWS_PROFILE}" \
+        --approve 2>&1 | grep -v "certificate signed by unknown authority" || true
+    set -e
+
+    # Get the IAM role ARN
+    print_info "Getting IAM role ARN..."
+    STACK_NAME="eksctl-${CLUSTER_NAME_EAST}-addon-iamserviceaccount-kube-system-ebs-csi-controller-sa"
+    EBS_CSI_ROLE_ARN=$(aws cloudformation describe-stack-resources \
+        --stack-name "${STACK_NAME}" \
+        --region "${AWS_REGION_EAST}" \
+        --profile "${AWS_PROFILE}" \
+        --query 'StackResources[?ResourceType==`AWS::IAM::Role`].PhysicalResourceId' \
+        --output text 2>/dev/null || echo "")
+
+    if [[ -n "$EBS_CSI_ROLE_ARN" ]]; then
+        # Get full ARN
+        EBS_CSI_ROLE_ARN=$(aws iam get-role --role-name "${EBS_CSI_ROLE_ARN}" --profile "${AWS_PROFILE}" --query 'Role.Arn' --output text)
+        print_info "EBS CSI IAM role: ${EBS_CSI_ROLE_ARN}"
+    else
+        print_error "Failed to create IAM role for EBS CSI driver"
+        exit 1
+    fi
+
+    # Install EBS CSI driver addon
+    print_info "Installing EBS CSI driver addon..."
+    eksctl create addon \
+        --cluster="${CLUSTER_NAME_EAST}" \
+        --name=aws-ebs-csi-driver \
+        --service-account-role-arn="${EBS_CSI_ROLE_ARN}" \
+        --region="${AWS_REGION_EAST}" \
+        --profile="${AWS_PROFILE}" \
+        --force
+
+    # Wait for addon to be active
+    print_info "Waiting for EBS CSI driver to be active..."
+    for i in {1..30}; do
+        ADDON_STATUS=$(eksctl get addon --cluster="${CLUSTER_NAME_EAST}" --region="${AWS_REGION_EAST}" --profile="${AWS_PROFILE}" --name aws-ebs-csi-driver -o json 2>/dev/null | jq -r '.[0].Status' || echo "")
+        if [[ "$ADDON_STATUS" == "ACTIVE" ]]; then
+            print_info "EBS CSI driver is active"
+            break
+        fi
+        echo "  Waiting for EBS CSI driver... ($i/30)"
+        sleep 10
+    done
+
+    # Verify pods are running
+    print_info "Verifying EBS CSI driver pods..."
+    kubectl wait --for=condition=Ready pod -l app.kubernetes.io/name=aws-ebs-csi-driver -n kube-system --timeout=120s || print_warning "Some EBS CSI pods may still be starting"
+
+    # Grant EBS CSI driver role permission to use KMS key
+    if [[ -n "$KMS_KEY_ARN_EAST" ]]; then
+        print_info "Granting EBS CSI driver permission to use KMS key..."
+        aws kms create-grant \
+            --key-id "${KMS_KEY_ARN_EAST}" \
+            --grantee-principal "${EBS_CSI_ROLE_ARN}" \
+            --operations Decrypt Encrypt GenerateDataKey GenerateDataKeyWithoutPlaintext CreateGrant DescribeKey \
+            --region "${AWS_REGION_EAST}" \
+            --profile "${AWS_PROFILE}" >/dev/null || print_warning "KMS grant may already exist"
+        print_info "KMS grant created for EBS CSI driver"
+    fi
+
+    print_info "EBS CSI driver installed successfully"
+}
+
 function install_lb_controller() {
     print_header "Installing AWS Load Balancer Controller"
 
@@ -611,6 +694,7 @@ function main() {
     echo "  - EKS cluster: ${CLUSTER_NAME_EAST} in ${AWS_REGION_EAST}"
     echo "  - 3 CockroachDB node groups (one per AZ)"
     echo "  - 1 Application node group (multi-AZ)"
+    echo "  - AWS EBS CSI Driver (for persistent volumes)"
     echo "  - AWS Load Balancer Controller"
     echo "  - StorageClass: ${STORAGE_CLASS_NAME}"
     echo ""
@@ -627,6 +711,7 @@ function main() {
     create_s3_buckets
     mirror_images
     deploy_eks_cluster
+    install_ebs_csi_driver
     install_lb_controller
     create_storageclass
     verify_deployment

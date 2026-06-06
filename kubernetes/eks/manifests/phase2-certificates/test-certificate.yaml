@@ -1,0 +1,15 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: test-cert
+  namespace: default
+spec:
+  secretName: test-cert-secret
+  issuerRef:
+    name: vault-issuer
+    kind: ClusterIssuer
+  commonName: localhost
+  dnsNames:
+    - localhost
+  duration: 2160h  # 90 days
+  renewBefore: 360h  # 15 days

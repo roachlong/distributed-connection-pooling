@@ -226,8 +226,18 @@ teardown_phase_3() {
 }
 
 teardown_phase_2() {
-    print_header "Phase 2: Certificates (cert-manager)"
+    print_header "Phase 2: Certificates (Vault + cert-manager)"
 
+    # Delete test certificate
+    print_info "Deleting test certificate..."
+    kubectl delete certificate test-cert -n default 2>/dev/null || true
+    kubectl delete secret test-cert-secret -n default 2>/dev/null || true
+
+    # Delete Vault ClusterIssuer
+    print_info "Deleting Vault ClusterIssuer..."
+    kubectl delete clusterissuer vault-issuer 2>/dev/null || true
+
+    # Uninstall cert-manager
     if helm list -n cert-manager 2>/dev/null | grep -q cert-manager; then
         print_info "Uninstalling cert-manager..."
         helm uninstall cert-manager -n cert-manager
@@ -245,6 +255,19 @@ teardown_phase_2() {
         issuers.cert-manager.io \
         orders.acme.cert-manager.io 2>/dev/null || true
 
+    # Uninstall Vault
+    if helm list -n vault 2>/dev/null | grep -q vault; then
+        print_info "Uninstalling Vault..."
+        helm uninstall vault -n vault
+    fi
+
+    print_info "Deleting Vault namespace and PVCs..."
+    kubectl delete namespace vault --wait=false 2>/dev/null || true
+
+    # PVCs are deleted with namespace, but ensure cleanup
+    sleep 5
+    kubectl delete pvc -n vault -l app.kubernetes.io/name=vault 2>/dev/null || true
+
     print_info "Phase 2 teardown complete"
 }
 
@@ -260,63 +283,330 @@ teardown_phase_1() {
         return 0
     fi
 
-    # Clean up Phase 1 Kubernetes resources before deleting cluster
-    print_info "Cleaning up Phase 1 resources..."
+    # Check if cluster exists
+    if ! aws eks describe-cluster --name "${CLUSTER_NAME_EAST}" --region "${AWS_REGION_EAST}" --profile "${AWS_PROFILE}" &>/dev/null; then
+        print_warning "Cluster ${CLUSTER_NAME_EAST} does not exist via EKS API"
+    else
+        # Clean up Phase 1 Kubernetes resources before deleting cluster
+        print_info "Cleaning up Phase 1 resources..."
 
-    # Delete test PVCs if they exist
-    kubectl delete pvc test-pvc-phase1 2>/dev/null || true
+        # Delete test PVCs if they exist (ignore errors if kubectl fails)
+        kubectl delete pvc test-pvc-phase1 2>/dev/null || true
 
-    # Delete StorageClass
-    kubectl delete storageclass crdb-gp3-encrypted 2>/dev/null || true
-    kubectl delete storageclass gp2 2>/dev/null || true
+        # Delete StorageClass (ignore errors if kubectl fails)
+        kubectl delete storageclass crdb-gp3-encrypted 2>/dev/null || true
+        kubectl delete storageclass gp2 2>/dev/null || true
 
-    # Uninstall AWS Load Balancer Controller
-    helm uninstall aws-load-balancer-controller -n kube-system 2>/dev/null || true
+        # Uninstall AWS Load Balancer Controller (ignore errors if kubectl fails)
+        helm uninstall aws-load-balancer-controller -n kube-system 2>/dev/null || true
 
-    # Delete IRSA for LB controller
-    eksctl delete iamserviceaccount \
-        --cluster="${CLUSTER_NAME_EAST}" \
-        --name=aws-load-balancer-controller \
-        --namespace=kube-system \
-        --region="${AWS_REGION_EAST}" \
-        --profile="${AWS_PROFILE}" 2>/dev/null || true
+        # Delete EBS CSI driver addon (ignore errors if kubectl/eksctl fails)
+        print_info "Deleting EBS CSI driver addon..."
+        eksctl delete addon \
+            --cluster="${CLUSTER_NAME_EAST}" \
+            --name=aws-ebs-csi-driver \
+            --region="${AWS_REGION_EAST}" \
+            --profile "${AWS_PROFILE}" 2>/dev/null || true
+    fi
 
-    # Delete IAM policy for LB controller
+    # Delete IAM policy for LB controller (regardless of cluster state)
+    print_info "Checking for IAM policies to delete..."
     POLICY_NAME="eksctl-${CLUSTER_NAME_EAST}-aws-load-balancer-controller"
     POLICY_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${POLICY_NAME}"
-    aws iam delete-policy --policy-arn "${POLICY_ARN}" --profile "${AWS_PROFILE}" 2>/dev/null || true
 
-    print_info "Deleting EKS cluster (this may take 10-15 minutes)..."
-    if eksctl delete cluster \
-        --name "${CLUSTER_NAME_EAST}" \
+    if aws iam get-policy --policy-arn "${POLICY_ARN}" --profile "${AWS_PROFILE}" &>/dev/null; then
+        print_info "Deleting IAM policy: ${POLICY_NAME}"
+        aws iam delete-policy --policy-arn "${POLICY_ARN}" --profile "${AWS_PROFILE}" 2>/dev/null || print_warning "Failed to delete IAM policy"
+    fi
+
+    # Continue with cluster/nodegroup deletion...
+    if aws eks describe-cluster --name "${CLUSTER_NAME_EAST}" --region "${AWS_REGION_EAST}" --profile "${AWS_PROFILE}" &>/dev/null; then
+
+        # Try eksctl delete first
+        print_info "Attempting EKS cluster deletion via eksctl..."
+        set +e
+        EKSCTL_OUTPUT=$(eksctl delete cluster \
+            --name "${CLUSTER_NAME_EAST}" \
+            --region "${AWS_REGION_EAST}" \
+            --profile "${AWS_PROFILE}" \
+            --wait 2>&1)
+        EKSCTL_EXIT_CODE=$?
+        set -e
+
+        # If eksctl failed (TLS error, etc.), fall back to CloudFormation
+        if [[ $EKSCTL_EXIT_CODE -ne 0 ]]; then
+            if echo "$EKSCTL_OUTPUT" | grep -q "certificate signed by unknown authority\|failed to create Kubernetes client"; then
+                print_warning "eksctl failed due to TLS/certificate issues, falling back to CloudFormation deletion..."
+
+                # Get all CloudFormation stacks for this cluster
+                print_info "Finding CloudFormation stacks..."
+                STACKS=$(aws cloudformation list-stacks \
+                    --region "${AWS_REGION_EAST}" \
+                    --profile "${AWS_PROFILE}" \
+                    --query "StackSummaries[?contains(StackName, '${CLUSTER_NAME_EAST}') && StackStatus!='DELETE_COMPLETE'].StackName" \
+                    --output text)
+
+                if [[ -n "$STACKS" ]]; then
+                    # Disable termination protection on all stacks
+                    print_info "Disabling termination protection..."
+                    for stack in $STACKS; do
+                        aws cloudformation update-termination-protection \
+                            --no-enable-termination-protection \
+                            --stack-name "$stack" \
+                            --region "${AWS_REGION_EAST}" \
+                            --profile "${AWS_PROFILE}" 2>/dev/null || true
+                    done
+
+                    # Delete in proper order: addons/IRSA, then nodegroups, then cluster
+                    print_info "Deleting CloudFormation stacks (this may take 10-15 minutes)..."
+
+                    # Delete addon stacks first
+                    for stack in $STACKS; do
+                        if [[ "$stack" == *"addon"* ]] || [[ "$stack" == *"iamserviceaccount"* ]]; then
+                            print_info "Deleting $stack..."
+                            aws cloudformation delete-stack \
+                                --stack-name "$stack" \
+                                --region "${AWS_REGION_EAST}" \
+                                --profile "${AWS_PROFILE}"
+                        fi
+                    done
+
+                    # Wait a bit for addons to delete
+                    sleep 10
+
+                    # Delete nodegroup stacks
+                    for stack in $STACKS; do
+                        if [[ "$stack" == *"nodegroup"* ]]; then
+                            print_info "Deleting $stack..."
+                            aws cloudformation delete-stack \
+                                --stack-name "$stack" \
+                                --region "${AWS_REGION_EAST}" \
+                                --profile "${AWS_PROFILE}"
+                        fi
+                    done
+
+                    # Wait for nodegroups to delete before deleting cluster
+                    print_info "Waiting for nodegroups to delete..."
+                    for wait_iter in {1..60}; do
+                        NODEGROUP_STACKS=$(aws cloudformation list-stacks \
+                            --region "${AWS_REGION_EAST}" \
+                            --profile "${AWS_PROFILE}" \
+                            --query "StackSummaries[?contains(StackName, '${CLUSTER_NAME_EAST}-nodegroup') && StackStatus!='DELETE_COMPLETE'].StackName" \
+                            --output text)
+
+                        if [[ -z "$NODEGROUP_STACKS" ]]; then
+                            print_info "All nodegroups deleted"
+                            break
+                        fi
+
+                        if [[ $((wait_iter % 6)) -eq 0 ]]; then
+                            echo "  Still waiting for nodegroups to delete... ($wait_iter/60)"
+                        fi
+                        sleep 10
+                    done
+
+                    # Clean up all VPC dependencies before deleting cluster stack
+                    print_info "Cleaning up VPC dependencies..."
+
+                    # Get VPC ID from EKS cluster or CloudFormation stack
+                    VPC_ID=$(aws eks describe-cluster \
+                        --name "${CLUSTER_NAME_EAST}" \
+                        --region "${AWS_REGION_EAST}" \
+                        --profile "${AWS_PROFILE}" \
+                        --query 'cluster.resourcesVpcConfig.vpcId' \
+                        --output text 2>/dev/null || echo "")
+
+                    # If EKS API fails, try CloudFormation
+                    if [[ -z "$VPC_ID" ]] || [[ "$VPC_ID" == "None" ]]; then
+                        VPC_ID=$(aws cloudformation describe-stack-resources \
+                            --stack-name "eksctl-${CLUSTER_NAME_EAST}-cluster" \
+                            --region "${AWS_REGION_EAST}" \
+                            --profile "${AWS_PROFILE}" \
+                            --query 'StackResources[?ResourceType==`AWS::EC2::VPC`].PhysicalResourceId' \
+                            --output text 2>/dev/null || echo "")
+                    fi
+
+                    if [[ -n "$VPC_ID" ]] && [[ "$VPC_ID" != "None" ]]; then
+                        print_info "VPC ID: ${VPC_ID}"
+
+                        # 1. Delete orphaned ENIs
+                        print_info "Checking for orphaned network interfaces..."
+                        ORPHANED_ENIS=$(aws ec2 describe-network-interfaces \
+                            --region "${AWS_REGION_EAST}" \
+                            --profile "${AWS_PROFILE}" \
+                            --filters "Name=vpc-id,Values=${VPC_ID}" "Name=status,Values=available" \
+                            --query 'NetworkInterfaces[].NetworkInterfaceId' \
+                            --output text 2>/dev/null || echo "")
+
+                        if [[ -n "$ORPHANED_ENIS" ]]; then
+                            for eni in $ORPHANED_ENIS; do
+                                print_info "Deleting orphaned ENI: $eni"
+                                aws ec2 delete-network-interface \
+                                    --network-interface-id "$eni" \
+                                    --region "${AWS_REGION_EAST}" \
+                                    --profile "${AWS_PROFILE}" 2>/dev/null || print_warning "Failed to delete ENI $eni"
+                            done
+                            sleep 5
+                        fi
+
+                        # 2. Delete non-default security groups that aren't managed by CloudFormation
+                        print_info "Checking for orphaned security groups..."
+                        ORPHANED_SGS=$(aws ec2 describe-security-groups \
+                            --region "${AWS_REGION_EAST}" \
+                            --profile "${AWS_PROFILE}" \
+                            --filters "Name=vpc-id,Values=${VPC_ID}" \
+                            --query 'SecurityGroups[?GroupName!=`default` && contains(GroupName, `eks-cluster-sg`)].GroupId' \
+                            --output text 2>/dev/null || echo "")
+
+                        if [[ -n "$ORPHANED_SGS" ]]; then
+                            for sg in $ORPHANED_SGS; do
+                                # Check if anything is using this security group
+                                SG_USAGE=$(aws ec2 describe-network-interfaces \
+                                    --region "${AWS_REGION_EAST}" \
+                                    --profile "${AWS_PROFILE}" \
+                                    --filters "Name=group-id,Values=${sg}" \
+                                    --query 'NetworkInterfaces[].NetworkInterfaceId' \
+                                    --output text 2>/dev/null || echo "")
+
+                                if [[ -z "$SG_USAGE" ]]; then
+                                    print_info "Deleting orphaned security group: $sg"
+                                    aws ec2 delete-security-group \
+                                        --group-id "$sg" \
+                                        --region "${AWS_REGION_EAST}" \
+                                        --profile "${AWS_PROFILE}" 2>/dev/null || print_warning "Failed to delete SG $sg"
+                                fi
+                            done
+                            sleep 3
+                        fi
+                    else
+                        print_warning "Could not determine VPC ID, skipping VPC cleanup"
+                    fi
+
+                    # Delete cluster stack (with retry for DELETE_FAILED)
+                    for stack in $STACKS; do
+                        if [[ "$stack" == *"cluster" ]] && [[ "$stack" != *"nodegroup"* ]]; then
+                            print_info "Deleting cluster stack: $stack..."
+                            aws cloudformation delete-stack \
+                                --stack-name "$stack" \
+                                --region "${AWS_REGION_EAST}" \
+                                --profile "${AWS_PROFILE}"
+                        fi
+                    done
+
+                    print_info "Cluster deletion initiated via CloudFormation"
+                else
+                    print_warning "No CloudFormation stacks found"
+                fi
+            else
+                print_error "eksctl failed with unexpected error:"
+                echo "$EKSCTL_OUTPUT"
+            fi
+        else
+            print_info "EKS cluster deleted successfully via eksctl"
+        fi
+    fi
+
+    # Delete S3 buckets (find actual buckets, not just from config)
+    print_info "Deleting S3 buckets..."
+    ACTUAL_BUCKETS=$(aws s3 ls --profile "${AWS_PROFILE}" 2>/dev/null | grep "${PROJECT_NAME}" | awk '{print $3}' || echo "")
+
+    if [[ -n "$ACTUAL_BUCKETS" ]]; then
+        for bucket in $ACTUAL_BUCKETS; do
+            print_info "Emptying and deleting bucket: ${bucket}"
+            aws s3 rm s3://${bucket} --recursive --profile "${AWS_PROFILE}" 2>/dev/null || true
+            aws s3 rb s3://${bucket} --force --profile "${AWS_PROFILE}" 2>/dev/null || true
+        done
+    else
+        print_info "No S3 buckets found with prefix ${PROJECT_NAME}"
+    fi
+
+    # Schedule KMS key deletion
+    print_info "Checking for KMS keys to delete..."
+
+    # Try to get key from config first
+    ACTUAL_KMS_KEY_ID=""
+    if [[ -n "$KMS_KEY_ARN_EAST" ]]; then
+        KEY_STATE=$(aws kms describe-key \
+            --key-id "${KMS_KEY_ARN_EAST}" \
+            --region "${AWS_REGION_EAST}" \
+            --profile "${AWS_PROFILE}" \
+            --query 'KeyMetadata.KeyState' \
+            --output text 2>/dev/null || echo "NotFound")
+
+        if [[ "$KEY_STATE" != "NotFound" ]]; then
+            ACTUAL_KMS_KEY_ID="${KMS_KEY_ARN_EAST}"
+        fi
+    fi
+
+    # If config value doesn't exist, discover by alias
+    if [[ -z "$ACTUAL_KMS_KEY_ID" ]]; then
+        print_info "KMS key from config not found, discovering by alias..."
+        ACTUAL_KMS_KEY_ID=$(aws kms list-aliases \
+            --region "${AWS_REGION_EAST}" \
+            --profile "${AWS_PROFILE}" \
+            --query "Aliases[?AliasName=='alias/crdb-ebs-east'].TargetKeyId" \
+            --output text 2>/dev/null || echo "")
+    fi
+
+    # Schedule deletion if key exists
+    if [[ -n "$ACTUAL_KMS_KEY_ID" ]]; then
+        KEY_STATE=$(aws kms describe-key \
+            --key-id "${ACTUAL_KMS_KEY_ID}" \
+            --region "${AWS_REGION_EAST}" \
+            --profile "${AWS_PROFILE}" \
+            --query 'KeyMetadata.KeyState' \
+            --output text 2>/dev/null || echo "NotFound")
+
+        if [[ "$KEY_STATE" == "Enabled" ]] || [[ "$KEY_STATE" == "Disabled" ]]; then
+            print_info "Scheduling KMS key deletion (7-day waiting period)..."
+            aws kms schedule-key-deletion \
+                --key-id "${ACTUAL_KMS_KEY_ID}" \
+                --pending-window-in-days 7 \
+                --region "${AWS_REGION_EAST}" \
+                --profile "${AWS_PROFILE}" 2>/dev/null || print_warning "Failed to schedule KMS key deletion"
+
+            # Update config to clear the KMS key ARN (set to empty string, don't delete line)
+            if [[ -f "$CONFIG_FILE" ]]; then
+                sed -i.bak 's|^export KMS_KEY_ARN_EAST=".*"|export KMS_KEY_ARN_EAST=""|' "$CONFIG_FILE"
+                print_info "Cleared KMS_KEY_ARN_EAST value in config.env"
+            fi
+        elif [[ "$KEY_STATE" == "PendingDeletion" ]]; then
+            print_info "KMS key already scheduled for deletion"
+        else
+            print_info "KMS key not found or already deleted"
+        fi
+    else
+        print_info "No KMS key found to delete"
+    fi
+
+    # Delete orphaned IAM policies (may exist even if cluster is gone)
+    print_info "Checking for orphaned IAM policies..."
+    POLICY_NAME="eksctl-${CLUSTER_NAME_EAST}-aws-load-balancer-controller"
+    POLICY_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${POLICY_NAME}"
+    if aws iam get-policy --policy-arn "${POLICY_ARN}" --profile "${AWS_PROFILE}" &>/dev/null; then
+        print_info "Deleting IAM policy: ${POLICY_NAME}"
+        aws iam delete-policy --policy-arn "${POLICY_ARN}" --profile "${AWS_PROFILE}" 2>/dev/null || print_warning "Failed to delete IAM policy"
+    fi
+
+    # Delete orphaned EBS volumes (created with Retain policy)
+    print_info "Checking for orphaned EBS volumes..."
+    ORPHANED_VOLUMES=$(aws ec2 describe-volumes \
         --region "${AWS_REGION_EAST}" \
         --profile "${AWS_PROFILE}" \
-        --wait 2>&1; then
-        print_info "EKS cluster deleted successfully"
+        --filters "Name=tag:kubernetes.io/cluster/${CLUSTER_NAME_EAST},Values=owned" "Name=status,Values=available" \
+        --query 'Volumes[].VolumeId' \
+        --output text 2>/dev/null || echo "")
+
+    if [[ -n "$ORPHANED_VOLUMES" ]]; then
+        for vol in $ORPHANED_VOLUMES; do
+            print_info "Deleting orphaned EBS volume: $vol"
+            aws ec2 delete-volume \
+                --volume-id "$vol" \
+                --region "${AWS_REGION_EAST}" \
+                --profile "${AWS_PROFILE}" 2>/dev/null || print_warning "Failed to delete volume $vol"
+        done
     else
-        print_warning "EKS cluster does not exist or failed to delete (continuing with S3/KMS cleanup)"
-    fi
-
-    print_info "Deleting S3 buckets..."
-    if [[ -n "$S3_BUCKET_BACKUPS_EAST" ]]; then
-        print_info "Emptying backup bucket: ${S3_BUCKET_BACKUPS_EAST}"
-        aws s3 rm s3://${S3_BUCKET_BACKUPS_EAST} --recursive --profile "${AWS_PROFILE}" 2>/dev/null || true
-        aws s3 rb s3://${S3_BUCKET_BACKUPS_EAST} --force --profile "${AWS_PROFILE}" 2>/dev/null || true
-    fi
-
-    if [[ -n "$S3_BUCKET_AUDIT_EAST" ]]; then
-        print_info "Emptying audit bucket: ${S3_BUCKET_AUDIT_EAST}"
-        aws s3 rm s3://${S3_BUCKET_AUDIT_EAST} --recursive --profile "${AWS_PROFILE}" 2>/dev/null || true
-        aws s3 rb s3://${S3_BUCKET_AUDIT_EAST} --force --profile "${AWS_PROFILE}" 2>/dev/null || true
-    fi
-
-    if [[ -n "$KMS_KEY_ARN_EAST" ]]; then
-        print_info "Scheduling KMS key deletion (7-day waiting period)..."
-        aws kms schedule-key-deletion \
-            --key-id "${KMS_KEY_ARN_EAST}" \
-            --pending-window-in-days 7 \
-            --region "${AWS_REGION_EAST}" \
-            --profile "${AWS_PROFILE}" 2>/dev/null || true
+        print_info "No orphaned EBS volumes found"
     fi
 
     print_info "Phase 1 teardown complete"
