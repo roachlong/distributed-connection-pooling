@@ -227,12 +227,11 @@ obsolette/
 settings
 .DS_Store
 *.log
-# Kubernetes manifests with sensitive data
-# Only commit .template files, not the generated versions
-kubernetes/eks/manifests/**/storageclass.yaml
-kubernetes/eks/manifests/**/vault-issuer.yaml
-kubernetes/eks/manifests/**/*.generated.yaml
-kubernetes/eks/manifests/**/vault-keys.json
+
+# Kubernetes generated files (contain sensitive data like KMS keys, Vault secrets)
+# All generated manifests are in generated/ - only commit .template files and README
+kubernetes/eks/generated/**
+!kubernetes/eks/generated/README.md
 
 # Backup files
 *.bak

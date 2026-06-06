@@ -7,6 +7,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONFIG_FILE="${ROOT_DIR}/config.env"
+GENERATED_DIR="${ROOT_DIR}/generated/phase1"
+
+# Create generated directory if it doesn't exist
+mkdir -p "${GENERATED_DIR}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -364,9 +368,9 @@ function deploy_eks_cluster() {
 
     # Generate cluster config with environment variables substituted
     print_info "Generating cluster configuration..."
-    envsubst < "${SCRIPT_DIR}/cluster-east.yaml" > "${SCRIPT_DIR}/cluster-east.generated.yaml"
+    envsubst < "${SCRIPT_DIR}/cluster-east.yaml" > "${GENERATED_DIR}/cluster-east.yaml"
 
-    print_info "Cluster configuration generated: cluster-east.generated.yaml"
+    print_info "Cluster configuration generated: ${GENERATED_DIR}/cluster-east.yaml"
     print_info "Review the configuration before proceeding"
 
     read -p "Deploy EKS cluster ${CLUSTER_NAME_EAST}? (y/n) " -n 1 -r
@@ -380,7 +384,7 @@ function deploy_eks_cluster() {
 
     # Run eksctl and capture exit code (don't exit on error)
     set +e
-    eksctl create cluster -f "${SCRIPT_DIR}/cluster-east.generated.yaml" --profile "${AWS_PROFILE}"
+    eksctl create cluster -f "${GENERATED_DIR}/cluster-east.yaml" --profile "${AWS_PROFILE}"
     local eksctl_exit_code=$?
     set -e
 
@@ -626,11 +630,11 @@ function create_storageclass() {
 
     # Generate StorageClass manifest
     print_info "Generating StorageClass manifest..."
-    envsubst < "${SCRIPT_DIR}/storageclass.yaml.template" > "${SCRIPT_DIR}/storageclass.yaml"
+    envsubst < "${SCRIPT_DIR}/storageclass.yaml.template" > "${GENERATED_DIR}/storageclass.yaml"
 
     # Apply StorageClass
     print_info "Creating StorageClass: ${STORAGE_CLASS_NAME}"
-    kubectl apply -f "${SCRIPT_DIR}/storageclass.yaml"
+    kubectl apply -f "${GENERATED_DIR}/storageclass.yaml"
 
     print_info "StorageClass created successfully"
 }

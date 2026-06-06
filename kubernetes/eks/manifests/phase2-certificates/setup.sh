@@ -7,7 +7,12 @@ set -e
 # Deploys HashiCorp Vault and cert-manager for certificate management
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${SCRIPT_DIR}/../../config.env"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+CONFIG_FILE="${ROOT_DIR}/config.env"
+GENERATED_DIR="${ROOT_DIR}/generated/phase2"
+
+# Create generated directory if it doesn't exist
+mkdir -p "${GENERATED_DIR}"
 
 # Colors
 GREEN='\033[0;32m'
@@ -147,7 +152,7 @@ initialize_vault() {
     ROOT_TOKEN=$(echo "$INIT_OUTPUT" | jq -r '.root_token')
 
     # Save to local file (in real production, use a secrets manager)
-    VAULT_KEYS_FILE="${SCRIPT_DIR}/vault-keys.json"
+    VAULT_KEYS_FILE="${GENERATED_DIR}/vault-keys.json"
     echo "$INIT_OUTPUT" > "$VAULT_KEYS_FILE"
     chmod 600 "$VAULT_KEYS_FILE"
 
@@ -170,7 +175,7 @@ unseal_vault() {
     print_header "Unsealing Vault"
 
     # Load unseal keys
-    VAULT_KEYS_FILE="${SCRIPT_DIR}/vault-keys.json"
+    VAULT_KEYS_FILE="${GENERATED_DIR}/vault-keys.json"
     if [[ ! -f "$VAULT_KEYS_FILE" ]]; then
         print_error "Vault keys file not found: ${VAULT_KEYS_FILE}"
         print_error "Please initialize Vault first or provide vault-keys.json"
@@ -220,7 +225,7 @@ configure_vault_pki() {
     print_header "Configuring Vault PKI"
 
     # Load root token
-    VAULT_KEYS_FILE="${SCRIPT_DIR}/vault-keys.json"
+    VAULT_KEYS_FILE="${GENERATED_DIR}/vault-keys.json"
     ROOT_TOKEN=$(jq -r '.root_token' "$VAULT_KEYS_FILE")
 
     # Port forward to Vault (in background)
@@ -272,7 +277,7 @@ configure_vault_k8s_auth() {
     print_header "Configuring Vault Kubernetes Authentication"
 
     # Load root token
-    VAULT_KEYS_FILE="${SCRIPT_DIR}/vault-keys.json"
+    VAULT_KEYS_FILE="${GENERATED_DIR}/vault-keys.json"
     ROOT_TOKEN=$(jq -r '.root_token' "$VAULT_KEYS_FILE")
 
     # Enable Kubernetes auth method
@@ -386,8 +391,8 @@ create_vault_issuer() {
 
     # Generate and apply Vault ClusterIssuer manifest
     print_info "Creating Vault ClusterIssuer..."
-    envsubst < "${SCRIPT_DIR}/vault-issuer.yaml.template" > "${SCRIPT_DIR}/vault-issuer.yaml"
-    kubectl apply -f "${SCRIPT_DIR}/vault-issuer.yaml"
+    envsubst < "${SCRIPT_DIR}/vault-issuer.yaml.template" > "${GENERATED_DIR}/vault-issuer.yaml"
+    kubectl apply -f "${GENERATED_DIR}/vault-issuer.yaml"
 
     # Wait for issuer to be ready
     print_info "Waiting for ClusterIssuer to be ready..."
