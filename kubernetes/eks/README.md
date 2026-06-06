@@ -100,6 +100,24 @@ This reference architecture is built incrementally over 10 phases, where each ph
 6. Install AWS Load Balancer Controller
 7. Create StorageClass with `volumeBindingMode: WaitForFirstConsumer`
 
+**Deploy**:
+```bash
+cd manifests/phase1-foundation
+./setup.sh
+```
+
+**Validate**:
+```bash
+# Check nodes
+kubectl get nodes -L topology.kubernetes.io/zone
+
+# Check StorageClass
+kubectl get storageclass
+
+# Check LB Controller
+kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller
+```
+
 **Success Criteria**:
 - ✅ 3 node groups running (one per AZ in primary region)
 - ✅ StorageClass with CMK encryption ready
@@ -122,6 +140,34 @@ This reference architecture is built incrementally over 10 phases, where each ph
 4. Deploy cert-manager via Helm
 5. Create Vault ClusterIssuer
 
+**Deploy**:
+```bash
+cd manifests/phase2-certificates
+
+# Install cert-manager
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
+helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager --create-namespace \
+  --values cert-manager-values.yaml
+
+# Create Vault ClusterIssuer
+kubectl apply -f vault-issuer.yaml
+```
+
+**Validate**:
+```bash
+# Check cert-manager pods
+kubectl get pods -n cert-manager
+
+# Check ClusterIssuer
+kubectl get clusterissuer
+
+# Test certificate
+kubectl apply -f test-certificate.yaml
+kubectl get certificate -n default
+```
+
 **Success Criteria**:
 - ✅ cert-manager pods running
 - ✅ Vault ClusterIssuer ready
@@ -142,6 +188,23 @@ This reference architecture is built incrementally over 10 phases, where each ph
 2. Apply CockroachDB CRDs
 3. Deploy operator
 
+**Deploy**:
+```bash
+cd manifests/phase3-operator
+
+# Apply CRDs and operator
+kubectl apply -f operator.yaml
+```
+
+**Validate**:
+```bash
+# Check CRDs
+kubectl get crds | grep cockroachdb
+
+# Check operator pod
+kubectl get pods -n cockroach-operator-system
+```
+
 **Success Criteria**:
 - ✅ CRDs installed
 - ✅ Operator pod running without errors
@@ -160,6 +223,34 @@ This reference architecture is built incrementally over 10 phases, where each ph
 2. Create Certificate resources (node + client)
 3. Create CrdbCluster CR with 3-AZ anti-affinity
 4. Verify cluster initialization
+
+**Deploy**:
+```bash
+cd manifests/phase4-crdb-cluster
+
+# Create namespace
+kubectl create namespace cockroachdb
+
+# Create certificates
+kubectl apply -f certificates.yaml
+
+# Deploy CRDB cluster
+kubectl apply -f crdb-east.yaml
+```
+
+**Validate**:
+```bash
+# Check pods
+kubectl get pods -n cockroachdb
+
+# Check cluster health
+kubectl exec -it cockroachdb-east-0 -n cockroachdb -- \
+  cockroach node status --certs-dir=/cockroach/cockroach-certs
+
+# Test SQL
+kubectl exec -it cockroachdb-east-0 -n cockroachdb -- \
+  cockroach sql --certs-dir=/cockroach/cockroach-certs -e "SELECT 1;"
+```
 
 **Success Criteria**:
 - ✅ 3 pods running (one per AZ)
@@ -181,6 +272,32 @@ This reference architecture is built incrementally over 10 phases, where each ph
 2. Create ConfigMap (transaction pooling, cert auth)
 3. Deploy PgBouncer (3 replicas)
 4. Create Service (internal NLB)
+
+**Deploy**:
+```bash
+cd manifests/phase5-pgbouncer
+
+# Create PgBouncer certificate
+kubectl apply -f pgbouncer-certificate.yaml
+
+# Deploy PgBouncer
+kubectl apply -f pgbouncer-configmap.yaml
+kubectl apply -f pgbouncer-deployment.yaml
+kubectl apply -f pgbouncer-service.yaml
+```
+
+**Validate**:
+```bash
+# Check PgBouncer pods
+kubectl get pods -n cockroachdb -l app=pgbouncer
+
+# Check NLB service
+kubectl get svc -n cockroachdb pgbouncer
+
+# Test connection through PgBouncer
+kubectl run -it --rm psql --image=postgres:15 --restart=Never -- \
+  psql "postgresql://root@pgbouncer.cockroachdb.svc.cluster.local:5432/defaultdb?sslmode=require" -c "SELECT 1;"
+```
 
 **Success Criteria**:
 - ✅ PgBouncer pods running
@@ -205,6 +322,46 @@ This reference architecture is built incrementally over 10 phases, where each ph
 5. Generate encryption key
 6. Update CrdbCluster CR for encryption-at-rest
 
+**Deploy**:
+```bash
+cd manifests/phase6-enterprise
+
+# Install External Secrets Operator
+helm repo add external-secrets https://charts.external-secrets.io
+helm install external-secrets external-secrets/external-secrets \
+  -n external-secrets-system --create-namespace
+
+# Store license in Vault (do this via Vault UI or CLI)
+# vault kv put secret/crdb-license license="YOUR-LICENSE-KEY"
+
+# Create SecretStore and ExternalSecret
+kubectl apply -f vault-secretstore.yaml
+kubectl apply -f license-external-secret.yaml
+
+# Apply license via SQL
+kubectl exec -it cockroachdb-east-0 -n cockroachdb -- \
+  cockroach sql --certs-dir=/cockroach/cockroach-certs \
+  -e "SET CLUSTER SETTING cluster.organization = 'YOUR-ORG';"
+kubectl exec -it cockroachdb-east-0 -n cockroachdb -- \
+  cockroach sql --certs-dir=/cockroach/cockroach-certs \
+  -e "SET CLUSTER SETTING enterprise.license = 'YOUR-LICENSE';"
+
+# Enable encryption-at-rest
+kubectl apply -f crdb-east-encrypted.yaml
+```
+
+**Validate**:
+```bash
+# Check license
+kubectl exec -it cockroachdb-east-0 -n cockroachdb -- \
+  cockroach sql --certs-dir=/cockroach/cockroach-certs \
+  -e "SHOW CLUSTER SETTING cluster.organization;"
+
+# Verify encryption
+kubectl exec -it cockroachdb-east-0 -n cockroachdb -- \
+  cockroach debug encryption-active-key /cockroach/cockroach-data
+```
+
 **Success Criteria**:
 - ✅ License active
 - ✅ Encryption enabled (verify with `cockroach debug encryption-active-key`)
@@ -225,6 +382,32 @@ This reference architecture is built incrementally over 10 phases, where each ph
 3. Import Grafana dashboards
 4. Configure alerts
 
+**Deploy**:
+```bash
+cd manifests/phase7-observability
+
+# Install kube-prometheus-stack
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+  -n monitoring --create-namespace \
+  --values prometheus-values.yaml
+
+# Create ServiceMonitor for CRDB
+kubectl apply -f crdb-servicemonitor.yaml
+kubectl apply -f prometheus-rules.yaml
+```
+
+**Validate**:
+```bash
+# Check Prometheus targets
+kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheus 9090:9090
+# Open http://localhost:9090/targets
+
+# Access Grafana
+kubectl port-forward -n monitoring svc/kube-prometheus-stack-grafana 3000:80
+# Open http://localhost:3000 (admin / configured password)
+```
+
 **Success Criteria**:
 - ✅ Prometheus showing CRDB targets UP
 - ✅ Grafana dashboards populated
@@ -244,6 +427,36 @@ This reference architecture is built incrementally over 10 phases, where each ph
 2. Deploy deny-all NetworkPolicy
 3. Deploy allow NetworkPolicies (CRDB ↔ PgBouncer, monitoring)
 4. Test S3 backup via IRSA
+
+**Deploy**:
+```bash
+cd manifests/phase8-security
+
+# Create IRSA for S3 backups
+eksctl create iamserviceaccount \
+  --cluster="${CLUSTER_NAME_EAST}" \
+  --namespace=cockroachdb \
+  --name=cockroachdb-backup \
+  --attach-policy-arn=arn:aws:iam::aws:policy/AmazonS3FullAccess \
+  --approve
+
+# Apply network policies
+kubectl apply -f network-policy-deny-all.yaml
+kubectl apply -f network-policy-crdb-internal.yaml
+kubectl apply -f network-policy-crdb-pgbouncer.yaml
+kubectl apply -f network-policy-monitoring.yaml
+```
+
+**Validate**:
+```bash
+# Test S3 backup with IRSA
+kubectl exec -it cockroachdb-east-0 -n cockroachdb -- \
+  cockroach sql --certs-dir=/cockroach/cockroach-certs \
+  -e "BACKUP INTO 's3://${S3_BUCKET_BACKUPS_EAST}/test?AUTH=implicit';"
+
+# Verify network policies
+kubectl get networkpolicies -n cockroachdb
+```
 
 **Success Criteria**:
 - ✅ Network policies enforced
@@ -266,6 +479,41 @@ This reference architecture is built incrementally over 10 phases, where each ph
 3. Deploy Fluent Bit DaemonSet
 4. Verify logs in S3 with 7-year retention
 
+**Deploy**:
+```bash
+cd manifests/phase9-audit
+
+# Enable audit logging in CRDB
+kubectl exec -it cockroachdb-east-0 -n cockroachdb -- \
+  cockroach sql --certs-dir=/cockroach/cockroach-certs \
+  -e "SET CLUSTER SETTING sql.log.user_audit = 'SENSITIVE_ACCESS';"
+
+# Create IRSA for Fluent Bit
+eksctl create iamserviceaccount \
+  --cluster="${CLUSTER_NAME_EAST}" \
+  --namespace=logging \
+  --name=fluent-bit \
+  --attach-policy-arn=arn:aws:iam::aws:policy/AmazonS3FullAccess \
+  --approve
+
+# Deploy Fluent Bit
+kubectl create namespace logging
+kubectl apply -f fluent-bit-configmap.yaml
+kubectl apply -f fluent-bit-daemonset.yaml
+```
+
+**Validate**:
+```bash
+# Check Fluent Bit pods
+kubectl get pods -n logging
+
+# Verify logs in S3
+aws s3 ls s3://${S3_BUCKET_AUDIT_EAST}/cockroachdb/
+
+# Verify Object Lock
+aws s3api get-object-lock-configuration --bucket ${S3_BUCKET_AUDIT_EAST}
+```
+
 **Success Criteria**:
 - ✅ Audit logs flowing to S3
 - ✅ Object Lock verified (7-year WORM)
@@ -285,6 +533,35 @@ This reference architecture is built incrementally over 10 phases, where each ph
 3. Enable rangefeed on both clusters
 4. Create virtual cluster replication (East → West)
 5. Test failover and failback
+
+**Deploy**:
+```bash
+# Repeat Phases 1-9 for West region (update config.env for WEST region)
+cd manifests/phase1-foundation
+# ... (same as Phase 1 but for us-west-2)
+
+# Configure Transit Gateway peering between regions
+# (See DEPLOYMENT.md for VPC peering/TGW setup)
+
+# Enable rangefeed on both clusters
+kubectl exec -it cockroachdb-east-0 -n cockroachdb -- \
+  cockroach sql --certs-dir=/cockroach/cockroach-certs \
+  -e "SET CLUSTER SETTING kv.rangefeed.enabled = true;"
+
+# Configure PCR from East (primary) to West (standby)
+cd manifests/phase10-pcr
+kubectl apply -f pcr-replication-east-to-west.yaml
+```
+
+**Validate**:
+```bash
+# Check replication status
+kubectl exec -it cockroachdb-east-0 -n cockroachdb -- \
+  cockroach sql --certs-dir=/cockroach/cockroach-certs \
+  -e "SHOW VIRTUAL CLUSTER main WITH REPLICATION STATUS;"
+
+# Test failover (see DEPLOYMENT.md for detailed procedure)
+```
 
 **Success Criteria**:
 - ✅ West cluster healthy
@@ -307,9 +584,139 @@ This reference architecture is built incrementally over 10 phases, where each ph
 3. Create ArgoCD Applications
 4. Test Git-based deployment workflow
 
+**Deploy**:
+```bash
+cd manifests/phase11-gitops
+
+# Install ArgoCD
+kubectl create namespace argocd
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Access ArgoCD UI
+kubectl port-forward svc/argocd-server -n argocd 8080:443
+# Get initial password: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+
+# Create ArgoCD Applications
+kubectl apply -f argocd-app-crdb.yaml
+kubectl apply -f argocd-app-pgbouncer.yaml
+```
+
+**Validate**:
+```bash
+# Check ArgoCD apps
+argocd app list
+
+# Verify sync status
+argocd app get crdb-east
+```
+
 **Success Criteria**:
 - ✅ All components managed by ArgoCD
 - ✅ Changes flow through Git PR → sync
+
+---
+
+## Teardown / Cleanup
+
+Use the automated teardown script to remove deployed resources and avoid ongoing AWS costs.
+
+### Usage
+
+```bash
+cd kubernetes/eks
+
+# Delete a specific phase only
+./teardown.sh --phase 5
+
+# Delete from Phase N down to Phase 1 (reverse order)
+./teardown.sh --from-phase 5
+
+# Delete all phases (11 through 1)
+./teardown.sh --all
+
+# Quick cleanup: Delete only the EKS cluster (leaves S3/KMS)
+./teardown.sh --cluster-only
+```
+
+### Common Scenarios
+
+**After testing Phase 1**:
+```bash
+./teardown.sh --phase 1
+# Deletes: EKS cluster, S3 buckets, KMS key
+```
+
+**After testing through Phase 5**:
+```bash
+./teardown.sh --from-phase 5
+# Deletes: Phases 5, 4, 3, 2, 1 in reverse order
+```
+
+**Complete teardown (all phases)**:
+```bash
+./teardown.sh --all
+# Deletes: All phases 11 through 1
+```
+
+**Fast cleanup for rebuild**:
+```bash
+./teardown.sh --cluster-only
+# Deletes: EKS cluster only (10-15 min)
+# Keeps: S3 buckets, KMS keys for reuse
+```
+
+### What Gets Deleted
+
+The script automatically removes (in reverse order):
+- **Phase 11**: ArgoCD and GitOps applications
+- **Phase 10**: West region cluster, PCR replication
+- **Phase 9**: Fluent Bit DaemonSet, audit logging resources
+- **Phase 8**: Network policies, IRSA for backups
+- **Phase 7**: Prometheus, Grafana, monitoring stack
+- **Phase 6**: External Secrets Operator, enterprise features
+- **Phase 5**: PgBouncer deployment and services
+- **Phase 4**: CockroachDB cluster and namespace
+- **Phase 3**: CockroachDB Operator and CRDs
+- **Phase 2**: cert-manager and certificate resources
+- **Phase 1**: EKS cluster, S3 buckets, KMS keys
+
+### Important Notes
+
+**Safety Features**:
+- Interactive confirmation prompts before deletion
+- Loads configuration from config.env automatically
+- Phases deleted in reverse dependency order
+- Clear status output with color-coded messages
+
+**EKS Cluster Deletion**:
+- `eksctl delete cluster` automatically deletes all Kubernetes resources (pods, services, PVCs, LoadBalancers)
+- Takes 10-15 minutes to complete
+- EBS volumes with `reclaimPolicy: Retain` are preserved (our default for safety)
+
+**S3 Object Lock**:
+- Objects with Object Lock cannot be deleted until retention expires
+- For testing: Use `Governance` mode instead of `Compliance` mode (allows admin override)
+- The script attempts deletion but will fail for locked objects
+
+**Cost Awareness**:
+- **EKS control plane**: ~$0.10/hour (~$73/month) per cluster
+- **EC2 nodes**: Varies by instance type (m5.2xlarge ~$0.384/hour)
+- **NAT Gateway**: ~$0.045/hour (~$32/month)
+- **EBS volumes**: ~$0.10/GB-month
+- **Always delete clusters when not in use** to avoid ongoing costs
+
+**Orphaned Resources**:
+After teardown, check for any orphaned resources:
+```bash
+# Check for orphaned EBS volumes
+aws ec2 describe-volumes --region us-east-1 --profile "${AWS_PROFILE}"
+
+# Check for orphaned Load Balancers
+aws elbv2 describe-load-balancers --region us-east-1 --profile "${AWS_PROFILE}"
+
+# Check for orphaned Security Groups
+aws ec2 describe-security-groups --region us-east-1 --profile "${AWS_PROFILE}"
+```
 
 ---
 
@@ -347,7 +754,7 @@ If a phase fails:
 
 ## Current Status
 
-- [ ] Phase 1: Foundation
+- [x] Phase 1: Foundation (EKS cluster, KMS, S3, LB Controller, StorageClass)
 - [ ] Phase 2: Certificates
 - [ ] Phase 3: Operator
 - [ ] Phase 4: CRDB Cluster
@@ -359,4 +766,4 @@ If a phase fails:
 - [ ] Phase 10: PCR
 - [ ] Phase 11: GitOps (optional)
 
-**Next**: Start with Phase 1 - see [DEPLOYMENT.md](./DEPLOYMENT.md) for detailed instructions.
+**Next**: Phase 2 (Certificates) - see [DEPLOYMENT.md](./DEPLOYMENT.md) for detailed instructions.
