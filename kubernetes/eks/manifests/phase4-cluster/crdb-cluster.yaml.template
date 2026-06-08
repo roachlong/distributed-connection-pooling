@@ -1,0 +1,57 @@
+apiVersion: crdb.cockroachlabs.com/v1alpha1
+kind: CrdbCluster
+metadata:
+  name: ${CRDB_CLUSTER_NAME_EAST}
+  namespace: ${CRDB_NAMESPACE}
+spec:
+  # Number of nodes (one per AZ)
+  nodes: ${CRDB_NODE_COUNT}
+
+  # CockroachDB image
+  image:
+    name: cockroachdb/cockroach:${COCKROACHDB_VERSION}
+
+  # TLS configuration (using Vault-issued certificates via cert-manager)
+  tlsEnabled: true
+  nodeTLSSecret: cockroachdb-node
+  clientTLSSecret: cockroachdb-client-root
+
+  # Data storage (PersistentVolumeClaims)
+  dataStore:
+    pvc:
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: ${STORAGE_CLASS_NAME}
+        resources:
+          requests:
+            storage: "${CRDB_STORAGE_SIZE}"
+        volumeMode: Filesystem
+
+  # Resource requests and limits
+  resources:
+    requests:
+      cpu: "${CRDB_CPU_REQUEST}"
+      memory: "${CRDB_MEMORY_REQUEST}"
+    limits:
+      cpu: "${CRDB_CPU_LIMIT}"
+      memory: "${CRDB_MEMORY_LIMIT}"
+
+  # Pod anti-affinity to spread across availability zones
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app.kubernetes.io/name
+                  operator: In
+                  values:
+                    - cockroachdb
+            topologyKey: topology.kubernetes.io/zone
+
+  # Additional labels
+  additionalLabels:
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: ${PROJECT_NAME}

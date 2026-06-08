@@ -1,0 +1,26 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: cockroachdb-node
+  namespace: ${CRDB_NAMESPACE}
+spec:
+  secretName: cockroachdb-node
+  duration: 8760h  # 1 year
+  renewBefore: 720h  # 30 days
+  issuerRef:
+    name: vault-issuer
+    kind: ClusterIssuer
+  commonName: node
+  dnsNames:
+    - localhost
+    - node
+    - "*.${CRDB_CLUSTER_NAME_EAST}"
+    - "*.${CRDB_CLUSTER_NAME_EAST}.${CRDB_NAMESPACE}"
+    - "*.${CRDB_CLUSTER_NAME_EAST}.${CRDB_NAMESPACE}.svc"
+    - "*.${CRDB_CLUSTER_NAME_EAST}.${CRDB_NAMESPACE}.svc.cluster.local"
+    - "*.${DNS_ZONE}"
+  ipAddresses:
+    - 127.0.0.1
+  usages:
+    - server auth
+    - client auth

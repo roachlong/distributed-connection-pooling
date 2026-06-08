@@ -17,9 +17,13 @@ generated/
 ├── phase1/
 │   ├── cluster-east.yaml         # Generated from cluster-east.yaml template
 │   └── storageclass.yaml         # Generated from storageclass.yaml.template (contains KMS ARN)
-└── phase2/
-    ├── vault-issuer.yaml         # Generated from vault-issuer.yaml.template
-    └── vault-keys.json           # Vault unseal keys and root token (CRITICAL!)
+├── phase2/
+│   ├── vault-issuer.yaml         # Generated from vault-issuer.yaml.template
+│   └── vault-keys.json           # Vault unseal keys and root token (CRITICAL!)
+└── phase4/
+    ├── node-certificate.yaml     # Generated from node-certificate.yaml.template
+    ├── client-certificate.yaml   # Generated from client-certificate.yaml.template
+    └── crdb-cluster.yaml         # Generated from crdb-cluster.yaml.template
 ```
 
 ## How Files Are Generated
@@ -36,6 +40,13 @@ envsubst < storageclass.yaml.template > generated/phase1/storageclass.yaml
 ```bash
 vault operator init > generated/phase2/vault-keys.json
 envsubst < vault-issuer.yaml.template > generated/phase2/vault-issuer.yaml
+```
+
+**Phase 4:**
+```bash
+envsubst < node-certificate.yaml.template > generated/phase4/node-certificate.yaml
+envsubst < client-certificate.yaml.template > generated/phase4/client-certificate.yaml
+envsubst < crdb-cluster.yaml.template > generated/phase4/crdb-cluster.yaml
 ```
 
 ## Security Best Practices
