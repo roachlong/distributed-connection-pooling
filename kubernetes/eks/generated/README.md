@@ -20,10 +20,14 @@ generated/
 ├── phase2/
 │   ├── vault-issuer.yaml         # Generated from vault-issuer.yaml.template
 │   └── vault-keys.json           # Vault unseal keys and root token (CRITICAL!)
-└── phase4/
-    ├── node-certificate.yaml     # Generated from node-certificate.yaml.template
-    ├── client-certificate.yaml   # Generated from client-certificate.yaml.template
-    └── crdb-cluster.yaml         # Generated from crdb-cluster.yaml.template
+├── phase4/
+│   ├── node-certificate.yaml     # Generated from node-certificate.yaml.template
+│   ├── client-certificate.yaml   # Generated from client-certificate.yaml.template
+│   └── crdb-cluster.yaml         # Generated from crdb-cluster.yaml.template
+└── phase5/
+    ├── pgbouncer-configmap.yaml  # Generated from pgbouncer-configmap.yaml.template
+    ├── pgbouncer-deployment.yaml # Generated from pgbouncer-deployment.yaml.template
+    └── pgbouncer-service.yaml    # Generated from pgbouncer-service.yaml.template
 ```
 
 ## How Files Are Generated
@@ -47,6 +51,13 @@ envsubst < vault-issuer.yaml.template > generated/phase2/vault-issuer.yaml
 envsubst < node-certificate.yaml.template > generated/phase4/node-certificate.yaml
 envsubst < client-certificate.yaml.template > generated/phase4/client-certificate.yaml
 envsubst < crdb-cluster.yaml.template > generated/phase4/crdb-cluster.yaml
+```
+
+**Phase 5:**
+```bash
+envsubst < pgbouncer-configmap.yaml.template > generated/phase5/pgbouncer-configmap.yaml
+envsubst < pgbouncer-deployment.yaml.template > generated/phase5/pgbouncer-deployment.yaml
+envsubst < pgbouncer-service.yaml.template > generated/phase5/pgbouncer-service.yaml
 ```
 
 ## Security Best Practices

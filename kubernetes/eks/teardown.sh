@@ -186,9 +186,37 @@ teardown_phase_6() {
 teardown_phase_5() {
     print_header "Phase 5: PgBouncer"
 
-    if [[ -d "${SCRIPT_DIR}/manifests/phase5-pgbouncer" ]]; then
-        print_info "Deleting PgBouncer resources..."
-        kubectl delete -f "${SCRIPT_DIR}/manifests/phase5-pgbouncer/" 2>/dev/null || true
+    if ! kubectl get namespace "${CRDB_NAMESPACE}" &>/dev/null; then
+        print_info "Namespace ${CRDB_NAMESPACE} does not exist, skipping"
+        return 0
+    fi
+
+    # Delete PgBouncer deployment and service
+    print_info "Deleting PgBouncer deployment..."
+    kubectl delete deployment pgbouncer -n "${CRDB_NAMESPACE}" --wait=false 2>/dev/null || true
+
+    print_info "Deleting PgBouncer service..."
+    kubectl delete service pgbouncer -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+
+    # Delete ConfigMap
+    print_info "Deleting PgBouncer ConfigMap..."
+    kubectl delete configmap pgbouncer-config -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+
+    # Delete certificates
+    print_info "Deleting PgBouncer certificates..."
+    kubectl delete certificate pgbouncer-server -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+    kubectl delete certificate pgbouncer-client -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+
+    # Delete certificate secrets
+    kubectl delete secret pgbouncer-server -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+    kubectl delete secret pgbouncer-client -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+
+    # Optional: Delete pgbouncer database user (requires cluster to be running)
+    if kubectl get pod "${CRDB_CLUSTER_NAME_EAST}-0" -n "${CRDB_NAMESPACE}" &>/dev/null; then
+        print_info "Deleting pgbouncer database user..."
+        kubectl exec -n "${CRDB_NAMESPACE}" "${CRDB_CLUSTER_NAME_EAST}-0" -- \
+            ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+            --execute="DROP USER IF EXISTS pgbouncer;" 2>/dev/null || true
     fi
 
     print_info "Phase 5 teardown complete"
@@ -197,16 +225,84 @@ teardown_phase_5() {
 teardown_phase_4() {
     print_header "Phase 4: CockroachDB Cluster"
 
-    if [[ -d "${SCRIPT_DIR}/manifests/phase4-crdb-cluster" ]]; then
-        print_info "Deleting CockroachDB cluster..."
-        kubectl delete -f "${SCRIPT_DIR}/manifests/phase4-crdb-cluster/crdb-east.yaml" 2>/dev/null || true
+    if ! kubectl get namespace "${CRDB_NAMESPACE}" &>/dev/null; then
+        print_info "Namespace ${CRDB_NAMESPACE} does not exist, skipping"
 
-        print_info "Waiting for StatefulSet cleanup..."
-        sleep 10
+        # Still clean up orphaned PVCs and volumes
+        print_info "Checking for orphaned EBS volumes..."
+        ORPHANED_VOLUMES=$(aws ec2 describe-volumes \
+            --region "${AWS_REGION_EAST}" \
+            --profile "${AWS_PROFILE}" \
+            --filters "Name=tag:app,Values=cockroachdb" "Name=status,Values=available" \
+            --query 'Volumes[].VolumeId' \
+            --output text 2>/dev/null || echo "")
+
+        if [[ -n "$ORPHANED_VOLUMES" ]]; then
+            for vol in $ORPHANED_VOLUMES; do
+                print_info "Deleting orphaned EBS volume: $vol"
+                aws ec2 delete-volume \
+                    --volume-id "$vol" \
+                    --region "${AWS_REGION_EAST}" \
+                    --profile "${AWS_PROFILE}" 2>/dev/null || print_warning "Failed to delete volume $vol"
+            done
+        fi
+
+        return 0
     fi
 
-    print_info "Deleting cockroachdb namespace..."
-    kubectl delete namespace cockroachdb --wait=false 2>/dev/null || true
+    # Delete CrdbCluster custom resource
+    print_info "Deleting CrdbCluster custom resource..."
+    kubectl delete crdbcluster "${CRDB_CLUSTER_NAME_EAST}" -n "${CRDB_NAMESPACE}" --wait=false 2>/dev/null || true
+
+    # Delete certificates
+    print_info "Deleting CockroachDB certificates..."
+    kubectl delete certificate cockroachdb-node -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+    kubectl delete certificate cockroachdb-client-root -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+    kubectl delete certificate cockroachdb-client-pgb-app-user -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+    kubectl delete certificate cockroachdb-client-pgb-batch-user -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+    kubectl delete certificate cockroachdb-client-pgb-admin-user -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+    kubectl delete certificate cockroachdb-client-flyway-svc -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+
+    # Delete certificate secrets
+    kubectl delete secret cockroachdb-node -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+    kubectl delete secret cockroachdb-client-root -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+    kubectl delete secret cockroachdb-client-pgb-app-user -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+    kubectl delete secret cockroachdb-client-pgb-batch-user -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+    kubectl delete secret cockroachdb-client-pgb-admin-user -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+    kubectl delete secret cockroachdb-client-flyway-svc -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+
+    # Wait for StatefulSet cleanup
+    print_info "Waiting for StatefulSet cleanup..."
+    sleep 15
+
+    # Delete PVCs (operator may not delete these automatically)
+    print_info "Deleting PVCs..."
+    kubectl delete pvc -n "${CRDB_NAMESPACE}" -l app.kubernetes.io/name=cockroachdb --wait=false 2>/dev/null || true
+
+    # Note: Namespace is NOT deleted here - it's managed by Phase 3
+    print_info "Namespace ${CRDB_NAMESPACE} preserved (managed by Phase 3)"
+
+    # Clean up orphaned EBS volumes
+    print_info "Checking for orphaned EBS volumes..."
+    sleep 10
+    ORPHANED_VOLUMES=$(aws ec2 describe-volumes \
+        --region "${AWS_REGION_EAST}" \
+        --profile "${AWS_PROFILE}" \
+        --filters "Name=tag:app,Values=cockroachdb" "Name=status,Values=available" \
+        --query 'Volumes[].VolumeId' \
+        --output text 2>/dev/null || echo "")
+
+    if [[ -n "$ORPHANED_VOLUMES" ]]; then
+        for vol in $ORPHANED_VOLUMES; do
+            print_info "Deleting orphaned EBS volume: $vol"
+            aws ec2 delete-volume \
+                --volume-id "$vol" \
+                --region "${AWS_REGION_EAST}" \
+                --profile "${AWS_PROFILE}" 2>/dev/null || print_warning "Failed to delete volume $vol"
+        done
+    else
+        print_info "No orphaned EBS volumes found"
+    fi
 
     print_info "Phase 4 teardown complete"
 }
@@ -214,11 +310,15 @@ teardown_phase_4() {
 teardown_phase_3() {
     print_header "Phase 3: CockroachDB Operator"
 
-    if [[ -d "${SCRIPT_DIR}/manifests/phase3-operator" ]]; then
-        print_info "Deleting CockroachDB Operator..."
-        kubectl delete -f "${SCRIPT_DIR}/manifests/phase3-operator/operator.yaml" 2>/dev/null || true
-    fi
+    # Delete operator deployment
+    print_info "Deleting CockroachDB Operator..."
+    kubectl delete -f "https://raw.githubusercontent.com/cockroachdb/cockroach-operator/${COCKROACHDB_OPERATOR_VERSION}/install/operator.yaml" 2>/dev/null || true
 
+    # Delete CRDs
+    print_info "Deleting CockroachDB CRDs..."
+    kubectl delete -f "https://raw.githubusercontent.com/cockroachdb/cockroach-operator/${COCKROACHDB_OPERATOR_VERSION}/install/crds.yaml" 2>/dev/null || true
+
+    # Delete operator namespace
     print_info "Deleting operator namespace..."
     kubectl delete namespace cockroach-operator-system --wait=false 2>/dev/null || true
 

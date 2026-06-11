@@ -259,9 +259,9 @@ configure_vault_pki() {
     print_info "Configuring CA and CRL URLs..."
     kubectl exec -n vault vault-0 -- sh -c "VAULT_TOKEN=$ROOT_TOKEN vault write ${VAULT_PKI_PATH}/config/urls issuing_certificates=http://vault.vault.svc.cluster.local:8200/v1/${VAULT_PKI_PATH}/ca crl_distribution_points=http://vault.vault.svc.cluster.local:8200/v1/${VAULT_PKI_PATH}/crl"
 
-    # Create role for CockroachDB node and client certificates (includes cluster name, namespace, and DNS_ZONE)
-    print_info "Creating PKI role for CockroachDB node and client certificates..."
-    kubectl exec -n vault vault-0 -- sh -c "VAULT_TOKEN=$ROOT_TOKEN vault write ${VAULT_PKI_PATH}/roles/cockroachdb-node allowed_domains=root,node,localhost,*.${CRDB_CLUSTER_NAME_EAST},*.${CRDB_CLUSTER_NAME_EAST}.${CRDB_NAMESPACE},*.${CRDB_CLUSTER_NAME_EAST}.${CRDB_NAMESPACE}.svc,*.${CRDB_CLUSTER_NAME_EAST}.${CRDB_NAMESPACE}.svc.cluster.local,*.cockroachdb,*.cockroachdb.${CRDB_NAMESPACE},*.cockroachdb.${CRDB_NAMESPACE}.svc,*.cockroachdb.${CRDB_NAMESPACE}.svc.cluster.local,*.cockroachdb.svc,*.cockroachdb.svc.cluster.local,*.${DNS_ZONE} allow_bare_domains=true allow_subdomains=true allow_localhost=true allow_ip_sans=true max_ttl=8760h key_type=rsa key_bits=2048 server_flag=true client_flag=true"
+    # Create role for CockroachDB and PgBouncer certificates (includes cluster name, namespace, service accounts, and DNS_ZONE)
+    print_info "Creating PKI role for CockroachDB and PgBouncer certificates..."
+    kubectl exec -n vault vault-0 -- sh -c "VAULT_TOKEN=$ROOT_TOKEN vault write ${VAULT_PKI_PATH}/roles/cockroachdb-node allowed_domains=root,node,localhost,pgbouncer,pgb_app_user,pgb_batch_user,pgb_admin_user,flyway_svc,*.pgbouncer,*.pgbouncer.${CRDB_NAMESPACE},*.pgbouncer.${CRDB_NAMESPACE}.svc,*.pgbouncer.${CRDB_NAMESPACE}.svc.cluster.local,*.${CRDB_CLUSTER_NAME_EAST},*.${CRDB_CLUSTER_NAME_EAST}.${CRDB_NAMESPACE},*.${CRDB_CLUSTER_NAME_EAST}.${CRDB_NAMESPACE}.svc,*.${CRDB_CLUSTER_NAME_EAST}.${CRDB_NAMESPACE}.svc.cluster.local,*.cockroachdb,*.cockroachdb.${CRDB_NAMESPACE},*.cockroachdb.${CRDB_NAMESPACE}.svc,*.cockroachdb.${CRDB_NAMESPACE}.svc.cluster.local,*.cockroachdb.svc,*.cockroachdb.svc.cluster.local,*.${DNS_ZONE} allow_bare_domains=true allow_subdomains=true allow_localhost=true allow_ip_sans=true enforce_hostnames=false max_ttl=8760h key_type=rsa key_bits=2048 server_flag=true client_flag=true"
 
     # Create role for CockroachDB client certificates (includes DNS_ZONE for external access)
     print_info "Creating PKI role for CockroachDB client certificates..."

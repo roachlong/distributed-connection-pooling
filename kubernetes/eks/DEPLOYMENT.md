@@ -1,2620 +1,2276 @@
-# AWS EKS Reference Architecture
+# Distributed Connection Pooling - EKS Deployment Guide
 
-This reference architecture deploys a **production-ready** CockroachDB cluster with distributed connection pooling on AWS EKS (Elastic Kubernetes Service) using the CockroachDB Kubernetes Operator with **Physical Cluster Replication (PCR)** for disaster recovery.
-
-**Deployment Targets**: Commercial AWS (default) and AWS GovCloud (FedRAMP-compliant variant)
-
-## Overview
-
-**Architecture Components:**
-- **Dual EKS Clusters**: Active (us-east-1) and Passive (us-west-2) for PCR in commercial AWS
-  - For GovCloud: Active (us-gov-east-1) and Passive (us-gov-west-1)
-- **CockroachDB Operator**: Kubernetes operator for automated CRDB lifecycle management
-- **CockroachDB StatefulSet**: Database tier with persistent volumes and 3-AZ pod anti-affinity
-- **Virtual Cluster Architecture**: PCR uses `main` virtual cluster on top of system tenant
-- **PgBouncer Deployment**: Connection pooling layer deployed as Kubernetes pods
-- **AWS Network Load Balancer**: External access to PgBouncer and DB Console
-- **HashiCorp Vault PKI**: Certificate management with cert-manager integration
-- **ArgoCD**: GitOps-based deployment and lifecycle management
-- **IAM Roles for Service Accounts (IRSA)**: S3 access for backups without hardcoded credentials
-
-**Security & Compliance Features:**
-- **Physical Cluster Replication**: Active-passive DR across regions
-- **EBS Encryption**: Customer-managed KMS keys (CMK) for data-at-rest security
-- **CockroachDB Encryption-at-Rest**: Database-level encryption (Enterprise license required)
-- **FIPS 140-3** (GovCloud only): FIPS-validated CockroachDB binary
-- **mTLS Everywhere**: Vault PKI-issued certificates for all cluster communication
-- **Network Policies**: Deny-all default with explicit allow rules (no pod-to-internet egress)
-- **Audit Log Pipeline**: Fluent Bit → S3 with Object Lock (WORM) for 7-year retention
-- **IRSA for S3**: IAM roles attached to service accounts for secure S3 access
-- **Private Subnets**: Worker nodes in private subnets with NAT gateway for outbound
-
-**Key Differences from EC2 Architecture:**
-- Kubernetes-native resource management vs. EC2 instances
-- CockroachDB Operator automates cluster lifecycle (scaling, upgrades, failover)
-- Physical Cluster Replication (PCR) replaces multi-region geo-partitioning
-- Virtual cluster architecture required for PCR
-- Kubernetes Services replace HAProxy + Keepalived for load balancing
-- StatefulSets with PersistentVolumeClaims instead of EC2 EBS volumes
-- ArgoCD/GitOps-based deployment instead of Terraform + cloud-init
-- Vault PKI + cert-manager for certificate automation
-- No bastion hosts needed - `kubectl exec` or port-forward for admin access
-
----
-
-## Commercial AWS vs. GovCloud
-
-This reference architecture is designed to work on **both commercial AWS and AWS GovCloud**. The default configuration targets **commercial AWS** (us-east-1/us-west-2), but migrating to GovCloud requires only **changing configuration variables** in [config.env](config.env) — no architectural rework.
-
-### What's the Same
-
-Almost everything translates directly:
-- EKS cluster configuration and 3-AZ topology
-- CockroachDB Operator installation and CRDB deployment
-- Physical Cluster Replication (PCR) setup
-- Vault PKI + cert-manager integration
-- PgBouncer configuration and deployment
-- Network policies and security posture
-- Audit logging pipeline and S3 Object Lock
-- ArgoCD GitOps workflow
-- Monitoring with Prometheus and Grafana
-
-### Key Differences
-
-| Aspect | Commercial AWS | AWS GovCloud |
-|--------|---------------|--------------|
-| **Regions** | us-east-1, us-west-2, etc. | us-gov-east-1, us-gov-west-1 |
-| **ARN Format** | `arn:aws:service::...` | `arn:aws-us-gov:service::...` |
-| **Container Images** | Pull directly from public registries<br/>(public.ecr.aws, Docker Hub) | Must mirror to private ECR<br/>(restricted internet access) |
-| **CockroachDB Image** | `v25.4.11` (standard) | `v25.4.11-fips` (FIPS 140-3) |
-| **Compliance** | Industry-standard security | FedRAMP High certified |
-| **IAM Permissions Boundary** | Optional (org-specific) | Often required by policy |
-| **S3 Endpoints** | Standard AWS endpoints | GovCloud-specific endpoints |
-
-### Switching to GovCloud
-
-To deploy on GovCloud instead of commercial AWS:
-
-1. **Update [config.env](config.env)** with GovCloud values:
-   ```bash
-   export AWS_REGION_EAST="us-gov-east-1"
-   export AWS_REGION_WEST="us-gov-west-1"
-   export ENVIRONMENT="govcloud"
-   export COCKROACHDB_VERSION="v25.4.11-fips"
-   export IAM_PERMISSIONS_BOUNDARY_ARN="arn:aws-us-gov:iam::${AWS_ACCOUNT_ID}:policy/YourBoundary"
-   ```
-
-2. **Mirror container images to ECR** (see [GovCloud Pre-Requisites](#govcloud-pre-requisites))
-
-3. **Deploy as normal** — all manifests use variable substitution from config.env
-
-That's it. The architecture, manifests, and procedures remain identical.
-
----
+Complete step-by-step deployment guide for the distributed connection pooling reference architecture on AWS EKS with full data access controls, observability, security hardening, and disaster recovery.
 
 ## Table of Contents
 
-- [Commercial AWS vs. GovCloud](#commercial-aws-vs-govcloud)
 - [Prerequisites](#prerequisites)
-- [Implementation Plan](#implementation-plan)
-- [Container Image Setup](#container-image-setup)
-  - [Commercial AWS (Direct Pull)](#commercial-aws-direct-pull)
-  - [GovCloud (ECR Mirroring)](#govcloud-ecr-mirroring)
-- [Customer-Managed KMS Key (CMK)](#customer-managed-kms-key-cmk)
-- [S3 Buckets with Object Lock (WORM)](#s3-buckets-with-object-lock-worm)
-- [EKS Cluster Setup (3-AZ Topology)](#eks-cluster-setup-3-az-topology)
-- [GitOps / ArgoCD Integration](#gitops--argocd-integration)
-- [HashiCorp Vault PKI Setup](#hashicorp-vault-pki-setup)
-- [CockroachDB Operator Installation](#cockroachdb-operator-installation)
-- [CockroachDB Cluster Deployment](#cockroachdb-cluster-deployment)
-- [Enterprise License Injection](#enterprise-license-injection)
-- [Active-Passive PCR Topology](#active-passive-pcr-topology)
-- [PgBouncer Deployment](#pgbouncer-deployment)
-- [Load Balancing and External Access](#load-balancing-and-external-access)
-- [Network Policies](#network-policies)
-- [Encryption-at-Rest](#encryption-at-rest)
-- [Audit Log Pipeline](#audit-log-pipeline)
-- [Scheduling Automated Backups](#scheduling-automated-backups)
-- [Monitoring with Prometheus and Grafana](#monitoring-with-prometheus-and-grafana)
-- [Common Operations](#common-operations)
-- [Failover and Failback Procedures](#failover-and-failback-procedures)
-- [Security Notes](#security-notes)
+- [Architecture Overview](#architecture-overview)
+- [Phase 0: Okta Configuration](#phase-0-okta-configuration)
+- [Phase 1: EKS Cluster](#phase-1-eks-cluster)
+- [Phase 2: Vault PKI](#phase-2-vault-pki)
+- [Phase 3: CockroachDB Operator](#phase-3-cockroachdb-operator)
+- [Phase 4: CockroachDB Cluster](#phase-4-cockroachdb-cluster)
+- [Phase 5: PgBouncer Connection Pools](#phase-5-pgbouncer-connection-pools)
+- [Phase 6: Istio Service Mesh](#phase-6-istio-service-mesh)
+- [Phase 7: Flyway Schema Migrations](#phase-7-flyway-schema-migrations)
+- [Phase 8: Enterprise Features](#phase-8-enterprise-features)
+- [Phase 9: Observability Stack](#phase-9-observability-stack)
+- [Phase 10: Security Hardening](#phase-10-security-hardening)
+- [Phase 11: Audit Logging](#phase-11-audit-logging)
+- [Phase 12: Physical Cluster Replication (PCR)](#phase-12-physical-cluster-replication-pcr)
+- [Phase 13: GitOps (Optional)](#phase-13-gitops-optional)
+- [Post-Deployment Validation](#post-deployment-validation)
 - [Troubleshooting](#troubleshooting)
-
----
+- [Teardown](#teardown)
 
 ## Prerequisites
 
-### Tools and CLI Setup
+### Required Tools
 
-**Required tools:**
-- `kubectl` (v1.28+) - Kubernetes command-line tool
-- `helm` (v3.12+) - Kubernetes package manager
-- `eksctl` or Terraform - for EKS cluster provisioning
-- `aws` CLI (v2) - for AWS resource management
-- `argocd` CLI - for ArgoCD application management
-- `jq` - JSON parsing
-- `cockroach` CLI - for database operations
-
-**Installation:**
+Install the following tools on your local machine:
 
 ```bash
-# macOS
-brew install kubectl helm eksctl awscli argocd jq cockroachdb/tap/cockroach
-
-# Linux
-# kubectl
-curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
-
-# helm
-curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+# AWS CLI v2
+curl "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "AWSCLIV2.pkg"
+sudo installer -pkg AWSCLIV2.pkg -target /
 
 # eksctl
-curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
-sudo mv /tmp/eksctl /usr/local/bin
+brew install eksctl
 
-# argocd
-curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-chmod +x argocd
-sudo mv argocd /usr/local/bin/
+# kubectl
+brew install kubectl
 
-# jq
-sudo apt-get install jq  # or yum install jq
+# Helm
+brew install helm
 
-# cockroach CLI
-curl https://binaries.cockroachdb.com/cockroach-v25.4.11.linux-amd64.tgz | tar -xz
-sudo cp -i cockroach-v25.4.11.linux-amd64/cockroach /usr/local/bin/
+# jq (for JSON processing)
+brew install jq
+
+# envsubst (for template substitution)
+brew install gettext
+
+# istioctl (for Phase 6)
+brew install istioctl
+
+# ArgoCD CLI (for Phase 13, optional)
+brew install argocd
 ```
 
-### AWS GovCloud Account Setup
+### AWS Account Setup
 
-<details>
-<summary>AWS CLI and SSO Configuration (click to expand)</summary>
+1. **AWS Account Access**: Ensure you have AWS account credentials with permissions to create:
+   - EKS clusters
+   - VPCs, subnets, security groups
+   - EC2 instances
+   - IAM roles and policies
+   - Load balancers
+   - S3 buckets (for backups and audit logs)
 
-**Configure AWS SSO for GovCloud and verify access:**
+2. **Configure AWS CLI**:
+```bash
+aws configure
+# Enter your AWS Access Key ID
+# Enter your AWS Secret Access Key
+# Default region: us-east-2
+# Default output format: json
+```
+
+3. **Verify AWS Access**:
+```bash
+aws sts get-caller-identity
+```
+
+### Okta Tenant
+
+You'll need an Okta tenant with admin access to configure OIDC applications and groups. If you don't have one, sign up for a free developer account at https://developer.okta.com/.
+
+### CockroachDB Enterprise License (Phase 8)
+
+For enterprise features (backup/restore, encryption-at-rest, RBAC, changefeed), you'll need a CockroachDB Enterprise license. Request a trial license at https://www.cockroachlabs.com/get-started-cockroachdb/.
+
+### Domain Name (Optional)
+
+For production deployments, you may want a domain name for the Istio ingress gateway. For testing, you can use the auto-generated ELB DNS name.
+
+## Architecture Overview
+
+Before starting deployment, review the [ARCHITECTURE.md](./ARCHITECTURE.md) document to understand:
+
+- Connection pooling strategy (50% app, 40% batch, 10% admin)
+- Security model (client certificates + JWT authentication)
+- Row-Level Security (RLS) design
+- Database schema structure (metadata, staging, production)
+- Component access patterns
+- Observability and monitoring approach
+- Disaster recovery with Physical Cluster Replication
+
+### Phase Dependencies
+
+```
+Phase 0: Okta Configuration (Manual)
+    ↓
+Phase 1: EKS Cluster
+    ↓
+Phase 2: Vault PKI (Certificate Authority)
+    ↓
+Phase 3: CockroachDB Operator
+    ↓
+Phase 4: CockroachDB Cluster (JWT, Roles, Service Accounts, RLS)
+    ↓
+Phase 5: PgBouncer (Three Pools: app, batch, admin)
+    ↓
+Phase 6: Istio Service Mesh (JWT Validation)
+    ↓
+Phase 7: Flyway Schema Migrations
+    ↓
+Phase 8: Enterprise Features (License, Encryption, Backups)
+    ↓
+Phase 9: Observability Stack (Prometheus, Grafana, Alertmanager)
+    ↓
+Phase 10: Security Hardening (Network Policies, Pod Security, IRSA)
+    ↓
+Phase 11: Audit Logging (Fluent Bit, S3 Object Lock)
+    ↓
+Phase 12: Physical Cluster Replication (PCR West Standby)
+    ↓
+Phase 13: GitOps (ArgoCD, optional)
+```
+
+## Phase 0: Okta Configuration
+
+Configure Okta OIDC application and groups for JWT-based authentication.
+
+### Step 1: Create or Reuse OIDC Application
+
+**Option A: Reuse Existing Application**
+If you already have an Okta OIDC application configured (e.g., from okta-crdb-sync), you can reuse it. Just note the **Client ID** - you'll need it for `config.env`.
+
+**Option B: Create New Application**
+1. Log in to your Okta Admin Console
+2. Navigate to **Applications** → **Applications**
+3. Click **Create App Integration**
+4. Select **OIDC - OpenID Connect**
+5. Select **Web Application**
+6. Configure:
+   - **App integration name**: `CockroachDB Cluster` (or any name you prefer)
+   - **Sign-in redirect URIs**: `https://localhost:8080/callback` (placeholder, not used for JWT validation)
+   - **Sign-out redirect URIs**: `https://localhost:8080` (placeholder, not used for JWT validation)
+   - **Controlled access**: Choose who can access (e.g., "Allow everyone in your organization to access")
+7. Click **Save**
+8. Note the **Client ID** - you'll need it for `config.env`
+
+### Step 2: Configure Token Settings
+
+1. In the application, go to **Sign On** tab
+2. Click **Edit** in the OpenID Connect ID Token section
+3. Configure:
+   - **Issuer**: Use Okta URL (recommended)
+   - **Audience**: Use the **Client ID** from Step 1, or a custom value (must match `OKTA_AUDIENCE` in config.env)
+4. Click **Save**
+
+### Step 3: Add Groups Claim
+
+1. Still in the application, go to **Sign On** tab
+2. Scroll to **OpenID Connect ID Token**
+3. Add a **Groups** claim:
+   - **Name**: `groups`
+   - **Include in**: ID Token, Always
+   - **Filter**: Starts with `crdb_`
+4. Click **Save**
+
+### Step 4: Create Security Groups
+
+Create the following groups in Okta (navigate to **Directory** → **Groups** → **Add Group**):
+
+| Group Name | Description |
+|------------|-------------|
+| `crdb_advisor_team_east` | Advisors in East region (full account access for East parties) |
+| `crdb_advisor_team_west` | Advisors in West region (full account access for West parties) |
+| `crdb_client_services` | Client services team (read-only access to accounts) |
+| `crdb_compliance_team` | Compliance team (read-only access to compliance views) |
+| `crdb_fiduciary_admin` | Fiduciary administrators (read-write access to all parties) |
+| `crdb_batch_service` | Batch processing service accounts (BYPASSRLS) |
+| `crdb_developers` | Developers (dev environment access) |
+
+### Step 5: Assign Users to Groups
+
+1. Navigate to **Directory** → **Groups**
+2. For each group, click the group name
+3. Click **Assign people**
+4. Assign appropriate users to each group
+
+### Step 6: Obtain JWKS URL
+
+The JSON Web Key Set (JWKS) URL is used by CockroachDB to validate JWT tokens.
+
+Format: `https://{your-okta-domain}/oauth2/default/v1/keys`
+
+Example: `https://dev-12345678.okta.com/oauth2/default/v1/keys`
+
+### Step 7: Update config.env
+
+Update `config.env` with Okta configuration values:
 
 ```bash
-# Login via SSO
-aws sso login --profile govcloud-revenue
+# Edit config.env
+vi config.env
 
-# Set default region
-export AWS_REGION=us-gov-east-1
-
-# Verify access
-aws eks list-clusters --region us-gov-east-1
-aws eks list-clusters --region us-gov-west-1
+# Add Okta configuration:
+export OKTA_ISSUER="https://dev-12345678.okta.com/oauth2/default"
+export OKTA_JWKS_URL="https://dev-12345678.okta.com/oauth2/default/v1/keys"
+export OKTA_CLIENT_ID="0oa9abcd1234efgh5678"
+export OKTA_AUDIENCE="example-crdb-cluster"
 ```
 
-</details>
+## Phase 1: EKS Cluster
 
-### IAM Permissions
+Deploy the EKS cluster in us-east-2.
 
-Ensure your AWS user/role has permissions for:
-- EKS cluster creation and management (us-gov-east-1 and us-gov-west-1)
-- EC2 (for worker nodes, VPC, subnets, security groups, Transit Gateway)
-- IAM (for IRSA - IAM Roles for Service Accounts)
-- S3 (for backups and audit logs bucket creation with Object Lock)
-- KMS (for customer-managed keys)
-- ECR (for private container registry)
-- Route53 (optional, for DNS)
-
-### HashiCorp Vault
-
-This deployment requires a running HashiCorp Vault instance for:
-- PKI certificate management
-- Enterprise license storage
-- Secret injection via External Secrets Operator
-
-**Vault requirements:**
-- Vault server accessible from EKS clusters (both regions)
-- OIDC auth method configured for Kubernetes
-- PKI secrets engine mounted at `pki/`
-- KV v2 secrets engine for license and credentials
-
-### Checklist
-
-Before deploying, ensure:
-
-- ✅ AWS GovCloud credentials configured and tested (both regions)
-- ✅ kubectl, helm, eksctl, argocd, aws CLI, cockroach CLI installed
-- ✅ IAM permissions for EKS, EC2, IAM, S3, KMS, ECR, Transit Gateway
-- ✅ HashiCorp Vault deployed and accessible
-- ✅ ArgoCD repository for GitOps manifests created
-- ✅ Customer-managed KMS key created in both regions
-- ✅ S3 buckets for backups and audit logs with Object Lock enabled
-
----
-
-## Container Image Setup
-
-Container image sourcing differs between commercial AWS and GovCloud.
-
-### Commercial AWS (Direct Pull)
-
-**In commercial AWS, you can pull container images directly from public registries.**
-
-No mirroring required. The manifests reference standard images:
-- `cockroachdb/cockroach:v25.4.11`
-- `cockroachdb/cockroach-operator:v2.15.0`
-- `pgbouncer/pgbouncer:1.22.1`
-- `fluent/fluent-bit:3.0.2`
-- `hashicorp/vault-k8s:1.4.0`
-- `external-secrets/external-secrets:v0.9.13`
-- `jetstack/cert-manager-controller:v1.14.3`
-- `jetstack/cert-manager-webhook:v1.14.3`
-- `jetstack/cert-manager-cainjector:v1.14.3`
-
-Kubernetes will pull these from Docker Hub, `public.ecr.aws`, or `ghcr.io` automatically.
-
-**Skip to [EKS Cluster Setup](#eks-cluster-setup-3-az-topology)** if deploying on commercial AWS.
-
----
-
-### GovCloud (ECR Mirroring)
-
-**AWS GovCloud does not have access to public container registries** (`docker.io`, `public.ecr.aws`, `ghcr.io`). All images must be mirrored to a private ECR repository in GovCloud.
-
-**Required images (GovCloud-specific versions):**
-- `cockroachdb/cockroach:v25.4.11-fips` (FIPS 140-3 validated binary)
-- `cockroachdb/cockroach-operator:v2.15.0`
-- `pgbouncer/pgbouncer:1.22.1`
-- `fluent/fluent-bit:3.0.2`
-- `hashicorp/vault-k8s:1.4.0`
-- `external-secrets/external-secrets:v0.9.13`
-- `jetstack/cert-manager-controller:v1.14.3`
-- `jetstack/cert-manager-webhook:v1.14.3`
-- `jetstack/cert-manager-cainjector:v1.14.3`
-
-**Mirror images to GovCloud ECR:**
+### Step 1: Review Configuration
 
 ```bash
-# Source configuration
-source config.env
-
-# Set GovCloud-specific variables
-export AWS_REGION=us-gov-east-1
-export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-
-# Login to commercial AWS ECR public and GovCloud ECR
-aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
-aws ecr get-login-password --region ${AWS_REGION} --profile ${AWS_PROFILE} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-
-# Create ECR repositories
-for repo in cockroachdb cockroach-operator pgbouncer fluent-bit vault-k8s external-secrets cert-manager-controller cert-manager-webhook cert-manager-cainjector; do
-  aws ecr create-repository --repository-name ${repo} --region ${AWS_REGION} --profile ${AWS_PROFILE} || true
-done
-
-# Mirror CockroachDB FIPS binary
-docker pull cockroachdb/cockroach:v25.4.11-fips
-docker tag cockroachdb/cockroach:v25.4.11-fips ${ECR_REGISTRY}/cockroachdb:v25.4.11-fips
-docker push ${ECR_REGISTRY}/cockroachdb:v25.4.11-fips
-
-# Mirror CockroachDB Operator
-docker pull cockroachdb/cockroach-operator:v2.15.0
-docker tag cockroachdb/cockroach-operator:v2.15.0 ${ECR_REGISTRY}/cockroach-operator:v2.15.0
-docker push ${ECR_REGISTRY}/cockroach-operator:v2.15.0
-
-# Mirror PgBouncer
-docker pull pgbouncer/pgbouncer:1.22.1
-docker tag pgbouncer/pgbouncer:1.22.1 ${ECR_REGISTRY}/pgbouncer:1.22.1
-docker push ${ECR_REGISTRY}/pgbouncer:1.22.1
-
-# Mirror Fluent Bit
-docker pull fluent/fluent-bit:3.0.2
-docker tag fluent/fluent-bit:3.0.2 ${ECR_REGISTRY}/fluent-bit:3.0.2
-docker push ${ECR_REGISTRY}/fluent-bit:3.0.2
-
-# Mirror Vault K8s
-docker pull hashicorp/vault-k8s:1.4.0
-docker tag hashicorp/vault-k8s:1.4.0 ${ECR_REGISTRY}/vault-k8s:1.4.0
-docker push ${ECR_REGISTRY}/vault-k8s:1.4.0
-
-# Mirror External Secrets
-docker pull ghcr.io/external-secrets/external-secrets:v0.9.13
-docker tag ghcr.io/external-secrets/external-secrets:v0.9.13 ${ECR_REGISTRY}/external-secrets:v0.9.13
-docker push ${ECR_REGISTRY}/external-secrets:v0.9.13
-
-# Mirror cert-manager images
-docker pull quay.io/jetstack/cert-manager-controller:v1.14.3
-docker tag quay.io/jetstack/cert-manager-controller:v1.14.3 ${ECR_REGISTRY}/cert-manager-controller:v1.14.3
-docker push ${ECR_REGISTRY}/cert-manager-controller:v1.14.3
-
-docker pull quay.io/jetstack/cert-manager-webhook:v1.14.3
-docker tag quay.io/jetstack/cert-manager-webhook:v1.14.3 ${ECR_REGISTRY}/cert-manager-webhook:v1.14.3
-docker push ${ECR_REGISTRY}/cert-manager-webhook:v1.14.3
-
-docker pull quay.io/jetstack/cert-manager-cainjector:v1.14.3
-docker tag quay.io/jetstack/cert-manager-cainjector:v1.14.3 ${ECR_REGISTRY}/cert-manager-cainjector:v1.14.3
-docker push ${ECR_REGISTRY}/cert-manager-cainjector:v1.14.3
+cd /path/to/distributed-connection-pooling/kubernetes/eks
+cat config.env
 ```
 
-**Repeat for us-gov-west-1** (passive cluster region):
-```bash
-export AWS_REGION=us-gov-west-1
-export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-# ... (repeat mirror commands)
-```
+Verify the following settings:
+- `AWS_REGION="us-east-2"`
+- `EKS_CLUSTER_NAME` (default: your desired cluster name)
+- `EKS_NODE_COUNT` and `EKS_INSTANCE_TYPE`
 
-**Verify FIPS 140-3 Binary** (GovCloud only):
-```bash
-# Check FIPS binary availability
-docker pull ${ECR_REGISTRY}/cockroachdb:v25.4.11-fips
-docker run --rm ${ECR_REGISTRY}/cockroachdb:v25.4.11-fips version
-
-# Expected output should indicate FIPS mode
-# Build Tag:    v25.4.11-fips
-# FIPS Mode:    enabled
-```
-
----
-
-## Customer-Managed KMS Key (CMK)
-
-Create a customer-managed KMS key in each region for EBS encryption. This provides defense-in-depth alongside CockroachDB's encryption-at-rest.
-
-**Note**: Phase 1 setup.sh script automates this. Manual steps below for reference.
+### Step 2: Run Phase 1 Setup
 
 ```bash
-# Source configuration
-source config.env
-
-# Create CMK in primary region (us-east-1 commercial, us-gov-east-1 GovCloud)
-KEY_ID=$(aws kms create-key \
-  --description "CockroachDB EBS encryption key - ${AWS_REGION_EAST}" \
-  --region "${AWS_REGION_EAST}" \
-  --profile "${AWS_PROFILE}" \
-  --query 'KeyMetadata.KeyId' \
-  --output text)
-
-# Create alias
-aws kms create-alias \
-  --alias-name "${KMS_KEY_ALIAS_EAST}" \
-  --target-key-id "${KEY_ID}" \
-  --region "${AWS_REGION_EAST}" \
-  --profile "${AWS_PROFILE}"
-
-# Get KMS key ARN (save to config.env)
-export KMS_KEY_ARN_EAST=$(aws kms describe-key \
-  --key-id "${KMS_KEY_ALIAS_EAST}" \
-  --region "${AWS_REGION_EAST}" \
-  --profile "${AWS_PROFILE}" \
-  --query 'KeyMetadata.Arn' \
-  --output text)
-
-echo "Update config.env with: export KMS_KEY_ARN_EAST=\"${KMS_KEY_ARN_EAST}\""
-
-# Repeat for secondary region (us-west-2 commercial, us-gov-west-1 GovCloud)
-KEY_ID=$(aws kms create-key \
-  --description "CockroachDB EBS encryption key - ${AWS_REGION_WEST}" \
-  --region "${AWS_REGION_WEST}" \
-  --profile "${AWS_PROFILE}" \
-  --query 'KeyMetadata.KeyId' \
-  --output text)
-
-aws kms create-alias \
-  --alias-name "${KMS_KEY_ALIAS_WEST}" \
-  --target-key-id "${KEY_ID}" \
-  --region "${AWS_REGION_WEST}" \
-  --profile "${AWS_PROFILE}"
-
-export KMS_KEY_ARN_WEST=$(aws kms describe-key \
-  --key-id "${KMS_KEY_ALIAS_WEST}" \
-  --region "${AWS_REGION_WEST}" \
-  --profile "${AWS_PROFILE}" \
-  --query 'KeyMetadata.Arn' \
-  --output text)
-
-echo "Update config.env with: export KMS_KEY_ARN_WEST=\"${KMS_KEY_ARN_WEST}\""
+cd manifests/phase1-foundation
+chmod +x setup.sh
+./setup.sh
 ```
 
----
+This will:
+- Create VPC with public and private subnets across 3 availability zones
+- Create EKS cluster with control plane (takes ~15-20 minutes)
+- Create managed node group with specified instance types
+- Configure kubectl context
+- Enable IRSA (IAM Roles for Service Accounts)
 
-## S3 Buckets with Object Lock (WORM)
-
-Create separate S3 buckets for backups and audit logs with Object Lock (Write Once Read Many) for compliance.
-
-**Retention policies:**
-- **Backups**: 365 days (1 year)
-- **Audit logs**: 2,555 days (7 years)
-
-**Note**: Phase 1 setup.sh script automates this. Manual steps below for reference.
+### Step 3: Verify Cluster
 
 ```bash
-# Source configuration
-source config.env
-
-# Backup bucket (365-day retention) - Primary region
-aws s3api create-bucket \
-  --bucket "${S3_BUCKET_BACKUPS_EAST}" \
-  --region "${AWS_REGION_EAST}" \
-  --create-bucket-configuration LocationConstraint="${AWS_REGION_EAST}" \
-  --object-lock-enabled-for-bucket \
-  --profile "${AWS_PROFILE}"
-
-aws s3api put-object-lock-configuration \
-  --bucket "${S3_BUCKET_BACKUPS_EAST}" \
-  --object-lock-configuration 'Rule={DefaultRetention={Mode=COMPLIANCE,Days=365}}' \
-  --region "${AWS_REGION_EAST}" \
-  --profile "${AWS_PROFILE}"
-
-aws s3api put-bucket-encryption \
-  --bucket "${S3_BUCKET_BACKUPS_EAST}" \
-  --server-side-encryption-configuration "{
-    \"Rules\": [{
-      \"ApplyServerSideEncryptionByDefault\": {
-        \"SSEAlgorithm\": \"aws:kms\",
-        \"KMSMasterKeyID\": \"${KMS_KEY_ARN_EAST}\"
-      }
-    }]
-  }" \
-  --region "${AWS_REGION_EAST}" \
-  --profile "${AWS_PROFILE}"
-
-# Audit log bucket (7-year retention) - Primary region
-aws s3api create-bucket \
-  --bucket "${S3_BUCKET_AUDIT_EAST}" \
-  --region "${AWS_REGION_EAST}" \
-  --create-bucket-configuration LocationConstraint="${AWS_REGION_EAST}" \
-  --object-lock-enabled-for-bucket \
-  --profile "${AWS_PROFILE}"
-
-aws s3api put-object-lock-configuration \
-  --bucket "${S3_BUCKET_AUDIT_EAST}" \
-  --object-lock-configuration 'Rule={DefaultRetention={Mode=COMPLIANCE,Days=2555}}' \
-  --region "${AWS_REGION_EAST}" \
-  --profile "${AWS_PROFILE}"
-
-aws s3api put-bucket-encryption \
-  --bucket "${S3_BUCKET_AUDIT_EAST}" \
-  --server-side-encryption-configuration "{
-    \"Rules\": [{
-      \"ApplyServerSideEncryptionByDefault\": {
-        \"SSEAlgorithm\": \"aws:kms\",
-        \"KMSMasterKeyID\": \"${KMS_KEY_ARN_EAST}\"
-      }
-    }]
-  }" \
-  --region "${AWS_REGION_EAST}" \
-  --profile "${AWS_PROFILE}"
-
-# Repeat for secondary region (us-west-2 commercial, us-gov-west-1 GovCloud)
-# ... (same commands with S3_BUCKET_*_WEST and AWS_REGION_WEST variables)
+kubectl cluster-info
+kubectl get nodes
 ```
 
----
-
-## EKS Cluster Setup (3-AZ Topology)
-
-Deploy EKS clusters in both regions (us-east-1/us-west-2 for commercial, us-gov-east-1/us-gov-west-1 for GovCloud) with explicit 3-AZ node placement for local quorum.
-
-### Architecture Requirements
-
-**3-AZ Topology for Local Quorum:**
-- Managed node groups spanning 3 availability zones (e.g., us-east-1a, us-east-1b, us-east-1c)
-- Pod anti-affinity rules forcing one CockroachDB pod per AZ
-- topologySpreadConstraints for even distribution
-- `volumeBindingMode: WaitForFirstConsumer` in StorageClass for AZ-aware EBS provisioning
-
-**Deployment**: See [Phase 1: Foundation](manifests/phase1-foundation/README.md) for automated deployment via setup.sh script.
-
-### Manual eksctl Deployment (Reference)
-
-The actual cluster configuration is in [manifests/phase1-foundation/cluster-east.yaml](manifests/phase1-foundation/cluster-east.yaml) which uses variable substitution from config.env.
-
-**Example structure** (actual file uses ${VARIABLES}):
-
-```yaml
-apiVersion: eksctl.io/v1alpha5
-kind: ClusterConfig
-
-metadata:
-  name: ${CLUSTER_NAME_EAST}  # from config.env
-  region: ${AWS_REGION_EAST}  # us-east-1 (commercial) or us-gov-east-1 (GovCloud)
-  version: "${EKS_VERSION}"
-
-iam:
-  withOIDC: true
-
-vpc:
-  cidr: 10.10.0.0/16
-  nat:
-    gateway: Single  # NAT gateway for private subnet outbound
-
-availabilityZones:
-  - us-gov-east-1a
-  - us-gov-east-1b
-  - us-gov-east-1c
-
-managedNodeGroups:
-  - name: crdb-nodes-1a
-    instanceType: m5.2xlarge
-    desiredCapacity: 1
-    minSize: 1
-    maxSize: 3
-    availabilityZones:
-      - us-gov-east-1a
-    privateNetworking: true
-    labels:
-      role: cockroachdb
-      topology.kubernetes.io/zone: us-gov-east-1a
-    tags:
-      k8s.io/cluster-autoscaler/enabled: "true"
-      k8s.io/cluster-autoscaler/crdb-dcp-east: "owned"
-
-  - name: crdb-nodes-1b
-    instanceType: m5.2xlarge
-    desiredCapacity: 1
-    minSize: 1
-    maxSize: 3
-    availabilityZones:
-      - us-gov-east-1b
-    privateNetworking: true
-    labels:
-      role: cockroachdb
-      topology.kubernetes.io/zone: us-gov-east-1b
-    tags:
-      k8s.io/cluster-autoscaler/enabled: "true"
-      k8s.io/cluster-autoscaler/crdb-dcp-east: "owned"
-
-  - name: crdb-nodes-1c
-    instanceType: m5.2xlarge
-    desiredCapacity: 1
-    minSize: 1
-    maxSize: 3
-    availabilityZones:
-      - us-gov-east-1c
-    privateNetworking: true
-    labels:
-      role: cockroachdb
-      topology.kubernetes.io/zone: us-gov-east-1c
-    tags:
-      k8s.io/cluster-autoscaler/enabled: "true"
-      k8s.io/cluster-autoscaler/crdb-dcp-east: "owned"
-
-  - name: app-nodes
-    instanceType: c5.xlarge
-    desiredCapacity: 3
-    minSize: 3
-    maxSize: 9
-    availabilityZones:
-      - us-gov-east-1a
-      - us-gov-east-1b
-      - us-gov-east-1c
-    privateNetworking: true
-    labels:
-      role: application
-
-addons:
-  - name: vpc-cni
-  - name: coredns
-  - name: kube-proxy
-  - name: aws-ebs-csi-driver
-    version: latest
-    serviceAccountRoleARN: arn:aws-us-gov:iam::123456789012:role/AmazonEKS_EBS_CSI_DriverRole
+Expected output:
+```
+NAME                                           STATUS   ROLES    AGE   VERSION
+ip-10-0-1-123.us-east-2.compute.internal      Ready    <none>   2m    v1.34.0-eks-xxxxxx
+ip-10-0-2-234.us-east-2.compute.internal      Ready    <none>   2m    v1.34.0-eks-xxxxxx
+ip-10-0-3-345.us-east-2.compute.internal      Ready    <none>   2m    v1.34.0-eks-xxxxxx
 ```
 
-**Deploy the cluster:**
+### Step 4: Verify kubectl Context
 
 ```bash
-eksctl create cluster -f cluster-east.yaml --profile govcloud-revenue
+kubectl config current-context
 ```
 
-**Repeat for West cluster** (`cluster-west.yaml` with us-gov-west-1 regions).
+Should show: `arn:aws:eks:us-east-2:ACCOUNT_ID:cluster/CLUSTER_NAME` or similar.
 
-### Option 2: Using Terraform
+## Phase 2: Vault PKI
 
-Create `eks-east.tf`:
+Deploy HashiCorp Vault as the certificate authority for all TLS certificates.
 
-```hcl
-# TODO: Terraform EKS module with 3-AZ node groups
-# Similar structure to eksctl config above
-```
+### Step 1: Review Configuration
 
-### Install AWS Load Balancer Controller
+Verify Vault settings in `config.env`:
+- `VAULT_NAMESPACE="vault"`
+- `VAULT_RELEASE_NAME="vault"`
 
-Required for exposing services via Network Load Balancer:
-
-```bash
-# Create IAM policy for ALB controller
-curl -o iam-policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.7.1/docs/install/iam_policy.json
-
-aws iam create-policy \
-  --policy-name AWSLoadBalancerControllerIAMPolicy \
-  --policy-document file://iam-policy.json \
-  --region us-gov-east-1 \
-  --profile govcloud-revenue
-
-# Create IRSA for ALB controller
-eksctl create iamserviceaccount \
-  --cluster=crdb-dcp-east \
-  --namespace=kube-system \
-  --name=aws-load-balancer-controller \
-  --attach-policy-arn=arn:aws-us-gov:iam::123456789012:policy/AWSLoadBalancerControllerIAMPolicy \
-  --override-existing-serviceaccounts \
-  --region us-gov-east-1 \
-  --profile govcloud-revenue \
-  --approve
-
-# Install ALB controller via Helm
-helm repo add eks https://aws.github.io/eks-charts
-helm repo update
-
-helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
-  -n kube-system \
-  --set clusterName=crdb-dcp-east \
-  --set serviceAccount.create=false \
-  --set serviceAccount.name=aws-load-balancer-controller \
-  --set region=us-gov-east-1 \
-  --set vpcId=<vpc-id>
-```
-
-### Create StorageClass with WaitForFirstConsumer
-
-Create `storageclass-crdb.yaml`:
-
-```yaml
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: crdb-gp3-encrypted
-provisioner: ebs.csi.aws.com
-parameters:
-  type: gp3
-  iops: "16000"
-  throughput: "1000"
-  encrypted: "true"
-  kmsKeyId: "arn:aws-us-gov:kms:us-gov-east-1:123456789012:key/<key-id>"  # Customer-managed key
-volumeBindingMode: WaitForFirstConsumer  # Critical for AZ-aware provisioning
-allowVolumeExpansion: true
-reclaimPolicy: Retain
-```
-
-Apply to both clusters:
+### Step 2: Run Phase 2 Setup
 
 ```bash
-kubectl apply -f storageclass-crdb.yaml --context crdb-dcp-east
-kubectl apply -f storageclass-crdb.yaml --context crdb-dcp-west
+cd ../phase2-certificates
+chmod +x setup.sh
+./setup.sh
 ```
 
-### Configure Cross-Cluster Networking (Transit Gateway)
+This will:
+- Create `vault` namespace
+- Install Vault via Helm in standalone mode with persistent storage
+- Initialize and unseal Vault (save the unseal keys and root token!)
+- Configure PKI secrets engine at `pki` path
+- Generate root CA certificate with 10-year TTL
+- Configure certificate roles for:
+  - CockroachDB node certificates
+  - CockroachDB client certificates (root, pgb_app_user, pgb_batch_user, pgb_admin_user, flyway_svc)
+  - PgBouncer server certificates (for app/batch/admin pools)
+  - PgBouncer client certificates (for connecting to CockroachDB)
+- Create Vault Issuer for cert-manager integration
 
-For PCR replication traffic between East and West clusters:
-
-```bash
-# TODO: Transit Gateway setup between us-gov-east-1 and us-gov-west-1 VPCs
-# - Create Transit Gateway in each region
-# - Create TGW peering connection
-# - Update route tables to allow CRDB pod-to-pod communication on port 26257
-# - Update security groups to allow cross-region traffic
-```
-
----
-
-## GitOps / ArgoCD Integration
-
-All Kubernetes resources are deployed via ArgoCD for GitOps-based lifecycle management.
-
-### ArgoCD Installation
-
-Install ArgoCD in both clusters:
+### Step 3: Verify Vault
 
 ```bash
-kubectl create namespace argocd --context crdb-dcp-east
-kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml --context crdb-dcp-east
-
-# Repeat for West
-kubectl create namespace argocd --context crdb-dcp-west
-kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml --context crdb-dcp-west
-
-# Get admin password
-kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" --context crdb-dcp-east | base64 -d
-
-# Expose ArgoCD UI via port-forward
-kubectl port-forward svc/argocd-server -n argocd 8080:443 --context crdb-dcp-east
+kubectl get pods -n vault
 ```
 
-### Git Repository Structure
-
-Create a Git repository with the following structure:
-
+Expected output:
 ```
-crdb-dcp-govcloud/
-├── clusters/
-│   ├── east/
-│   │   ├── argocd-apps/          # ArgoCD Application manifests
-│   │   │   ├── cert-manager.yaml
-│   │   │   ├── external-secrets.yaml
-│   │   │   ├── cockroachdb-operator.yaml
-│   │   │   ├── cockroachdb-cluster.yaml
-│   │   │   ├── pgbouncer.yaml
-│   │   │   ├── fluent-bit.yaml
-│   │   │   └── network-policies.yaml
-│   │   └── kustomization.yaml
-│   └── west/
-│       ├── argocd-apps/          # Same structure as east
-│       └── kustomization.yaml
-├── base/
-│   ├── cert-manager/
-│   │   ├── kustomization.yaml
-│   │   └── values.yaml
-│   ├── external-secrets/
-│   ├── cockroachdb-operator/
-│   ├── cockroachdb-cluster/
-│   │   ├── crdb-east.yaml        # CockroachDB CR for East (active)
-│   │   ├── crdb-west.yaml        # CockroachDB CR for West (passive)
-│   │   ├── service.yaml
-│   │   └── kustomization.yaml
-│   ├── pgbouncer/
-│   │   ├── deployment.yaml
-│   │   ├── configmap.yaml
-│   │   ├── service.yaml
-│   │   └── kustomization.yaml
-│   ├── fluent-bit/
-│   └── network-policies/
-└── overlays/
-    ├── east/
-    └── west/
+NAME                                    READY   STATUS    RESTARTS   AGE
+vault-0                                 1/1     Running   0          2m
+vault-agent-injector-xxxxxxxxxx-xxxxx   1/1     Running   0          2m
 ```
 
-### ArgoCD Application Pattern
-
-All resources are deployed via ArgoCD Applications, not `kubectl apply`. Example for CockroachDB Operator:
-
-**clusters/east/argocd-apps/cockroachdb-operator.yaml:**
-
-```yaml
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: cockroachdb-operator
-  namespace: argocd
-spec:
-  project: default
-  source:
-    repoURL: https://github.com/yourorg/crdb-dcp-govcloud.git
-    targetRevision: main
-    path: base/cockroachdb-operator
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: cockroach-operator-system
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-    syncOptions:
-      - CreateNamespace=true
-```
-
-Apply the ArgoCD Application:
+### Step 4: Test Certificate Generation
 
 ```bash
-kubectl apply -f clusters/east/argocd-apps/cockroachdb-operator.yaml --context crdb-dcp-east
+# Port-forward to Vault
+kubectl port-forward -n vault vault-0 8200:8200 &
+
+# Export Vault address and token (use root token from setup output)
+export VAULT_ADDR='http://127.0.0.1:8200'
+export VAULT_TOKEN='<root-token-from-setup-output>'
+
+# Test certificate issuance for CockroachDB node
+vault write pki/issue/cockroachdb-server \
+    common_name="cockroachdb.cockroachdb.svc.cluster.local" \
+    alt_names="localhost,*.cockroachdb,*.cockroachdb.cockroachdb,*.cockroachdb.cockroachdb.svc.cluster.local" \
+    ip_sans="127.0.0.1" \
+    ttl="8760h"
 ```
 
-**All subsequent deployments follow this pattern** - changes go through Git PR → ArgoCD sync, not imperative kubectl commands.
+You should receive a certificate in the response with `serial_number`, `certificate`, `private_key`, etc.
 
----
+## Phase 3: CockroachDB Operator
 
-## HashiCorp Vault PKI Setup
+Install the CockroachDB Kubernetes Operator and cert-manager.
 
-Configure Vault PKI for mTLS certificate management with cert-manager integration.
-
-### 1. Enable PKI Secrets Engine
+### Step 1: Run Phase 3 Setup
 
 ```bash
-# Enable PKI at pki/ mount
-vault secrets enable -path=pki pki
-
-# Tune TTL to 10 years for CA
-vault secrets tune -max-lease-ttl=87600h pki
-
-# Generate root CA
-vault write -field=certificate pki/root/generate/internal \
-  common_name="CockroachDB Root CA" \
-  issuer_name="root-ca" \
-  ttl=87600h > ca.crt
-
-# Configure CA and CRL URLs
-vault write pki/config/urls \
-  issuing_certificates="https://vault.example.com:8200/v1/pki/ca" \
-  crl_distribution_points="https://vault.example.com:8200/v1/pki/crl"
+cd ../phase3-operator
+chmod +x setup.sh
+./setup.sh
 ```
 
-### 2. Create PKI Role for CockroachDB
+This will:
+- Create `cockroachdb` namespace
+- Install cert-manager from Jetstack Helm chart
+- Create Vault Issuer for cert-manager (connects to Vault PKI)
+- Install CockroachDB Kubernetes Operator from Cockroach Helm chart
+- Wait for all components to be ready
+
+### Step 2: Verify Operator
 
 ```bash
-# Create role for node certificates
-vault write pki/roles/cockroachdb-node \
-  allowed_domains="cockroachdb,cockroachdb.cockroachdb,cockroachdb.cockroachdb.svc,cockroachdb.cockroachdb.svc.cluster.local,localhost,node" \
-  allow_subdomains=true \
-  allow_bare_domains=true \
-  allow_localhost=true \
-  allow_ip_sans=true \
-  client_flag=true \
-  server_flag=true \
-  max_ttl=8760h \
-  ttl=2160h
-
-# Create role for client certificates
-vault write pki/roles/cockroachdb-client \
-  allowed_domains="root,admin,pgbouncer" \
-  allow_bare_domains=true \
-  client_flag=true \
-  max_ttl=8760h \
-  ttl=2160h
+kubectl get pods -n cockroachdb-operator-system
 ```
 
-### 3. Configure Kubernetes Auth
+Expected output:
+```
+NAME                                                  READY   STATUS    RESTARTS   AGE
+cockroach-operator-manager-xxxxxxxxxx-xxxxx          1/1     Running   0          1m
+```
+
+### Step 3: Verify cert-manager
 
 ```bash
-# Enable Kubernetes auth
-vault auth enable -path=kubernetes-east kubernetes
-
-# Configure Kubernetes auth with EKS cluster
-vault write auth/kubernetes-east/config \
-  kubernetes_host="https://<eks-api-endpoint>" \
-  kubernetes_ca_cert=@/path/to/ca.crt \
-  token_reviewer_jwt="<service-account-jwt>"
-
-# Create policy for cert-manager
-vault policy write cert-manager-policy - <<EOF
-path "pki/sign/cockroachdb-node" {
-  capabilities = ["create", "update"]
-}
-path "pki/sign/cockroachdb-client" {
-  capabilities = ["create", "update"]
-}
-EOF
-
-# Create Kubernetes role for cert-manager
-vault write auth/kubernetes-east/role/cert-manager \
-  bound_service_account_names=cert-manager \
-  bound_service_account_namespaces=cert-manager \
-  policies=cert-manager-policy \
-  ttl=1h
+kubectl get pods -n cert-manager
 ```
 
-### 4. Deploy cert-manager
-
-Create ArgoCD Application for cert-manager:
-
-**base/cert-manager/values.yaml:**
-
-```yaml
-installCRDs: true
-image:
-  repository: 123456789012.dkr.ecr.us-gov-east-1.amazonaws.com/cert-manager-controller
-  tag: v1.14.3
-webhook:
-  image:
-    repository: 123456789012.dkr.ecr.us-gov-east-1.amazonaws.com/cert-manager-webhook
-    tag: v1.14.3
-cainjector:
-  image:
-    repository: 123456789012.dkr.ecr.us-gov-east-1.amazonaws.com/cert-manager-cainjector
-    tag: v1.14.3
+Expected output:
+```
+NAME                                      READY   STATUS    RESTARTS   AGE
+cert-manager-xxxxxxxxxx-xxxxx             1/1     Running   0          2m
+cert-manager-cainjector-xxxxxxxxxx-xxxxx  1/1     Running   0          2m
+cert-manager-webhook-xxxxxxxxxx-xxxxx     1/1     Running   0          2m
 ```
 
-### 5. Create Vault ClusterIssuer
-
-**base/cert-manager/vault-issuer.yaml:**
-
-```yaml
-apiVersion: cert-manager.io/v1
-kind: ClusterIssuer
-metadata:
-  name: vault-issuer
-spec:
-  vault:
-    server: https://vault.example.com:8200
-    path: pki/sign/cockroachdb-node
-    auth:
-      kubernetes:
-        role: cert-manager
-        mountPath: /v1/auth/kubernetes-east
-        secretRef:
-          name: cert-manager-vault-token
-          key: token
-```
-
-### 6. Configure cert-manager to Issue Certificates
-
-**Example Certificate resource (managed by CockroachDB Operator or created manually):**
-
-```yaml
-apiVersion: cert-manager.io/v1
-kind: Certificate
-metadata:
-  name: cockroachdb-node
-  namespace: cockroachdb
-spec:
-  secretName: cockroachdb-node-secret
-  issuerRef:
-    name: vault-issuer
-    kind: ClusterIssuer
-  commonName: node
-  dnsNames:
-    - localhost
-    - cockroachdb-public
-    - cockroachdb-public.cockroachdb
-    - cockroachdb-public.cockroachdb.svc.cluster.local
-    - "*.cockroachdb"
-    - "*.cockroachdb.cockroachdb"
-    - "*.cockroachdb.cockroachdb.svc.cluster.local"
-  ipAddresses:
-    - 127.0.0.1
-  duration: 2160h  # 90 days
-  renewBefore: 720h  # 30 days
-  usages:
-    - server auth
-    - client auth
-```
-
-cert-manager will automatically renew certificates before expiry.
-
----
-
-## CockroachDB Operator Installation
-
-Install the CockroachDB Operator via ArgoCD.
-
-### Create Operator ArgoCD Application
-
-**base/cockroachdb-operator/kustomization.yaml:**
-
-```yaml
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-
-resources:
-  - https://raw.githubusercontent.com/cockroachdb/cockroach-operator/v2.15.0/install/crds.yaml
-  - https://raw.githubusercontent.com/cockroachdb/cockroach-operator/v2.15.0/install/operator.yaml
-
-images:
-  - name: cockroachdb/cockroach-operator
-    newName: 123456789012.dkr.ecr.us-gov-east-1.amazonaws.com/cockroach-operator
-    newTag: v2.15.0
-
-namespace: cockroach-operator-system
-```
-
-**clusters/east/argocd-apps/cockroachdb-operator.yaml:**
-
-```yaml
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: cockroachdb-operator
-  namespace: argocd
-spec:
-  project: default
-  source:
-    repoURL: https://github.com/yourorg/crdb-dcp-govcloud.git
-    targetRevision: main
-    path: base/cockroachdb-operator
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: cockroach-operator-system
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-    syncOptions:
-      - CreateNamespace=true
-```
-
-Apply via ArgoCD:
+### Step 4: Verify Vault Issuer
 
 ```bash
-kubectl apply -f clusters/east/argocd-apps/cockroachdb-operator.yaml --context crdb-dcp-east
-kubectl apply -f clusters/west/argocd-apps/cockroachdb-operator.yaml --context crdb-dcp-west
+kubectl get issuer -n cockroachdb
 ```
 
-### Verify Operator Installation
+Expected output:
+```
+NAME            READY   AGE
+vault-issuer    True    2m
+```
+
+## Phase 4: CockroachDB Cluster
+
+Deploy the CockroachDB cluster with JWT authentication, roles, service accounts, and example RLS configuration.
+
+### Step 1: Ensure Okta Configuration in config.env
+
+Verify that `config.env` contains Okta configuration from Phase 0:
 
 ```bash
-kubectl get pods -n cockroach-operator-system --context crdb-dcp-east
-# Expected: cockroach-operator pod running
+grep OKTA config.env
 ```
 
----
+Should show:
+```
+export OKTA_ISSUER="..."
+export OKTA_JWKS_URL="..."
+export OKTA_CLIENT_ID="..."
+export OKTA_AUDIENCE="..."
+```
 
-## CockroachDB Cluster Deployment
-
-Deploy CockroachDB clusters in both regions using the Operator.
-
-### Create Namespace
+### Step 2: Run Phase 4 Setup
 
 ```bash
-kubectl create namespace cockroachdb --context crdb-dcp-east
-kubectl create namespace cockroachdb --context crdb-dcp-west
+cd ../phase4-cluster
+chmod +x setup.sh
+./setup.sh
 ```
 
-### Configure CockroachDB Custom Resource (East - Active)
+This will:
+- Generate CockroachDB cluster manifest (3 nodes, 8 CPU limit per node, 24Gi memory per node)
+- Create CockroachDB StatefulSet via CockroachDB Operator
+- Wait for cluster to be ready (~5-10 minutes)
+- Initialize cluster
+- Generate node certificate via cert-manager + Vault PKI
+- Generate client certificates for:
+  - `root` (admin access, for DBA operations)
+  - `pgb_app_user` (app pool service account)
+  - `pgb_batch_user` (batch pool service account)
+  - `pgb_admin_user` (admin pool service account)
+  - `flyway_svc` (schema migration service account)
+- Configure JWT authentication:
+  - Set `server.jwt_authentication.enabled = true`
+  - Set `server.jwt_authentication.jwks` to Okta JWKS URL
+  - Set `server.jwt_authentication.audience` to configured audience
+  - Set `server.jwt_authentication.claim` to `groups` (Okta group memberships)
+- Create database roles:
+  - **Parent roles (NOLOGIN)**: readonly, app, pipeline, powerbi, compliance, developer, admin
+  - **Okta-mapped roles (NOLOGIN)**: advisor-team-east, advisor-team-west, client-services, compliance-team, fiduciary-admin, batch-service, developers
+- Create service account SQL users (NOLOGIN, certificate-only):
+  - `pgb_app_user` → granted `app` role
+  - `pgb_batch_user` → granted `admin` role with BYPASSRLS
+  - `pgb_admin_user` → granted `admin` role with BYPASSRLS
+  - `flyway_svc` → granted `admin` role with BYPASSRLS
+- Create databases: `metadata`, `staging`, `production`
+- Create example `role_party_access` table (production database)
+- Create example RLS policy on `accounts` table (stub, full schema applied in Phase 7)
 
-**base/cockroachdb-cluster/crdb-east.yaml:**
-
-```yaml
-apiVersion: crdb.cockroachlabs.com/v1alpha1
-kind: CrdbCluster
-metadata:
-  name: cockroachdb-east
-  namespace: cockroachdb
-spec:
-  # FIPS-validated binary from GovCloud ECR
-  image:
-    name: 123456789012.dkr.ecr.us-gov-east-1.amazonaws.com/cockroachdb:v25.4.11-fips
-  
-  # 3 nodes for quorum (one per AZ)
-  nodes: 3
-  
-  # Resources per pod
-  resources:
-    requests:
-      cpu: "4"
-      memory: "16Gi"
-    limits:
-      cpu: "8"
-      memory: "32Gi"
-  
-  # Persistent storage with CMK encryption
-  dataStore:
-    pvc:
-      spec:
-        accessModes:
-          - ReadWriteOnce
-        resources:
-          requests:
-            storage: 100Gi
-        storageClassName: crdb-gp3-encrypted  # WaitForFirstConsumer with CMK
-  
-  # 3-AZ topology with pod anti-affinity
-  topologySpreadConstraints:
-    - maxSkew: 1
-      topologyKey: topology.kubernetes.io/zone
-      whenUnsatisfiable: DoNotSchedule
-      labelSelector:
-        matchLabels:
-          app: cockroachdb-east
-  
-  affinity:
-    podAntiAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        - labelSelector:
-            matchExpressions:
-              - key: app
-                operator: In
-                values:
-                  - cockroachdb-east
-          topologyKey: topology.kubernetes.io/zone
-  
-  # Node selector for CRDB-dedicated nodes
-  nodeSelector:
-    role: cockroachdb
-  
-  # TLS configuration (Vault PKI + cert-manager)
-  tlsEnabled: true
-  nodeTLSSecret: cockroachdb-node-secret  # Created by cert-manager
-  clientTLSSecret: cockroachdb-client-secret
-  
-  # Cluster settings for PCR
-  additionalArgs:
-    - --locality=region=us-gov-east-1,zone=$(POD_NAMESPACE)
-    - --cluster-name=crdb-east
-  
-  # Cluster init settings
-  cockroachDBVersion: v25.4.11
-  
-  # Enable rangefeed for PCR (set via SQL after cluster init)
-  # cluster.organization and enterprise.license injected via secret
-```
-
-### Configure CockroachDB Custom Resource (West - Passive)
-
-**base/cockroachdb-cluster/crdb-west.yaml:**
-
-Similar to East but with:
-- `name: cockroachdb-west`
-- `image` pointing to us-gov-west-1 ECR
-- `--locality=region=us-gov-west-1`
-- `--cluster-name=crdb-west`
-- StorageClass pointing to west region CMK
-
-### Pod Anti-Affinity and Topology Spread
-
-The `topologySpreadConstraints` and `podAntiAffinity` rules ensure:
-- One CockroachDB pod per AZ (us-gov-east-1a, 1b, 1c)
-- Even distribution across zones
-- No two pods scheduled on the same zone (hard requirement)
-
-Combined with `volumeBindingMode: WaitForFirstConsumer`, this ensures:
-- EBS volumes are created in the same AZ as the pod
-- Pods can always attach to their volumes after rescheduling
-
-### Deploy via ArgoCD
-
-**clusters/east/argocd-apps/cockroachdb-cluster.yaml:**
-
-```yaml
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: cockroachdb-cluster-east
-  namespace: argocd
-spec:
-  project: default
-  source:
-    repoURL: https://github.com/yourorg/crdb-dcp-govcloud.git
-    targetRevision: main
-    path: base/cockroachdb-cluster
-    kustomize:
-      namePrefix: east-
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: cockroachdb
-  syncPolicy:
-    automated:
-      prune: false  # Don't auto-delete database!
-      selfHeal: true
-    syncOptions:
-      - CreateNamespace=true
-```
-
-Apply:
+### Step 3: Verify Cluster
 
 ```bash
-kubectl apply -f clusters/east/argocd-apps/cockroachdb-cluster.yaml --context crdb-dcp-east
-kubectl apply -f clusters/west/argocd-apps/cockroachdb-cluster.yaml --context crdb-dcp-west
+kubectl get pods -n cockroachdb
 ```
 
-### Verify Cluster Deployment
+Expected output:
+```
+NAME                        READY   STATUS    RESTARTS   AGE
+example-crdb-cluster-0      1/1     Running   0          5m
+example-crdb-cluster-1      1/1     Running   0          4m
+example-crdb-cluster-2      1/1     Running   0          3m
+```
+
+### Step 4: Verify Certificates
 
 ```bash
-# Check pods
-kubectl get pods -n cockroachdb --context crdb-dcp-east
-# Expected: cockroachdb-east-0, cockroachdb-east-1, cockroachdb-east-2 (one per AZ)
-
-# Check pod distribution across AZs
-kubectl get pods -n cockroachdb -o wide --context crdb-dcp-east
-# Verify NODE column shows nodes from different AZs
-
-# Check PVCs
-kubectl get pvc -n cockroachdb --context crdb-dcp-east
-# Expected: 3 PVCs, all Bound
-
-# Check cluster status via SQL
-kubectl exec -it cockroachdb-east-0 -n cockroachdb --context crdb-dcp-east -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost -e "SHOW CLUSTER SETTING cluster.organization;"
+kubectl get certificates -n cockroachdb
 ```
 
----
+Expected output:
+```
+NAME                          READY   AGE
+cockroachdb-node              True    5m
+cockroachdb-client-root       True    4m
+cockroachdb-client-pgb-app    True    4m
+cockroachdb-client-pgb-batch  True    4m
+cockroachdb-client-pgb-admin  True    4m
+cockroachdb-client-flyway     True    4m
+```
 
-## Enterprise License Injection
-
-The Enterprise license is required for PCR, encryption-at-rest, and audit logging. Store it in Vault and inject via Kubernetes Secret.
-
-### 1. Store License in Vault
+### Step 5: Test Database Access
 
 ```bash
-vault kv put secret/cockroachdb/license \
-  organization="YourCompany" \
-  license="crl-0-xxxxxxxxxxxxxxxxxxxxx..."
+# Port-forward to CockroachDB SQL port
+kubectl port-forward -n cockroachdb example-crdb-cluster-0 26257:26257 &
+
+# Connect using root certificate
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SHOW DATABASES;"
 ```
 
-### 2. Deploy External Secrets Operator
-
-**base/external-secrets/kustomization.yaml:**
-
-```yaml
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-
-resources:
-  - https://raw.githubusercontent.com/external-secrets/external-secrets/v0.9.13/deploy/crds/bundle.yaml
-  - https://raw.githubusercontent.com/external-secrets/external-secrets/v0.9.13/deploy/kubernetes/external-secrets.yaml
-
-images:
-  - name: ghcr.io/external-secrets/external-secrets
-    newName: 123456789012.dkr.ecr.us-gov-east-1.amazonaws.com/external-secrets
-    newTag: v0.9.13
+Expected output:
+```
+  database_name
+-----------------
+  defaultdb
+  metadata
+  postgres
+  production
+  staging
+  system
+(6 rows)
 ```
 
-### 3. Configure SecretStore
-
-**base/external-secrets/vault-secret-store.yaml:**
-
-```yaml
-apiVersion: external-secrets.io/v1beta1
-kind: ClusterSecretStore
-metadata:
-  name: vault-backend
-spec:
-  provider:
-    vault:
-      server: "https://vault.example.com:8200"
-      path: "secret"
-      version: "v2"
-      auth:
-        kubernetes:
-          mountPath: "kubernetes-east"
-          role: "external-secrets"
-          serviceAccountRef:
-            name: "external-secrets"
-```
-
-### 4. Create ExternalSecret for License
-
-**base/cockroachdb-cluster/license-external-secret.yaml:**
-
-```yaml
-apiVersion: external-secrets.io/v1beta1
-kind: ExternalSecret
-metadata:
-  name: cockroachdb-license
-  namespace: cockroachdb
-spec:
-  refreshInterval: 1h
-  secretStoreRef:
-    name: vault-backend
-    kind: ClusterSecretStore
-  target:
-    name: cockroachdb-license
-    creationPolicy: Owner
-  data:
-    - secretKey: organization
-      remoteRef:
-        key: secret/cockroachdb/license
-        property: organization
-    - secretKey: license
-      remoteRef:
-        key: secret/cockroachdb/license
-        property: license
-```
-
-### 5. Apply License via SQL
-
-After cluster init, the operator or init job can apply the license:
+### Step 6: Verify JWT Authentication Configuration
 
 ```bash
-kubectl exec -it cockroachdb-east-0 -n cockroachdb --context crdb-dcp-east -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost <<EOF
-SET CLUSTER SETTING cluster.organization = '$(kubectl get secret cockroachdb-license -n cockroachdb -o jsonpath='{.data.organization}' | base64 -d)';
-SET CLUSTER SETTING enterprise.license = '$(kubectl get secret cockroachdb-license -n cockroachdb -o jsonpath='{.data.license}' | base64 -d)';
-EOF
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SHOW CLUSTER SETTING server.jwt_authentication.enabled;"
+
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SHOW CLUSTER SETTING server.jwt_authentication.jwks;"
 ```
 
-**Or inject via init container in CockroachDB CR** (preferred for GitOps):
-
-```yaml
-spec:
-  additionalArgs:
-    - --env=COCKROACH_ORGANIZATION=$(COCKROACH_ORGANIZATION)
-    - --env=COCKROACH_LICENSE=$(COCKROACH_LICENSE)
-  env:
-    - name: COCKROACH_ORGANIZATION
-      valueFrom:
-        secretKeyRef:
-          name: cockroachdb-license
-          key: organization
-    - name: COCKROACH_LICENSE
-      valueFrom:
-        secretKeyRef:
-          name: cockroachdb-license
-          key: license
-```
-
----
-
-## Active-Passive PCR Topology
-
-Physical Cluster Replication (PCR) creates an active cluster in us-gov-east-1 and a passive replica in us-gov-west-1 for disaster recovery.
-
-### Architecture Overview
-
-**Active Cluster (East):**
-- Serves application traffic
-- main virtual cluster handles reads/writes
-- Rangefeed streams changes to West cluster
-
-**Passive Cluster (West):**
-- Receives replication stream from East
-- main virtual cluster is read-only (replicating)
-- Cannot serve writes until promoted (failover)
-
-**Virtual Cluster Architecture:**
-- System tenant manages the physical infrastructure
-- `main` virtual cluster is where applications connect
-- PCR replicates the `main` virtual cluster, not the system tenant
-
-### Prerequisites for PCR
-
-1. **Cross-cluster network connectivity**: Transit Gateway or VPC peering between East and West VPCs
-2. **Rangefeed enabled**: `SET CLUSTER SETTING kv.rangefeed.enabled = true` on both clusters
-3. **Enterprise license**: Applied to both clusters
-4. **Connection string**: West cluster needs connection string to East cluster
-
-### 1. Enable Rangefeed on Both Clusters
+### Step 7: Verify Roles and Users
 
 ```bash
-# East cluster
-kubectl exec -it cockroachdb-east-0 -n cockroachdb --context crdb-dcp-east -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost -e \
-  "SET CLUSTER SETTING kv.rangefeed.enabled = true;"
+# Check all roles
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SHOW ROLES;"
 
-# West cluster
-kubectl exec -it cockroachdb-west-0 -n cockroachdb --context crdb-dcp-west -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost -e \
-  "SET CLUSTER SETTING kv.rangefeed.enabled = true;"
+# Check service account users
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SELECT username, \"isRole\" FROM system.users WHERE username LIKE 'pgb_%' OR username LIKE 'flyway_%';"
 ```
 
-### 2. Get Connection String for East Cluster
-
-The West cluster needs a connection string to the East cluster's system interface (port 26257):
+### Step 8: Access DB Console
 
 ```bash
-# Get East cluster internal service DNS
-EAST_CLUSTER_CONN="postgresql://cockroachdb-east-public.cockroachdb.svc.cluster.local:26257?sslmode=verify-full&sslrootcert=/cockroach/cockroach-certs/ca.crt&sslcert=/cockroach/cockroach-certs/client.root.crt&sslkey=/cockroach/cockroach-certs/client.root.key"
+# Port-forward to DB Console
+kubectl port-forward -n cockroachdb example-crdb-cluster-0 8080:8080 &
+
+# Open browser to: https://localhost:8080
+# Username: root
+# Password: (leave blank, using client certificate auth)
+# Click "Advanced" and "Proceed to localhost (unsafe)" if self-signed cert warning appears
 ```
 
-**Note**: For cross-region connectivity, use the Transit Gateway or VPC peering endpoint, or expose East cluster via NLB with internal DNS.
+## Phase 5: PgBouncer Connection Pools
 
-### 3. Initialize Virtual Cluster Replication (West)
+Deploy three PgBouncer connection pools with separate service accounts: app (50%), batch (40%), admin (10%).
 
-On the **West (passive) cluster**, create the `main` virtual cluster from East replication:
+### Step 1: Review Pool Configuration
+
+Verify pool settings in `config.env`:
 
 ```bash
-kubectl exec -it cockroachdb-west-0 -n cockroachdb --context crdb-dcp-west -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost <<EOF
-CREATE VIRTUAL CLUSTER main FROM REPLICATION OF main ON 'postgresql://cockroachdb-east-public.cockroachdb.svc.cluster.local:26257?sslmode=verify-full&sslrootcert=/cockroach/cockroach-certs/ca.crt&sslcert=/cockroach/cockroach-certs/client.root.crt&sslkey=/cockroach/cockroach-certs/client.root.key';
-EOF
+# Pool allocation percentages
+export PGBOUNCER_APP_POOL_PCT="50"
+export PGBOUNCER_BATCH_POOL_PCT="40"
+export PGBOUNCER_ADMIN_POOL_PCT="10"
+
+# Pool ports
+export PGBOUNCER_APP_PORT="5432"
+export PGBOUNCER_BATCH_PORT="5433"
+export PGBOUNCER_ADMIN_PORT="5434"
+
+# Pool replicas
+export PGBOUNCER_APP_REPLICAS="3"
+export PGBOUNCER_BATCH_REPLICAS="2"
+export PGBOUNCER_ADMIN_REPLICAS="1"
+
+# Pool mode
+export PGBOUNCER_POOL_MODE="transaction"
+
+# Client connection limits
+export PGBOUNCER_MAX_CLIENT_CONN="1000"
 ```
 
-This starts the replication stream from East → West.
+**Connection Pool Calculation**:
+- Total available connections to CockroachDB: `4 × 8 CPU × 3 nodes = 96 connections`
+- App pool: `96 × 50% = 48 connections` → 16 per replica (3 replicas)
+- Batch pool: `96 × 40% ≈ 38 connections` → 19 per replica (2 replicas)
+- Admin pool: `96 × 10% ≈ 10 connections` → 10 per replica (1 replica)
 
-### 4. Verify Replication Status
+### Step 2: Run Phase 5 Setup
 
 ```bash
-# On West cluster, check replication status
-kubectl exec -it cockroachdb-west-0 -n cockroachdb --context crdb-dcp-west -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost -e \
-  "SHOW VIRTUAL CLUSTER main WITH REPLICATION STATUS;"
-
-# Expected output:
-#   id |  name  | data_state  | service_mode |    source_tenant_name     | replication_lag
-# -----+--------+-------------+--------------+---------------------------+------------------
-#    3 | main   | replicating | none         | main                      | 00:00:02.5
+cd ../phase5-pgbouncer
+chmod +x setup.sh
+./setup.sh
 ```
 
-**Key fields:**
-- `data_state: replicating` - West is receiving data from East
-- `service_mode: none` - West is not serving traffic (passive)
-- `replication_lag` - How far behind West is (should be < 10 seconds)
+This will:
+- Create `pgbouncer` SQL user in CockroachDB (for admin console access)
+- Generate certificates for each pool via cert-manager + Vault PKI:
+  - **pgbouncer-app-server** (TLS for apps connecting to app pool)
+  - **pgbouncer-app-client** (TLS for app pool connecting to CockroachDB as `pgb_app_user`)
+  - **pgbouncer-batch-server** (TLS for batch jobs connecting to batch pool)
+  - **pgbouncer-batch-client** (TLS for batch pool connecting to CockroachDB as `pgb_batch_user`)
+  - **pgbouncer-admin-server** (TLS for admin tools connecting to admin pool)
+  - **pgbouncer-admin-client** (TLS for admin pool connecting to CockroachDB as `pgb_admin_user`)
+- Create ConfigMaps for each pool:
+  - `pgbouncer-app-config` (pool_size=16, max_client_conn=1000, transaction pooling)
+  - `pgbouncer-batch-config` (pool_size=19, max_client_conn=1000, transaction pooling)
+  - `pgbouncer-admin-config` (pool_size=10, max_client_conn=200, transaction pooling)
+- Deploy three PgBouncer Deployments:
+  - `pgbouncer-app` (3 replicas, listens on port 5432)
+  - `pgbouncer-batch` (2 replicas, listens on port 5433)
+  - `pgbouncer-admin` (1 replica, listens on port 5434)
+- Create three ClusterIP Services:
+  - `pgbouncer-app.cockroachdb.svc.cluster.local:5432`
+  - `pgbouncer-batch.cockroachdb.svc.cluster.local:5433`
+  - `pgbouncer-admin.cockroachdb.svc.cluster.local:5434`
+- Add Stakater Reloader annotations for auto-restart on ConfigMap changes
 
-### 5. Application Connection Strings
-
-**East (Active) - Applications connect here:**
-
-```
-postgresql://root@pgbouncer.cockroachdb.svc.cluster.local:5432/defaultdb?sslmode=verify-full&options=-ccluster=main
-```
-
-The `options=-ccluster=main` parameter routes connections to the `main` virtual cluster.
-
-**West (Passive) - No application connections until failover.**
-
-### 6. Monitoring Replication Lag
-
-Monitor replication lag continuously:
+### Step 3: Verify PgBouncer Pods
 
 ```bash
-# On West cluster
-kubectl exec -it cockroachdb-west-0 -n cockroachdb --context crdb-dcp-west -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost -e \
-  "SELECT lag FROM [SHOW VIRTUAL CLUSTER main WITH REPLICATION STATUS] WHERE name = 'main';"
+kubectl get pods -n cockroachdb -l app.kubernetes.io/component=connection-pooler
 ```
 
-**Alert if replication lag > 30 seconds** - indicates network issues or East cluster overload.
-
----
-
-## PgBouncer Deployment
-
-Deploy PgBouncer for connection pooling in front of the CockroachDB `main` virtual cluster.
-
-### Create PgBouncer ConfigMap
-
-**base/pgbouncer/configmap.yaml:**
-
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: pgbouncer-config
-  namespace: cockroachdb
-data:
-  pgbouncer.ini: |
-    [databases]
-    defaultdb = host=cockroachdb-east-public.cockroachdb.svc.cluster.local port=26257 dbname=defaultdb options=-ccluster=main
-
-    [pgbouncer]
-    listen_addr = 0.0.0.0
-    listen_port = 5432
-    auth_type = cert
-    auth_file = /etc/pgbouncer/userlist.txt
-    pool_mode = transaction
-    max_client_conn = 10000
-    default_pool_size = 25
-    reserve_pool_size = 5
-    reserve_pool_timeout = 3
-    server_tls_sslmode = verify-full
-    server_tls_ca_file = /etc/pgbouncer/certs/ca.crt
-    server_tls_cert_file = /etc/pgbouncer/certs/client.pgbouncer.crt
-    server_tls_key_file = /etc/pgbouncer/certs/client.pgbouncer.key
-    client_tls_sslmode = verify-full
-    client_tls_ca_file = /etc/pgbouncer/certs/ca.crt
-    client_tls_cert_file = /etc/pgbouncer/certs/server.crt
-    client_tls_key_file = /etc/pgbouncer/certs/server.key
-    logfile = /var/log/pgbouncer/pgbouncer.log
-    pidfile = /var/run/pgbouncer/pgbouncer.pid
-    admin_users = admin
-    stats_users = stats
-
-  userlist.txt: |
-    # cert auth - no passwords needed
+Expected output:
+```
+NAME                               READY   STATUS    RESTARTS   AGE
+pgbouncer-app-xxxxxxxxxx-xxxxx     1/1     Running   0          2m
+pgbouncer-app-xxxxxxxxxx-xxxxx     1/1     Running   0          2m
+pgbouncer-app-xxxxxxxxxx-xxxxx     1/1     Running   0          2m
+pgbouncer-batch-xxxxxxxxxx-xxxxx   1/1     Running   0          2m
+pgbouncer-batch-xxxxxxxxxx-xxxxx   1/1     Running   0          2m
+pgbouncer-admin-xxxxxxxxxx-xxxxx   1/1     Running   0          2m
 ```
 
-**Note**: The `options=-ccluster=main` in the connection string routes to the virtual cluster.
-
-### Create PgBouncer Deployment
-
-**base/pgbouncer/deployment.yaml:**
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: pgbouncer
-  namespace: cockroachdb
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: pgbouncer
-  template:
-    metadata:
-      labels:
-        app: pgbouncer
-    spec:
-      containers:
-        - name: pgbouncer
-          image: 123456789012.dkr.ecr.us-gov-east-1.amazonaws.com/pgbouncer:1.22.1
-          ports:
-            - containerPort: 5432
-              name: pgbouncer
-          volumeMounts:
-            - name: config
-              mountPath: /etc/pgbouncer
-            - name: certs
-              mountPath: /etc/pgbouncer/certs
-              readOnly: true
-            - name: logs
-              mountPath: /var/log/pgbouncer
-          resources:
-            requests:
-              cpu: "1"
-              memory: "2Gi"
-            limits:
-              cpu: "2"
-              memory: "4Gi"
-      volumes:
-        - name: config
-          configMap:
-            name: pgbouncer-config
-        - name: certs
-          secret:
-            secretName: pgbouncer-client-secret  # cert-manager issued
-        - name: logs
-          emptyDir: {}
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchExpressions:
-                    - key: app
-                      operator: In
-                      values:
-                        - pgbouncer
-                topologyKey: topology.kubernetes.io/zone
-```
-
-### Create PgBouncer Service
-
-**base/pgbouncer/service.yaml:**
-
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: pgbouncer
-  namespace: cockroachdb
-  annotations:
-    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
-    service.beta.kubernetes.io/aws-load-balancer-internal: "true"  # Internal NLB
-spec:
-  type: LoadBalancer
-  ports:
-    - port: 5432
-      targetPort: 5432
-      protocol: TCP
-      name: pgbouncer
-  selector:
-    app: pgbouncer
-```
-
-### Deploy via ArgoCD
+### Step 4: Verify PgBouncer Services
 
 ```bash
-kubectl apply -f clusters/east/argocd-apps/pgbouncer.yaml --context crdb-dcp-east
+kubectl get svc -n cockroachdb | grep pgbouncer
 ```
 
-### Verify PgBouncer
+Expected output:
+```
+pgbouncer-app     ClusterIP   10.100.123.45   <none>   5432/TCP   2m
+pgbouncer-batch   ClusterIP   10.100.123.46   <none>   5433/TCP   2m
+pgbouncer-admin   ClusterIP   10.100.123.47   <none>   5434/TCP   2m
+```
+
+### Step 5: Test Connection Through Each Pool
 
 ```bash
-# Check pods
-kubectl get pods -n cockroachdb -l app=pgbouncer --context crdb-dcp-east
+# Test app pool
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql \
+    --url "postgresql://root@pgbouncer-app:5432/defaultdb?sslmode=require" \
+    --certs-dir=/cockroach/cockroach-certs \
+    --execute="SELECT 'App pool connection successful' AS status;"
 
-# Get NLB endpoint
-kubectl get svc pgbouncer -n cockroachdb --context crdb-dcp-east
+# Test batch pool
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql \
+    --url "postgresql://root@pgbouncer-batch:5433/defaultdb?sslmode=require" \
+    --certs-dir=/cockroach/cockroach-certs \
+    --execute="SELECT 'Batch pool connection successful' AS status;"
 
-# Test connection
-kubectl run -it --rm psql --image=postgres:15 --restart=Never -- \
-  psql "postgresql://root@pgbouncer.cockroachdb.svc.cluster.local:5432/defaultdb?sslmode=verify-full&sslrootcert=/certs/ca.crt&sslcert=/certs/client.root.crt&sslkey=/certs/client.root.key&options=-ccluster=main"
+# Test admin pool
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql \
+    --url "postgresql://root@pgbouncer-admin:5434/defaultdb?sslmode=require" \
+    --certs-dir=/cockroach/cockroach-certs \
+    --execute="SELECT 'Admin pool connection successful' AS status;"
 ```
 
----
-
-## Load Balancing and External Access
-
-Expose PgBouncer and CockroachDB DB Console via AWS Network Load Balancer.
-
-### PgBouncer NLB (Internal)
-
-Already created in the PgBouncer Service above with `service.beta.kubernetes.io/aws-load-balancer-internal: "true"`.
-
-Applications within the VPC connect to:
-
-```
-pgbouncer.<nlb-dns-name>:5432
-```
-
-### DB Console NLB (Internal)
-
-**base/cockroachdb-cluster/console-service.yaml:**
-
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: cockroachdb-console
-  namespace: cockroachdb
-  annotations:
-    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
-    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
-spec:
-  type: LoadBalancer
-  ports:
-    - port: 8080
-      targetPort: 8080
-      protocol: TCP
-      name: http
-  selector:
-    app: cockroachdb-east
-```
-
-### Optional: Route53 DNS
-
-Create Route53 records pointing to NLB endpoints:
+### Step 6: Check PgBouncer Pool Stats
 
 ```bash
-# Get NLB DNS names
-PGBOUNCER_NLB=$(kubectl get svc pgbouncer -n cockroachdb -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' --context crdb-dcp-east)
-CONSOLE_NLB=$(kubectl get svc cockroachdb-console -n cockroachdb -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' --context crdb-dcp-east)
+# Check app pool statistics
+kubectl exec -n cockroachdb deployment/pgbouncer-app -- \
+    psql -p 5432 pgbouncer -U pgbouncer -c 'SHOW POOLS;'
 
-# Create Route53 CNAME records
-aws route53 change-resource-record-sets --hosted-zone-id <zone-id> --change-batch '{
-  "Changes": [{
-    "Action": "CREATE",
-    "ResourceRecordSet": {
-      "Name": "pgb.us-gov-east-1.dcp-govcloud.example.com",
-      "Type": "CNAME",
-      "TTL": 300,
-      "ResourceRecords": [{"Value": "'${PGBOUNCER_NLB}'"}]
-    }
-  }]
-}'
+# Check batch pool statistics
+kubectl exec -n cockroachdb deployment/pgbouncer-batch -- \
+    psql -p 5433 pgbouncer -U pgbouncer -c 'SHOW POOLS;'
 
-aws route53 change-resource-record-sets --hosted-zone-id <zone-id> --change-batch '{
-  "Changes": [{
-    "Action": "CREATE",
-    "ResourceRecordSet": {
-      "Name": "db.us-gov-east-1.dcp-govcloud.example.com",
-      "Type": "CNAME",
-      "TTL": 300,
-      "ResourceRecords": [{"Value": "'${CONSOLE_NLB}'"}]
-    }
-  }]
-}'
+# Check admin pool statistics
+kubectl exec -n cockroachdb deployment/pgbouncer-admin -- \
+    psql -p 5434 pgbouncer -U pgbouncer -c 'SHOW POOLS;'
 ```
 
-**Application connection string:**
+## Phase 6: Istio Service Mesh
 
-```
-postgresql://appuser@pgb.us-gov-east-1.dcp-govcloud.example.com:5432/defaultdb?sslmode=verify-full&sslrootcert=/path/to/ca.crt&sslcert=/path/to/client.crt&sslkey=/path/to/client.key&options=-ccluster=main
-```
+Deploy Istio service mesh for JWT validation, mTLS, and traffic management.
 
----
-
-## Network Policies
-
-Implement deny-all default with explicit allow rules for GovCloud compliance (no pod-to-internet egress).
-
-### Deny-All Default Policy
-
-**base/network-policies/deny-all.yaml:**
-
-```yaml
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: deny-all-ingress-egress
-  namespace: cockroachdb
-spec:
-  podSelector: {}
-  policyTypes:
-    - Ingress
-    - Egress
-```
-
-### Allow CockroachDB Ingress
-
-**base/network-policies/crdb-allow-ingress.yaml:**
-
-```yaml
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: crdb-allow-ingress
-  namespace: cockroachdb
-spec:
-  podSelector:
-    matchLabels:
-      app: cockroachdb-east
-  policyTypes:
-    - Ingress
-  ingress:
-    # Allow from PgBouncer on port 26257 (SQL)
-    - from:
-        - podSelector:
-            matchLabels:
-              app: pgbouncer
-      ports:
-        - protocol: TCP
-          port: 26257
-    
-    # Allow from monitoring namespace on port 8080 (metrics)
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              name: monitoring
-      ports:
-        - protocol: TCP
-          port: 8080
-    
-    # Allow from other CRDB pods on port 26257 (inter-node)
-    - from:
-        - podSelector:
-            matchLabels:
-              app: cockroachdb-east
-      ports:
-        - protocol: TCP
-          port: 26257
-    
-    # Allow PCR traffic from West cluster (cross-region)
-    # Note: Requires Transit Gateway CIDR or VPC peering
-    - from:
-        - ipBlock:
-            cidr: 10.20.0.0/16  # West VPC CIDR
-      ports:
-        - protocol: TCP
-          port: 26257
-```
-
-### Allow CockroachDB Egress
-
-**base/network-policies/crdb-allow-egress.yaml:**
-
-```yaml
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: crdb-allow-egress
-  namespace: cockroachdb
-spec:
-  podSelector:
-    matchLabels:
-      app: cockroachdb-east
-  policyTypes:
-    - Egress
-  egress:
-    # Allow to other CRDB pods (inter-node)
-    - to:
-        - podSelector:
-            matchLabels:
-              app: cockroachdb-east
-      ports:
-        - protocol: TCP
-          port: 26257
-    
-    # Allow to West cluster for PCR replication
-    - to:
-        - ipBlock:
-            cidr: 10.20.0.0/16  # West VPC CIDR
-      ports:
-        - protocol: TCP
-          port: 26257
-    
-    # Allow DNS (kube-dns/CoreDNS)
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              name: kube-system
-      ports:
-        - protocol: UDP
-          port: 53
-    
-    # Allow S3 for backups (GovCloud S3 endpoint)
-    - to:
-        - ipBlock:
-            cidr: 52.61.0.0/16  # S3 GovCloud CIDR (verify for your region)
-      ports:
-        - protocol: TCP
-          port: 443
-    
-    # NO internet egress - deny-all handles this
-```
-
-### Allow PgBouncer Ingress
-
-**base/network-policies/pgbouncer-allow-ingress.yaml:**
-
-```yaml
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: pgbouncer-allow-ingress
-  namespace: cockroachdb
-spec:
-  podSelector:
-    matchLabels:
-      app: pgbouncer
-  policyTypes:
-    - Ingress
-  ingress:
-    # Allow from application namespaces only on port 5432
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              app: application  # Application namespaces must have this label
-      ports:
-        - protocol: TCP
-          port: 5432
-    
-    # Allow from monitoring for metrics
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              name: monitoring
-      ports:
-        - protocol: TCP
-          port: 9127  # PgBouncer exporter port (if deployed)
-```
-
-### Allow PgBouncer Egress
-
-**base/network-policies/pgbouncer-allow-egress.yaml:**
-
-```yaml
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: pgbouncer-allow-egress
-  namespace: cockroachdb
-spec:
-  podSelector:
-    matchLabels:
-      app: pgbouncer
-  policyTypes:
-    - Egress
-  egress:
-    # Allow to CRDB pods on port 26257
-    - to:
-        - podSelector:
-            matchLabels:
-              app: cockroachdb-east
-      ports:
-        - protocol: TCP
-          port: 26257
-    
-    # Allow DNS
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              name: kube-system
-      ports:
-        - protocol: UDP
-          port: 53
-```
-
-Deploy via ArgoCD:
+### Step 1: Install Istio Operator
 
 ```bash
-kubectl apply -f clusters/east/argocd-apps/network-policies.yaml --context crdb-dcp-east
+cd ../phase6-istio
+chmod +x setup.sh
+./setup.sh
 ```
 
----
+This will:
+- Install Istio base CRDs
+- Install Istio control plane (istiod) in `istio-system` namespace
+- Install Istio ingress gateway with AWS Network Load Balancer
+- Enable automatic sidecar injection on `cockroachdb` namespace
+- Create RequestAuthentication resource for Okta JWT validation
+- Create AuthorizationPolicy to require valid JWT for ingress traffic
+- Create Gateway and VirtualService for routing PostgreSQL traffic
 
-## Encryption-at-Rest
-
-Two layers of encryption for defense-in-depth:
-
-### Layer 1: EBS Volume Encryption (AWS KMS)
-
-Already configured in the StorageClass (see [EKS Cluster Setup](#eks-cluster-setup-3-az-topology)):
-
-```yaml
-parameters:
-  encrypted: "true"
-  kmsKeyId: "arn:aws-us-gov:kms:us-gov-east-1:123456789012:key/<key-id>"
-```
-
-### Layer 2: CockroachDB Encryption-at-Rest
-
-Configure in the CockroachDB Custom Resource:
-
-**Update base/cockroachdb-cluster/crdb-east.yaml:**
-
-```yaml
-spec:
-  # ... existing config ...
-  
-  # Enterprise encryption-at-rest
-  additionalArgs:
-    - --enterprise-encryption=path=/cockroach/cockroach-data,key=/cockroach/cockroach-keys/master.key,old-key=plain
-  
-  # Mount encryption key from secret
-  additionalVolumes:
-    - name: encryption-key
-      secret:
-        secretName: cockroachdb-encryption-key
-  
-  additionalVolumeMounts:
-    - name: encryption-key
-      mountPath: /cockroach/cockroach-keys
-      readOnly: true
-```
-
-### Generate Encryption Key
+### Step 2: Verify Istio Installation
 
 ```bash
-# Generate 128-bit AES key
-cockroach gen encryption-key -s 128 /tmp/master.key
-
-# Create Kubernetes secret
-kubectl create secret generic cockroachdb-encryption-key \
-  --from-file=master.key=/tmp/master.key \
-  -n cockroachdb \
-  --context crdb-dcp-east
-
-# Securely delete local copy
-shred -u /tmp/master.key
+kubectl get pods -n istio-system
 ```
 
-**For GitOps/production**, store the key in Vault and inject via External Secrets Operator (similar to license injection).
+Expected output:
+```
+NAME                                    READY   STATUS    RESTARTS   AGE
+istiod-xxxxxxxxxx-xxxxx                 1/1     Running   0          2m
+istio-ingressgateway-xxxxxxxxxx-xxxxx   1/1     Running   0          2m
+```
 
-### Verify Encryption
+### Step 3: Verify Sidecar Injection Enabled
 
 ```bash
-kubectl exec -it cockroachdb-east-0 -n cockroachdb --context crdb-dcp-east -- \
-  cockroach debug encryption-active-key /cockroach/cockroach-data --certs-dir=/cockroach/cockroach-certs
-
-# Expected output:
-#   /cockroach/cockroach-data: aes-128-ctr (ID: master, created: 2026-06-03 12:00:00)
+kubectl get namespace cockroachdb -o jsonpath='{.metadata.labels.istio-injection}'
 ```
 
----
+Expected output: `enabled`
 
-## Audit Log Pipeline
-
-Stream CockroachDB SENSITIVE_ACCESS audit logs to S3 with Object Lock (WORM) for compliance.
-
-### 1. Enable Audit Logging
+### Step 4: Get Ingress Gateway External Endpoint
 
 ```bash
-kubectl exec -it cockroachdb-east-0 -n cockroachdb --context crdb-dcp-east -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost <<EOF
-SET CLUSTER SETTING sql.log.user_audit = 'SENSITIVE_ACCESS';
-ALTER ROLE ALL SET CLUSTER SETTING sql.log.user_audit = 'SENSITIVE_ACCESS';
-EOF
+export INGRESS_HOST=$(kubectl get svc -n istio-system istio-ingressgateway \
+    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+echo $INGRESS_HOST
 ```
 
-### 2. Deploy Fluent Bit DaemonSet
+Note this ELB DNS name - this is the external entry point for client connections with JWT authentication.
 
-**base/fluent-bit/configmap.yaml:**
-
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: fluent-bit-config
-  namespace: cockroachdb
-data:
-  fluent-bit.conf: |
-    [SERVICE]
-        Flush         5
-        Daemon        off
-        Log_Level     info
-        Parsers_File  parsers.conf
-
-    [INPUT]
-        Name              tail
-        Path              /var/log/pods/cockroachdb_cockroachdb-east-*/*/*.log
-        Parser            docker
-        Tag               kube.*
-        Refresh_Interval  5
-        Mem_Buf_Limit     5MB
-        Skip_Long_Lines   On
-
-    [FILTER]
-        Name                kubernetes
-        Match               kube.*
-        Kube_URL            https://kubernetes.default.svc:443
-        Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-        Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
-        Merge_Log           On
-        K8S-Logging.Parser  On
-        K8S-Logging.Exclude Off
-
-    [FILTER]
-        Name    grep
-        Match   kube.*
-        Regex   log SENSITIVE_ACCESS
-
-    [OUTPUT]
-        Name                         s3
-        Match                        kube.*
-        bucket                       crdb-audit-logs-govcloud-east
-        region                       us-gov-east-1
-        endpoint                     s3.us-gov-east-1.amazonaws.com
-        s3_key_format                /audit-logs/%Y/%m/%d/%H/%M/%S-$UUID.log
-        total_file_size              10M
-        upload_timeout               1m
-        use_put_object               On
-        compression                  gzip
-        store_dir                    /tmp/fluent-bit/s3
-        
-  parsers.conf: |
-    [PARSER]
-        Name   docker
-        Format json
-        Time_Key time
-        Time_Format %Y-%m-%dT%H:%M:%S.%LZ
-```
-
-**base/fluent-bit/daemonset.yaml:**
-
-```yaml
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: fluent-bit
-  namespace: cockroachdb
-spec:
-  selector:
-    matchLabels:
-      app: fluent-bit
-  template:
-    metadata:
-      labels:
-        app: fluent-bit
-    spec:
-      serviceAccountName: fluent-bit
-      containers:
-        - name: fluent-bit
-          image: 123456789012.dkr.ecr.us-gov-east-1.amazonaws.com/fluent-bit:3.0.2
-          volumeMounts:
-            - name: config
-              mountPath: /fluent-bit/etc/
-            - name: varlog
-              mountPath: /var/log
-            - name: varlibdockercontainers
-              mountPath: /var/lib/docker/containers
-              readOnly: true
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 500m
-              memory: 512Mi
-      volumes:
-        - name: config
-          configMap:
-            name: fluent-bit-config
-        - name: varlog
-          hostPath:
-            path: /var/log
-        - name: varlibdockercontainers
-          hostPath:
-            path: /var/lib/docker/containers
-      tolerations:
-        - key: node-role.kubernetes.io/control-plane
-          operator: Exists
-          effect: NoSchedule
-```
-
-### 3. Create IRSA for S3 Access
+### Step 5: Verify JWT Authentication Configuration
 
 ```bash
-# Create IAM policy for S3 audit log write
-cat > audit-log-policy.json <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "s3:PutObject",
-        "s3:PutObjectAcl"
-      ],
-      "Resource": "arn:aws-us-gov:s3:::crdb-audit-logs-govcloud-east/*"
-    }
-  ]
-}
-EOF
-
-aws iam create-policy \
-  --policy-name CockroachDBAuditLogWrite \
-  --policy-document file://audit-log-policy.json \
-  --region us-gov-east-1 \
-  --profile govcloud-revenue
-
-# Create IRSA
-eksctl create iamserviceaccount \
-  --cluster=crdb-dcp-east \
-  --namespace=cockroachdb \
-  --name=fluent-bit \
-  --attach-policy-arn=arn:aws-us-gov:iam::123456789012:policy/CockroachDBAuditLogWrite \
-  --override-existing-serviceaccounts \
-  --region us-gov-east-1 \
-  --profile govcloud-revenue \
-  --approve
+kubectl get requestauthentication -n cockroachdb
+kubectl get authorizationpolicy -n cockroachdb
 ```
 
-### 4. Deploy via ArgoCD
+Expected output:
+```
+NAME                    AGE
+jwt-auth-okta           2m
+
+NAME                    AGE
+require-jwt             2m
+```
+
+## Phase 7: Flyway Schema Migrations
+
+Deploy Flyway for automated schema migrations using SQL scripts from the sample-data-pipeline repository.
+
+### Step 1: Clone sample-data-pipeline Repository
 
 ```bash
-kubectl apply -f clusters/east/argocd-apps/fluent-bit.yaml --context crdb-dcp-east
+cd /tmp
+git clone https://github.com/roachlong/sample-data-pipeline.git
+cd sample-data-pipeline
 ```
 
-### 5. Verify Audit Log Pipeline
+### Step 2: Copy Migration Scripts to Phase 7
 
 ```bash
-# Check Fluent Bit pods
-kubectl get pods -n cockroachdb -l app=fluent-bit --context crdb-dcp-east
+cd /path/to/distributed-connection-pooling/kubernetes/eks/manifests/phase7-flyway
 
-# Verify logs in S3
-aws s3 ls s3://crdb-audit-logs-govcloud-east/audit-logs/ --region us-gov-east-1 --profile govcloud-revenue --recursive
+# Create sql directories
+mkdir -p sql/metadata sql/staging sql/production
 
-# Check Object Lock status
-aws s3api get-object-retention \
-  --bucket crdb-audit-logs-govcloud-east \
-  --key audit-logs/<path-to-log-file> \
-  --region us-gov-east-1 \
-  --profile govcloud-revenue
+# Copy scripts from sample-data-pipeline
+cp /tmp/sample-data-pipeline/flyway/sql/metadata/*.sql sql/metadata/ || echo "No metadata migrations yet"
+cp /tmp/sample-data-pipeline/flyway/sql/staging/*.sql sql/staging/ || echo "No staging migrations yet"
+cp /tmp/sample-data-pipeline/flyway/sql/production/*.sql sql/production/
 ```
 
----
+### Step 3: Add Custom RLS Scripts
 
-## Scheduling Automated Backups
+The setup script will create additional migration files for RLS:
 
-Configure automated backups to S3 using IRSA.
+- `sql/production/V002__add_role_party_access.sql` - Create `role_party_access` mapping table
+- `sql/production/V015__enable_rls_accounts.sql` - Enable RLS on `accounts` table
+- `sql/production/V016__enable_rls_parties.sql` - Enable RLS on `parties` table
 
-### 1. Create IRSA for S3 Backup Access
+These are applied AFTER the base schema from sample-data-pipeline.
+
+### Step 4: Run Phase 7 Setup
 
 ```bash
-# Create IAM policy for S3 backup
-cat > backup-policy.json <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "s3:PutObject",
-        "s3:GetObject",
-        "s3:ListBucket",
-        "s3:DeleteObject"
-      ],
-      "Resource": [
-        "arn:aws-us-gov:s3:::crdb-backups-govcloud-east",
-        "arn:aws-us-gov:s3:::crdb-backups-govcloud-east/*"
-      ]
-    }
-  ]
-}
-EOF
-
-aws iam create-policy \
-  --policy-name CockroachDBBackupAccess \
-  --policy-document file://backup-policy.json \
-  --region us-gov-east-1 \
-  --profile govcloud-revenue
-
-# Create IRSA for CockroachDB pods
-eksctl create iamserviceaccount \
-  --cluster=crdb-dcp-east \
-  --namespace=cockroachdb \
-  --name=cockroachdb-sa \
-  --attach-policy-arn=arn:aws-us-gov:iam::123456789012:policy/CockroachDBBackupAccess \
-  --override-existing-serviceaccounts \
-  --region us-gov-east-1 \
-  --profile govcloud-revenue \
-  --approve
+chmod +x setup.sh
+./setup.sh
 ```
 
-### 2. Update CockroachDB CR to Use IRSA
+This will:
+- Generate RLS migration scripts (V002, V015, V016)
+- Create ConfigMaps for Flyway SQL scripts (one per database)
+- Create Flyway Kubernetes Job for each database:
+  - `flyway-metadata-migration` (applies metadata schema)
+  - `flyway-staging-migration` (applies staging schema)
+  - `flyway-production-migration` (applies production schema + RLS)
+- Flyway connects directly to CockroachDB:26257 (bypasses PgBouncer)
+- Uses `flyway_svc` client certificate for authentication
+- Executes migrations in version order (V001, V002, V003, ...)
+- Wait for all migration jobs to complete
 
-**Update base/cockroachdb-cluster/crdb-east.yaml:**
-
-```yaml
-spec:
-  # ... existing config ...
-  serviceAccountName: cockroachdb-sa  # IRSA service account
-```
-
-### 3. Create Backup Schedule
+### Step 5: Verify Migration Jobs
 
 ```bash
-# Note: Use GovCloud S3 endpoint explicitly
-kubectl exec -it cockroachdb-east-0 -n cockroachdb --context crdb-dcp-east -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost -e """
-CREATE SCHEDULE crdb_daily_backup
-  FOR BACKUP INTO 's3://crdb-backups-govcloud-east/scheduled?AWS_ENDPOINT=s3.us-gov-east-1.amazonaws.com&AUTH=implicit'
-  RECURRING '@daily'
-  FULL BACKUP '@weekly'
-  WITH SCHEDULE OPTIONS first_run = 'now';
-"""
-
-# Verify schedule
-kubectl exec -it cockroachdb-east-0 -n cockroachdb --context crdb-dcp-east -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost -e "SHOW SCHEDULES;"
+kubectl get jobs -n cockroachdb | grep flyway
 ```
 
-**Important**: The `AWS_ENDPOINT=s3.us-gov-east-1.amazonaws.com` parameter is required for GovCloud S3 access.
+Expected output:
+```
+NAME                          COMPLETIONS   DURATION   AGE
+flyway-metadata-migration     1/1           45s        3m
+flyway-staging-migration      1/1           52s        3m
+flyway-production-migration   1/1           67s        3m
+```
 
-### 4. Verify Backups
+### Step 6: Verify Migration History
 
 ```bash
-# Check backups in S3
-aws s3 ls s3://crdb-backups-govcloud-east/scheduled/ --region us-gov-east-1 --profile govcloud-revenue --recursive
+# Check metadata database migrations
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=metadata \
+    --execute="SELECT installed_rank, version, description, success FROM flyway_schema_history ORDER BY installed_rank;"
 
-# Show backup details in SQL
-kubectl exec -it cockroachdb-east-0 -n cockroachdb --context crdb-dcp-east -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost -e \
-  "SHOW BACKUPS IN 's3://crdb-backups-govcloud-east/scheduled?AWS_ENDPOINT=s3.us-gov-east-1.amazonaws.com&AUTH=implicit';"
+# Check staging database migrations
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=staging \
+    --execute="SELECT installed_rank, version, description, success FROM flyway_schema_history ORDER BY installed_rank;"
+
+# Check production database migrations
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=production \
+    --execute="SELECT installed_rank, version, description, success FROM flyway_schema_history ORDER BY installed_rank;"
 ```
 
----
-
-## Monitoring with Prometheus and Grafana
-
-Deploy Prometheus and Grafana for observability.
-
-### Install Prometheus Operator (kube-prometheus-stack)
+### Step 7: Verify RLS is Enabled
 
 ```bash
-# Add Prometheus community Helm repo
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm repo update
+# Verify RLS on accounts table
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=production \
+    --execute="SELECT tablename, rowsecurity FROM pg_tables WHERE tablename IN ('accounts', 'parties');"
 
-# Install kube-prometheus-stack
-helm install prometheus prometheus-community/kube-prometheus-stack \
-  -n monitoring \
-  --create-namespace \
-  --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
-  --set grafana.adminPassword=admin \
-  --context crdb-dcp-east
+# Verify RLS policies exist
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=production \
+    --execute="SELECT tablename, policyname, cmd, qual FROM pg_policies WHERE tablename IN ('accounts', 'parties');"
 ```
 
-### Create ServiceMonitor for CockroachDB
+Expected: `rowsecurity = t` (true) for both tables, and policies named `role_based_account_access` and `role_based_party_access`.
 
-**base/monitoring/crdb-servicemonitor.yaml:**
+## Phase 8: Enterprise Features
 
-```yaml
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: cockroachdb-metrics
-  namespace: monitoring
-spec:
-  selector:
-    matchLabels:
-      app: cockroachdb-east
-  namespaceSelector:
-    matchNames:
-      - cockroachdb
-  endpoints:
-    - port: http
-      interval: 30s
-      path: /_status/vars
-```
+Enable CockroachDB Enterprise features: licensing, backup/restore, encryption-at-rest, and changefeeds.
 
-### Import CockroachDB Grafana Dashboards
+### Prerequisites
+
+- CockroachDB Enterprise license (request trial at https://www.cockroachlabs.com/get-started-cockroachdb/)
+- S3 bucket for backups (will be created in this phase)
+
+### Step 1: Set Enterprise License
 
 ```bash
-# Download official dashboards
-curl -O https://raw.githubusercontent.com/cockroachdb/cockroach/master/monitoring/grafana-dashboards/runtime.json
-curl -O https://raw.githubusercontent.com/cockroachdb/cockroach/master/monitoring/grafana-dashboards/storage.json
-curl -O https://raw.githubusercontent.com/cockroachdb/cockroach/master/monitoring/grafana-dashboards/sql.json
+cd ../phase8-enterprise
+chmod +x setup.sh
 
-# Import to Grafana via UI or ConfigMap
-kubectl create configmap crdb-dashboards \
-  --from-file=runtime.json \
-  --from-file=storage.json \
-  --from-file=sql.json \
-  -n monitoring \
-  --context crdb-dcp-east
+# Add your enterprise license to config.env
+vi ../../config.env
+export CRDB_ENTERPRISE_LICENSE="your-license-key-here"
 ```
 
-### Access Grafana
+### Step 2: Run Phase 8 Setup
+
+```bash
+./setup.sh
+```
+
+This will:
+- Create S3 bucket for backups with versioning enabled
+- Create IAM role for CockroachDB service account (IRSA)
+- Set CockroachDB Enterprise license via SQL
+- Enable cluster settings for enterprise features
+- Configure automatic full and incremental backups to S3
+- Enable encryption-at-rest with customer-managed key (if configured)
+- Create changefeed example for audit events
+
+### Step 3: Verify Enterprise License
+
+```bash
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SHOW CLUSTER SETTING cluster.organization;"
+
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SHOW CLUSTER SETTING enterprise.license;"
+```
+
+### Step 4: Verify Backup Configuration
+
+```bash
+# Check backup schedule
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SHOW SCHEDULES;"
+
+# List backups in S3
+aws s3 ls s3://${BACKUP_BUCKET_NAME}/cockroachdb/backups/ --recursive
+```
+
+### Step 5: Test Backup and Restore
+
+```bash
+# Manually trigger a backup
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="BACKUP DATABASE production INTO 's3://${BACKUP_BUCKET_NAME}/cockroachdb/backups/manual?AWS_ACCESS_KEY_ID={ACCESS_KEY}&AWS_SECRET_ACCESS_KEY={SECRET_KEY}';"
+
+# List backups
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SHOW BACKUPS IN 's3://${BACKUP_BUCKET_NAME}/cockroachdb/backups/manual?AWS_ACCESS_KEY_ID={ACCESS_KEY}&AWS_SECRET_ACCESS_KEY={SECRET_KEY}';"
+```
+
+## Phase 9: Observability Stack
+
+Deploy Prometheus, Grafana, and Alertmanager for monitoring, metrics, and alerting.
+
+### Step 1: Run Phase 9 Setup
+
+```bash
+cd ../phase9-observability
+chmod +x setup.sh
+./setup.sh
+```
+
+This will:
+- Create `monitoring` namespace
+- Install Prometheus Operator via kube-prometheus-stack Helm chart
+- Install Grafana with pre-configured CockroachDB dashboards
+- Install Alertmanager with alert rules for CockroachDB
+- Install PgBouncer exporter for connection pool metrics
+- Create ServiceMonitor resources for:
+  - CockroachDB pods (port 8080, `_status/vars` endpoint)
+  - PgBouncer pods (port 9127, Prometheus exporter)
+- Configure Prometheus scrape configs
+- Import CockroachDB Grafana dashboards from cockroach-community
+- Create alert rules:
+  - Node down
+  - High query latency (p99 > 1s)
+  - Replication lag (> 10s)
+  - Under-replicated ranges
+  - Low disk space (< 20%)
+  - High CPU usage (> 80%)
+  - Connection pool exhaustion (< 10% available)
+
+### Step 2: Verify Observability Components
+
+```bash
+kubectl get pods -n monitoring
+```
+
+Expected output:
+```
+NAME                                                     READY   STATUS    RESTARTS   AGE
+prometheus-operator-xxxxxxxxxx-xxxxx                     1/1     Running   0          2m
+prometheus-prometheus-kube-prometheus-prometheus-0       2/2     Running   0          2m
+alertmanager-prometheus-kube-prometheus-alertmanager-0   2/2     Running   0          2m
+prometheus-kube-prometheus-grafana-xxxxxxxxxx-xxxxx      3/3     Running   0          2m
+```
+
+### Step 3: Access Grafana
 
 ```bash
 # Port-forward to Grafana
-kubectl port-forward svc/prometheus-grafana 3000:80 -n monitoring --context crdb-dcp-east
+kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-grafana 3000:80 &
 
-# Open browser
-open http://localhost:3000
-# Login: admin / admin
+# Get Grafana admin password
+kubectl get secret -n monitoring prometheus-kube-prometheus-grafana \
+    -o jsonpath="{.data.admin-password}" | base64 --decode
+echo
+
+# Open browser to: http://localhost:3000
+# Username: admin
+# Password: <from above command>
 ```
 
-### Key Metrics to Monitor
+### Step 4: View CockroachDB Dashboards
 
-- **Replication Lag (PCR)**: `SELECT lag FROM [SHOW VIRTUAL CLUSTER main WITH REPLICATION STATUS]`
-- **Clock Offset**: `clock_offset_meannanos / 1000000 > 400` (alert if > 400ms)
-- **Under-Replicated Ranges**: `ranges_underreplicated > 0`
-- **Disk Usage**: `(capacity - available) / capacity > 0.8`
-- **Query Latency P99**: `histogram_quantile(0.99, rate(sql_exec_latency_bucket[5m]))`
+In Grafana:
+1. Navigate to **Dashboards** → **Browse**
+2. Find the **CockroachDB** folder
+3. Open dashboards:
+   - CockroachDB Overview
+   - CockroachDB Runtime
+   - CockroachDB SQL Performance
+   - CockroachDB Replication
+   - PgBouncer Connection Pools
 
----
-
-## Common Operations
-
-### Accessing SQL Shell
+### Step 5: Verify Prometheus Targets
 
 ```bash
-# Via kubectl exec
-kubectl exec -it cockroachdb-east-0 -n cockroachdb --context crdb-dcp-east -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost --database=defaultdb
+# Port-forward to Prometheus
+kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090 &
 
-# Connect to virtual cluster
-kubectl exec -it cockroachdb-east-0 -n cockroachdb --context crdb-dcp-east -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost --cluster=main --database=defaultdb
-
-# Via port-forward (external access)
-kubectl port-forward svc/cockroachdb-east-public 26257:26257 -n cockroachdb --context crdb-dcp-east
-cockroach sql --url "postgresql://root@localhost:26257/defaultdb?sslmode=verify-full&sslrootcert=/path/to/ca.crt&sslcert=/path/to/client.root.crt&sslkey=/path/to/client.root.key&options=-ccluster=main"
+# Open browser to: http://localhost:9090
+# Navigate to Status → Targets
+# Verify CockroachDB and PgBouncer targets are UP
 ```
 
-### Viewing Logs
+### Step 6: Test Alerting
 
 ```bash
-# CockroachDB logs
-kubectl logs -f cockroachdb-east-0 -n cockroachdb --context crdb-dcp-east
+# View active alerts
+kubectl port-forward -n monitoring svc/alertmanager-operated 9093:9093 &
 
-# PgBouncer logs
-kubectl logs -f -l app=pgbouncer -n cockroachdb --context crdb-dcp-east
-
-# Fluent Bit logs (audit pipeline)
-kubectl logs -f -l app=fluent-bit -n cockroachdb --context crdb-dcp-east
+# Open browser to: http://localhost:9093
+# You should see any active alerts (initially none if cluster is healthy)
 ```
 
-### Scaling the Cluster
+## Phase 10: Security Hardening
 
-Scaling is done via Git PR → ArgoCD sync (GitOps workflow):
+Apply security best practices: network policies, pod security standards, IRSA, and secrets management.
 
-1. **Update the CockroachDB CR** in Git:
-
-```yaml
-# base/cockroachdb-cluster/crdb-east.yaml
-spec:
-  nodes: 5  # Scale from 3 to 5
-```
-
-2. **Commit and push** to Git repository
-
-3. **ArgoCD syncs automatically** or manually trigger:
+### Step 1: Run Phase 10 Setup
 
 ```bash
-argocd app sync cockroachdb-cluster-east --context crdb-dcp-east
+cd ../phase10-security
+chmod +x setup.sh
+./setup.sh
 ```
 
-4. **Verify scaling**:
+This will:
+- Create Kubernetes NetworkPolicies:
+  - Deny all ingress/egress by default
+  - Allow CockroachDB inter-node communication (ports 26257, 8080)
+  - Allow PgBouncer → CockroachDB (port 26257)
+  - Allow applications → PgBouncer (ports 5432, 5433, 5434)
+  - Allow Prometheus → CockroachDB metrics (port 8080)
+  - Allow Prometheus → PgBouncer exporter (port 9127)
+  - Allow DNS resolution (kube-dns)
+  - Deny pod-to-internet egress (only allow to AWS services via VPC endpoints)
+- Apply Pod Security Standards:
+  - Enforce `restricted` pod security standard on `cockroachdb` namespace
+  - CockroachDB pods run as non-root user (UID 1000)
+  - PgBouncer pods run as non-root user (UID 999)
+  - Drop all capabilities except NET_BIND_SERVICE
+  - Set readOnlyRootFilesystem where possible
+- Configure IAM Roles for Service Accounts (IRSA):
+  - CockroachDB service account → S3 backup bucket access
+  - Fluent Bit service account → S3 audit log bucket access
+  - External DNS service account → Route53 access (if using custom domain)
+- Rotate certificates:
+  - Reduce certificate TTL to 90 days
+  - Enable automatic rotation via cert-manager
+- Enable Secrets encryption at rest:
+  - Configure AWS KMS key for EKS secrets encryption
+  - Re-encrypt existing secrets
+
+### Step 2: Verify Network Policies
 
 ```bash
-kubectl get pods -n cockroachdb --context crdb-dcp-east
-# Expected: cockroachdb-east-0 through cockroachdb-east-4
+kubectl get networkpolicies -n cockroachdb
 ```
 
-### Checking Cluster Health
+Expected output:
+```
+NAME                          POD-SELECTOR                      AGE
+deny-all-ingress-egress       <none>                            2m
+allow-crdb-inter-node         app=cockroachdb                   2m
+allow-crdb-from-pgbouncer     app=cockroachdb                   2m
+allow-pgbouncer-from-apps     app.kubernetes.io/component=...   2m
+allow-prometheus-scrape       <all pods>                        2m
+allow-dns-egress              <all pods>                        2m
+```
+
+### Step 3: Verify Pod Security
 
 ```bash
-kubectl exec -it cockroachdb-east-0 -n cockroachdb --context crdb-dcp-east -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost -e """
-SELECT node_id, address, is_live, is_available FROM crdb_internal.gossip_nodes;
-SHOW CLUSTER SETTING cluster.organization;
-SHOW VIRTUAL CLUSTER main WITH REPLICATION STATUS;
-"""
+# Check pod security standard on namespace
+kubectl get namespace cockroachdb -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}'
+
+# Verify pods are running as non-root
+kubectl get pods -n cockroachdb -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.securityContext.runAsNonRoot}{"\n"}{end}'
 ```
 
----
-
-## Failover and Failback Procedures
-
-### Failover: Promote West to Active
-
-When East region fails, promote West cluster to serve traffic:
-
-1. **Complete replication to latest**:
+### Step 4: Verify IRSA Configuration
 
 ```bash
-kubectl exec -it cockroachdb-west-0 -n cockroachdb --context crdb-dcp-west -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost -e """
-ALTER VIRTUAL CLUSTER main COMPLETE REPLICATION TO LATEST;
-"""
+# Check service account annotations
+kubectl get sa -n cockroachdb cockroachdb -o yaml | grep eks.amazonaws.com/role-arn
+
+# Verify pods have AWS credentials via IRSA
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- env | grep AWS
 ```
 
-This command waits for West to catch up to the last replicated timestamp from East before proceeding.
-
-2. **Start service on West virtual cluster**:
+### Step 5: Test Network Policy Enforcement
 
 ```bash
-kubectl exec -it cockroachdb-west-0 -n cockroachdb --context crdb-dcp-west -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost -e """
-ALTER VIRTUAL CLUSTER main START SERVICE SHARED;
-"""
+# This should FAIL (pod-to-internet blocked):
+kubectl run -n cockroachdb curl-test --image=curlimages/curl:latest --rm -it -- \
+    curl -v https://google.com
+
+# This should SUCCEED (pod-to-pod within namespace allowed):
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    nc -zv example-crdb-cluster-1.example-crdb-cluster.cockroachdb 26257
 ```
 
-Now West is serving read/write traffic.
+## Phase 11: Audit Logging
 
-3. **Update application connection strings** to point to West:
+Deploy Fluent Bit to collect CockroachDB audit logs and ship them to S3 with Object Lock (WORM).
 
-```
-postgresql://root@pgbouncer.us-gov-west-1.dcp-govcloud.example.com:5432/defaultdb?sslmode=verify-full&options=-ccluster=main
-```
+### Prerequisites
 
-Or update DNS to point to West NLB.
+- S3 bucket for audit logs with Object Lock enabled (created in this phase)
+- IRSA configured for Fluent Bit service account (created in this phase)
 
-4. **Verify West is active**:
+### Step 1: Run Phase 11 Setup
 
 ```bash
-kubectl exec -it cockroachdb-west-0 -n cockroachdb --context crdb-dcp-west -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost -e """
-SHOW VIRTUAL CLUSTER main WITH REPLICATION STATUS;
-"""
-
-# Expected:
-#   service_mode: shared (was 'none' before)
-#   data_state: ready (no longer 'replicating')
+cd ../phase11-audit
+chmod +x setup.sh
+./setup.sh
 ```
 
-### Failback: Restore East as Active
+This will:
+- Create S3 bucket for audit logs:
+  - Enable versioning
+  - Enable Object Lock in compliance mode
+  - Set default retention period (7 years for compliance)
+  - Enable bucket encryption (AES-256 or KMS)
+- Create IAM role for Fluent Bit service account (IRSA)
+- Enable CockroachDB audit logging:
+  - Set `sql.log.all_statements.enabled = true` (log all SQL statements)
+  - Set `sql.log.slow_query.latency_threshold = '100ms'` (log slow queries)
+  - Set `server.auth_log.sql_connections.enabled = true` (log auth events)
+  - Set `server.auth_log.sql_sessions.enabled = true` (log session events)
+- Deploy Fluent Bit DaemonSet:
+  - Collect logs from CockroachDB pods (stdout, stderr, and log files)
+  - Parse JSON-formatted logs
+  - Enrich with Kubernetes metadata (pod name, namespace, labels)
+  - Ship to S3 bucket with partition keys: `year=YYYY/month=MM/day=DD/hour=HH/`
+  - Buffer logs locally in case of S3 unavailability
+- Create Athena table for querying audit logs (optional)
 
-After East region is restored, reverse the replication:
-
-1. **On East, create virtual cluster from West replication**:
+### Step 2: Verify Fluent Bit Deployment
 
 ```bash
-kubectl exec -it cockroachdb-east-0 -n cockroachdb --context crdb-dcp-east -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost -e """
-CREATE VIRTUAL CLUSTER main FROM REPLICATION OF main ON 'postgresql://cockroachdb-west-public.cockroachdb.svc.cluster.local:26257?sslmode=verify-full&sslrootcert=/cockroach/cockroach-certs/ca.crt&sslcert=/cockroach/cockroach-certs/client.root.crt&sslkey=/cockroach/cockroach-certs/client.root.key';
-"""
+kubectl get pods -n logging
 ```
 
-2. **Wait for East to catch up**:
+Expected output:
+```
+NAME                    READY   STATUS    RESTARTS   AGE
+fluent-bit-xxxxx        1/1     Running   0          2m
+fluent-bit-xxxxx        1/1     Running   0          2m
+fluent-bit-xxxxx        1/1     Running   0          2m
+```
+
+### Step 3: Verify Audit Logging is Enabled
 
 ```bash
-kubectl exec -it cockroachdb-east-0 -n cockroachdb --context crdb-dcp-east -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost -e """
-SHOW VIRTUAL CLUSTER main WITH REPLICATION STATUS;
-"""
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SHOW CLUSTER SETTING sql.log.all_statements.enabled;"
 
-# Wait for replication_lag < 5 seconds
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SHOW CLUSTER SETTING server.auth_log.sql_connections.enabled;"
 ```
 
-3. **Cutover: Stop service on West, start on East**:
+Expected: `true` for both settings.
+
+### Step 4: Verify Logs are Shipped to S3
 
 ```bash
-# Stop West
-kubectl exec -it cockroachdb-west-0 -n cockroachdb --context crdb-dcp-west -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost -e """
-ALTER VIRTUAL CLUSTER main STOP SERVICE;
-"""
+# List objects in S3 audit bucket (wait 5-10 minutes for initial buffering)
+aws s3 ls s3://${AUDIT_BUCKET_NAME}/cockroachdb/audit-logs/ --recursive | head -20
 
-# Complete replication on East
-kubectl exec -it cockroachdb-east-0 -n cockroachdb --context crdb-dcp-east -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost -e """
-ALTER VIRTUAL CLUSTER main COMPLETE REPLICATION TO LATEST;
-"""
-
-# Start East
-kubectl exec -it cockroachdb-east-0 -n cockroachdb --context crdb-dcp-east -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost -e """
-ALTER VIRTUAL CLUSTER main START SERVICE SHARED;
-"""
+# Download and view a log file
+aws s3 cp s3://${AUDIT_BUCKET_NAME}/cockroachdb/audit-logs/year=2026/month=06/day=09/hour=12/logs.json.gz - | gunzip | jq .
 ```
 
-4. **Update application connection strings** back to East.
+### Step 5: Query Audit Logs with Athena (Optional)
 
-5. **Re-establish West as passive replica** (repeat PCR setup from East → West).
+```bash
+# Create Athena database and table
+aws athena start-query-execution \
+    --query-string "CREATE EXTERNAL TABLE IF NOT EXISTS cockroachdb_audit_logs (...)" \
+    --result-configuration "OutputLocation=s3://${ATHENA_RESULTS_BUCKET}/" \
+    --region us-east-2
 
----
+# Query example: Find all failed authentication attempts
+aws athena start-query-execution \
+    --query-string "SELECT * FROM cockroachdb_audit_logs WHERE event_type = 'client_authentication_failed' AND year = '2026' AND month = '06' LIMIT 100;" \
+    --result-configuration "OutputLocation=s3://${ATHENA_RESULTS_BUCKET}/" \
+    --region us-east-2
+```
 
-## Security Notes
+### Step 6: Verify Object Lock Retention
 
-### mTLS Everywhere
+```bash
+# Check Object Lock configuration
+aws s3api get-object-lock-configuration --bucket ${AUDIT_BUCKET_NAME}
 
-- All CockroachDB node-to-node communication uses mTLS (Vault PKI-issued certs)
-- All client-to-node communication requires client certificates
-- PgBouncer-to-CRDB uses client certificates
-- Application-to-PgBouncer uses client certificates
+# Verify objects have retention period
+aws s3api head-object \
+    --bucket ${AUDIT_BUCKET_NAME} \
+    --key cockroachdb/audit-logs/year=2026/month=06/day=09/hour=12/logs.json.gz \
+    | jq '.ObjectLockRetainUntilDate'
+```
 
-### Network Policies
+Expected: Retention date 7 years in the future (for compliance).
 
-- Deny-all default with explicit allow rules
-- No pod-to-internet egress (GovCloud compliance)
-- Cross-region traffic allowed only for PCR replication
+## Phase 12: Physical Cluster Replication (PCR)
 
-### IRSA (IAM Roles for Service Accounts)
+Deploy a second CockroachDB cluster in us-west-2 for disaster recovery using Physical Cluster Replication.
 
-- No AWS credentials stored in pods or secrets
-- Service accounts have IAM roles attached via OIDC
-- Least-privilege policies for S3 backup and audit log access
+### Prerequisites
 
-### Audit Logging
+- CockroachDB Enterprise license (Phase 8 must be completed)
+- Second EKS cluster in us-west-2 (or create new one in this phase)
 
-- SENSITIVE_ACCESS logs streamed to S3 with Object Lock (WORM)
-- 7-year retention (2555 days) for compliance
-- Separate bucket from backups
+### Architecture
 
-### Encryption-at-Rest
+```
+┌─────────────────────────────────────┐      ┌─────────────────────────────────────┐
+│  Primary Cluster (us-east-2)        │      │  Standby Cluster (us-west-2)        │
+│  ─────────────────────────────────  │      │  ─────────────────────────────────  │
+│                                     │      │                                     │
+│  ┌────────────────────────────────┐ │      │  ┌────────────────────────────────┐ │
+│  │  CockroachDB East (3 nodes)    │ │      │  │  CockroachDB West (3 nodes)    │ │
+│  │  - Active read/write           │ │──────▶  │  - Standby (read-only)         │ │
+│  │  - App/Batch pools             │ │ PCR  │  │  - Analytics pool (100%)       │ │
+│  │  - RLS enforced                │ │      │  │  - Historical queries          │ │
+│  └────────────────────────────────┘ │      │  └────────────────────────────────┘ │
+│                                     │      │                                     │
+│  ┌────────────────────────────────┐ │      │  ┌────────────────────────────────┐ │
+│  │  PgBouncer                     │ │      │  │  PgBouncer Analytics           │ │
+│  │  - App pool (50%)              │ │      │  │  - Analytics pool (100%)       │ │
+│  │  - Batch pool (40%)            │ │      │  │  - Power BI connector          │ │
+│  │  - Admin pool (10%)            │ │      │  └────────────────────────────────┘ │
+│  └────────────────────────────────┘ │      │                                     │
+└─────────────────────────────────────┘      └─────────────────────────────────────┘
+```
 
-- Layer 1: EBS volumes encrypted with customer-managed KMS keys
-- Layer 2: CockroachDB encryption-at-rest with per-node AES-128 keys
-- Enterprise license required for database-level encryption
+### Step 1: Create West EKS Cluster (if needed)
 
----
+```bash
+cd ../phase12-pcr
+
+# Update config.env with West region settings
+export AWS_REGION_WEST="us-west-2"
+export EKS_CLUSTER_NAME_WEST="example-crdb-eks-west"
+
+# Create West cluster using Phase 1 scripts
+./setup-west-cluster.sh
+```
+
+This creates a separate EKS cluster in us-west-2 with the same configuration as East.
+
+### Step 2: Run Phase 12 Setup
+
+```bash
+chmod +x setup.sh
+./setup.sh
+```
+
+This will:
+- Deploy Vault PKI in West cluster
+- Deploy CockroachDB Operator in West cluster
+- Deploy CockroachDB Standby cluster (3 nodes) in West
+- Configure Physical Cluster Replication:
+  - Create replication stream from East (primary) to West (standby)
+  - Set replication mode to FULL (replicate all databases)
+  - Configure retention window (24 hours for point-in-time recovery)
+- Deploy PgBouncer Analytics pool in West:
+  - Single pool, 100% of West cluster connections (96 connections)
+  - 3 replicas for HA
+  - Port 5432
+  - Read-only queries against replicated data
+- Configure DNS routing:
+  - `crdb-east.example.com` → East cluster (read-write)
+  - `crdb-west.example.com` → West cluster (read-only analytics)
+- Set up automated failover scripts (manual invocation for safety)
+
+### Step 3: Verify PCR Replication
+
+```bash
+# Check replication status on primary (East)
+kubectl exec -n cockroachdb example-crdb-cluster-0 --context east-cluster -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SELECT * FROM crdb_internal.cluster_replication_streams;"
+
+# Check replication lag
+kubectl exec -n cockroachdb example-crdb-cluster-0 --context east-cluster -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SELECT stream_id, lag FROM crdb_internal.cluster_replication_streams;"
+```
+
+Expected: `lag` should be < 10 seconds under normal conditions.
+
+### Step 4: Verify West Standby Cluster
+
+```bash
+# Check West cluster status
+kubectl exec -n cockroachdb example-crdb-cluster-west-0 --context west-cluster -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SHOW DATABASES;"
+
+# Verify read-only mode
+kubectl exec -n cockroachdb example-crdb-cluster-west-0 --context west-cluster -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=production \
+    --execute="SELECT COUNT(*) FROM accounts;"
+
+# This should FAIL (standby is read-only):
+kubectl exec -n cockroachdb example-crdb-cluster-west-0 --context west-cluster -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=production \
+    --execute="INSERT INTO accounts (...) VALUES (...);"
+```
+
+### Step 5: Verify Analytics Pool
+
+```bash
+# Port-forward to West analytics pool
+kubectl port-forward -n cockroachdb --context west-cluster svc/pgbouncer-analytics 5435:5432 &
+
+# Connect with psql
+psql "postgresql://root@localhost:5435/production?sslmode=require" \
+    --set=sslcert=/path/to/client.root.crt \
+    --set=sslkey=/path/to/client.root.key \
+    -c "SELECT party_id, COUNT(*) FROM accounts GROUP BY party_id;"
+```
+
+### Step 6: Deploy Power BI Connector (Optional)
+
+```bash
+# Install Power BI Gateway on Windows VM in VPC
+# Configure connection to pgbouncer-analytics.cockroachdb.svc.cluster.local:5432
+
+# Test connection from Power BI Desktop
+# Connection string: pgbouncer-analytics.cockroachdb.svc.cluster.local
+# Port: 5432
+# Database: production
+# Authentication: Client certificate (pgb_analytics_user)
+```
+
+### Step 7: Test Failover (DR Exercise)
+
+**WARNING**: This promotes West to primary and demotes East to standby. Only do this during a planned DR exercise.
+
+```bash
+# Trigger manual failover
+./failover-to-west.sh
+
+# Verify West is now primary (read-write)
+kubectl exec -n cockroachdb example-crdb-cluster-west-0 --context west-cluster -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=production \
+    --execute="INSERT INTO accounts (party_id, account_number, ...) VALUES (...);"
+
+# Verify East is now standby (read-only)
+kubectl exec -n cockroachdb example-crdb-cluster-0 --context east-cluster -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=production \
+    --execute="SELECT * FROM accounts WHERE account_id = '...';"
+```
+
+### Step 8: Failback to East
+
+```bash
+# After DR exercise, fail back to East as primary
+./failback-to-east.sh
+
+# Verify East is primary again
+kubectl exec -n cockroachdb example-crdb-cluster-0 --context east-cluster -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SELECT * FROM crdb_internal.cluster_replication_streams;"
+```
+
+## Phase 13: GitOps (Optional)
+
+Deploy ArgoCD for GitOps-based application delivery and continuous deployment.
+
+### Step 1: Install ArgoCD
+
+```bash
+cd ../phase13-gitops
+chmod +x setup.sh
+./setup.sh
+```
+
+This will:
+- Create `argocd` namespace
+- Install ArgoCD via Helm chart
+- Configure ArgoCD to manage itself (app-of-apps pattern)
+- Create ArgoCD Applications for each phase:
+  - `vault-pki`
+  - `cockroachdb-operator`
+  - `cockroachdb-cluster`
+  - `pgbouncer-pools`
+  - `istio`
+  - `flyway-migrations`
+  - `observability-stack`
+  - `security-policies`
+  - `audit-logging`
+- Configure automated sync with Git repository
+- Enable auto-sync and self-healing for production namespaces
+- Set up RBAC for ArgoCD users
+
+### Step 2: Access ArgoCD UI
+
+```bash
+# Get ArgoCD admin password
+kubectl get secret -n argocd argocd-initial-admin-secret \
+    -o jsonpath="{.data.password}" | base64 --decode
+echo
+
+# Port-forward to ArgoCD server
+kubectl port-forward -n argocd svc/argocd-server 8080:443 &
+
+# Open browser to: https://localhost:8080
+# Username: admin
+# Password: <from above command>
+```
+
+### Step 3: Connect Git Repository
+
+In ArgoCD UI:
+1. Navigate to **Settings** → **Repositories**
+2. Click **Connect Repo**
+3. Enter repository URL: `https://github.com/your-org/distributed-connection-pooling`
+4. Choose authentication method (SSH key or HTTPS token)
+5. Click **Connect**
+
+### Step 4: Sync Applications
+
+```bash
+# Sync all applications
+argocd app sync --grpc-web --server localhost:8080 --insecure \
+    vault-pki cockroachdb-operator cockroachdb-cluster pgbouncer-pools \
+    istio flyway-migrations observability-stack security-policies audit-logging
+
+# Watch sync status
+argocd app list --grpc-web --server localhost:8080 --insecure
+```
+
+### Step 5: Enable Auto-Sync
+
+```bash
+# Enable auto-sync for all applications
+for app in vault-pki cockroachdb-operator cockroachdb-cluster pgbouncer-pools istio flyway-migrations observability-stack security-policies audit-logging; do
+    argocd app set $app --sync-policy automated --auto-prune --self-heal \
+        --grpc-web --server localhost:8080 --insecure
+done
+```
+
+### Step 6: Test GitOps Workflow
+
+```bash
+# Make a change to pgbouncer-app replicas in Git
+cd /path/to/distributed-connection-pooling
+vi kubernetes/eks/manifests/phase5-pgbouncer/pgbouncer-app-deployment.yaml
+# Change replicas from 3 to 4
+
+git add .
+git commit -m "Scale pgbouncer-app to 4 replicas"
+git push origin main
+
+# ArgoCD will automatically detect the change and sync within 3 minutes
+# Watch sync status
+argocd app watch pgbouncer-pools --grpc-web --server localhost:8080 --insecure
+
+# Verify new replica is running
+kubectl get pods -n cockroachdb -l app=pgbouncer-app
+```
+
+## Post-Deployment Validation
+
+### End-to-End Connection Test
+
+Test the complete flow: External client → Istio → PgBouncer → CockroachDB with JWT authentication and RLS filtering.
+
+#### Step 1: Obtain JWT Token from Okta
+
+```bash
+# Use Okta's token endpoint to get a JWT token for a test user
+curl -X POST https://your-okta-domain/oauth2/default/v1/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=password" \
+  -d "client_id=your-client-id" \
+  -d "client_secret=your-client-secret" \
+  -d "username=advisor-east@example.com" \
+  -d "password=test-password" \
+  -d "scope=openid profile groups"
+
+# Extract the id_token from the response
+export JWT_TOKEN="eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."
+
+# Decode and verify token claims
+echo $JWT_TOKEN | cut -d. -f2 | base64 -d | jq .
+# Verify 'groups' claim includes: ["example-crdb-advisor-team-east"]
+```
+
+#### Step 2: Test Connection via Istio Ingress
+
+```bash
+# Get Istio ingress gateway external hostname
+export INGRESS_HOST=$(kubectl get svc -n istio-system istio-ingressgateway \
+    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+# Connect via psql with JWT token
+psql "postgresql://advisor-east@example.com@${INGRESS_HOST}:5432/production?sslmode=require" \
+    --set=jwt_token="${JWT_TOKEN}" \
+    -c "SELECT current_user, current_database();"
+```
+
+#### Step 3: Test RLS Filtering
+
+```bash
+# Query accounts through app pool with JWT token
+# User is in advisor-team-east group, should only see East party accounts
+
+psql "postgresql://advisor-east@example.com@${INGRESS_HOST}:5432/production?sslmode=require" \
+    --set=jwt_token="${JWT_TOKEN}" <<EOF
+SELECT party_id, account_number, account_type, balance
+FROM accounts
+LIMIT 10;
+EOF
+
+# Expected: Only accounts for parties where advisor-team-east has access in role_party_access table
+```
+
+### RLS Validation
+
+Test that Row-Level Security correctly filters data based on user roles from JWT token.
+
+#### Step 1: Populate Test Data
+
+```bash
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=production <<EOF
+-- Insert test parties
+INSERT INTO parties (party_id, party_name, party_type, region) VALUES
+('11111111-1111-1111-1111-111111111111', 'Party East 1', 'individual', 'us-east'),
+('22222222-2222-2222-2222-222222222222', 'Party West 1', 'individual', 'us-west'),
+('33333333-3333-3333-3333-333333333333', 'Party East 2', 'corporate', 'us-east');
+
+-- Insert test accounts
+INSERT INTO accounts (party_id, account_number, account_type, account_status, balance, currency_code, source_system, source_record_id) VALUES
+('11111111-1111-1111-1111-111111111111', 'ACCT-EAST-001', 'checking', 'active', 10000.00, 'USD', 'core_banking', 'CB-001'),
+('22222222-2222-2222-2222-222222222222', 'ACCT-WEST-001', 'checking', 'active', 20000.00, 'USD', 'core_banking', 'CB-002'),
+('33333333-3333-3333-3333-333333333333', 'ACCT-EAST-002', 'savings', 'active', 50000.00, 'USD', 'core_banking', 'CB-003');
+
+-- Populate role_party_access table
+INSERT INTO role_party_access (role_name, party_id, access_level) VALUES
+('advisor-team-east', '11111111-1111-1111-1111-111111111111', 'read_write'),
+('advisor-team-east', '33333333-3333-3333-3333-333333333333', 'read_write'),
+('advisor-team-west', '22222222-2222-2222-2222-222222222222', 'read_write'),
+('client-services', '11111111-1111-1111-1111-111111111111', 'read_only'),
+('client-services', '22222222-2222-2222-2222-222222222222', 'read_only'),
+('client-services', '33333333-3333-3333-3333-333333333333', 'read_only');
+EOF
+```
+
+#### Step 2: Test RLS with Different Roles
+
+```bash
+# Test as advisor-team-east (should see ACCT-EAST-001 and ACCT-EAST-002)
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=production <<EOF
+BEGIN;
+SET LOCAL app.current_user = 'advisor-east@example.com';
+SET LOCAL app.current_roles = 'advisor-team-east';
+SELECT account_number, party_id, balance FROM accounts ORDER BY account_number;
+COMMIT;
+EOF
+
+# Expected output:
+#   account_number |               party_id               | balance
+# -----------------+--------------------------------------+----------
+#   ACCT-EAST-001  | 11111111-1111-1111-1111-111111111111 | 10000.00
+#   ACCT-EAST-002  | 33333333-3333-3333-3333-333333333333 | 50000.00
+
+# Test as advisor-team-west (should only see ACCT-WEST-001)
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=production <<EOF
+BEGIN;
+SET LOCAL app.current_user = 'advisor-west@example.com';
+SET LOCAL app.current_roles = 'advisor-team-west';
+SELECT account_number, party_id, balance FROM accounts ORDER BY account_number;
+COMMIT;
+EOF
+
+# Expected output:
+#   account_number |               party_id               | balance
+# -----------------+--------------------------------------+----------
+#   ACCT-WEST-001  | 22222222-2222-2222-2222-222222222222 | 20000.00
+
+# Test as client-services (should see all three accounts, read-only)
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=production <<EOF
+BEGIN;
+SET LOCAL app.current_user = 'client-services@example.com';
+SET LOCAL app.current_roles = 'client-services';
+SELECT account_number, party_id, balance FROM accounts ORDER BY account_number;
+COMMIT;
+EOF
+
+# Expected output: All three accounts
+
+# Test write with read-only role (should FAIL)
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=production <<EOF
+BEGIN;
+SET LOCAL app.current_user = 'client-services@example.com';
+SET LOCAL app.current_roles = 'client-services';
+UPDATE accounts SET balance = balance + 100 WHERE account_number = 'ACCT-EAST-001';
+COMMIT;
+EOF
+
+# Expected: Error - new row violates row-level security policy (WITH CHECK failed)
+```
+
+### Connection Pool Monitoring
+
+Monitor PgBouncer connection pool usage and performance.
+
+```bash
+# Check app pool statistics
+kubectl exec -n cockroachdb deployment/pgbouncer-app -- \
+    psql -p 5432 pgbouncer -U pgbouncer -c 'SHOW STATS;'
+
+# Check server connections (to CockroachDB)
+kubectl exec -n cockroachdb deployment/pgbouncer-app -- \
+    psql -p 5432 pgbouncer -U pgbouncer -c 'SHOW SERVERS;'
+
+# Check client connections (from applications)
+kubectl exec -n cockroachdb deployment/pgbouncer-app -- \
+    psql -p 5432 pgbouncer -U pgbouncer -c 'SHOW CLIENTS;'
+
+# Check pool health (should have ~16 active server connections per replica)
+kubectl exec -n cockroachdb deployment/pgbouncer-app -- \
+    psql -p 5432 pgbouncer -U pgbouncer -c 'SHOW POOLS;'
+
+# Repeat for batch and admin pools (ports 5433, 5434)
+```
+
+### CockroachDB Health Check
+
+```bash
+# Check cluster health and node status
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach node status --certs-dir=/cockroach/cockroach-certs
+
+# Check database sizes
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SELECT * FROM [SHOW DATABASES] ORDER BY database_name;"
+
+# Check active queries
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SELECT query_id, node_id, user_name, application_name, start, query FROM [SHOW QUERIES] WHERE query NOT LIKE '%SHOW QUERIES%' ORDER BY start DESC LIMIT 20;"
+
+# Check replication status
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SELECT range_id, start_pretty, end_pretty, replicas, learner_replicas FROM crdb_internal.ranges WHERE database_name = 'production' AND table_name = 'accounts' LIMIT 10;"
+```
 
 ## Troubleshooting
 
-### Pods Not Starting
+### EKS Cluster Issues
 
+**Problem**: `eksctl create cluster` fails with VPC limit error
+
+**Solution**: Delete unused VPCs in the AWS console or request a limit increase via AWS Service Quotas.
+
+**Problem**: Nodes not joining cluster
+
+**Solution**: 
 ```bash
-# Check pod events
-kubectl describe pod <pod-name> -n cockroachdb --context crdb-dcp-east
+# Check node group status
+aws eks describe-nodegroup --cluster-name example-crdb-eks --nodegroup-name example-crdb-ng-1
 
-# Common issues:
-# - Image pull errors (ECR mirroring incomplete)
-# - PVC stuck in pending (EBS CSI driver not installed, wrong StorageClass)
-# - Pod anti-affinity conflicts (not enough nodes in each AZ)
+# Check node IAM role
+aws iam get-role --role-name eksctl-example-crdb-eks-NodeInstanceRole-xxxxx
+
+# Check node security group allows traffic from control plane
+aws ec2 describe-security-groups --group-ids sg-xxxxx
 ```
 
-### PVC Stuck in Pending
+### Vault Issues
 
+**Problem**: Vault pods in CrashLoopBackOff
+
+**Solution**:
+```bash
+# Check Vault logs
+kubectl logs -n vault vault-0
+
+# Common causes:
+# 1. PVC not bound - check: kubectl get pvc -n vault
+# 2. Storage class missing - check: kubectl get storageclass
+# 3. Incorrect configuration - check: kubectl get configmap -n vault vault-config
+
+# Delete and recreate
+kubectl delete namespace vault
+cd manifests/phase2-certificates
+./teardown.sh
+./setup.sh
+```
+
+**Problem**: Certificate generation fails with "permission denied" error
+
+**Solution**:
+```bash
+# Check Vault token is valid
+vault token lookup
+
+# Re-authenticate
+vault login <root-token>
+
+# Check PKI secrets engine is enabled
+vault secrets list | grep pki
+
+# Re-enable if needed
+vault secrets enable -path=pki pki
+vault secrets tune -max-lease-ttl=87600h pki
+```
+
+### CockroachDB Issues
+
+**Problem**: Pods stuck in Pending state
+
+**Solution**:
 ```bash
 # Check PVC status
-kubectl get pvc -n cockroachdb --context crdb-dcp-east
+kubectl get pvc -n cockroachdb
 
-# Check events
-kubectl describe pvc <pvc-name> -n cockroachdb --context crdb-dcp-east
+# Check storage class exists
+kubectl get storageclass
+
+# Describe pod to see events
+kubectl describe pod -n cockroachdb example-crdb-cluster-0
 
 # Common causes:
-# - StorageClass doesn't exist or is misspelled
-# - EBS CSI driver not installed
-# - volumeBindingMode is Immediate but pod not scheduled (should be WaitForFirstConsumer)
-# - KMS key permissions issue
+# 1. Insufficient disk space in node
+# 2. PVC size too large for storage class
+# 3. Node affinity rules preventing scheduling
 ```
 
-### LoadBalancer Not Getting External IP
+**Problem**: Cluster not initializing
+
+**Solution**:
+```bash
+# Check CockroachDB operator logs
+kubectl logs -n cockroachdb-operator-system deployment/cockroach-operator-manager
+
+# Check CRD status
+kubectl get crdbcluster -n cockroachdb example-crdb-cluster -o yaml
+
+# Manually initialize if needed
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach init --certs-dir=/cockroach/cockroach-certs --host=example-crdb-cluster-0.example-crdb-cluster.cockroachdb
+```
+
+**Problem**: JWT authentication not working
+
+**Solution**:
+```bash
+# Verify JWT cluster settings
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SHOW CLUSTER SETTING server.jwt_authentication.enabled;"
+
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SHOW CLUSTER SETTING server.jwt_authentication.jwks;"
+
+# Test JWKS endpoint accessibility from within cluster
+kubectl run -n cockroachdb curl-test --image=curlimages/curl:latest --rm -it -- \
+    curl -v https://your-okta-domain/oauth2/default/v1/keys
+
+# Decode JWT token to verify claims
+echo $JWT_TOKEN | cut -d. -f2 | base64 -d | jq .
+# Ensure 'aud' matches OKTA_AUDIENCE
+# Ensure 'iss' matches OKTA_ISSUER
+# Ensure 'groups' claim exists and contains expected groups
+```
+
+### PgBouncer Issues
+
+**Problem**: PgBouncer pods failing to start
+
+**Solution**:
+```bash
+# Check logs for specific errors
+kubectl logs -n cockroachdb deployment/pgbouncer-app
+
+# Common issues:
+# 1. Certificate permissions - ensure tls.key has mode 0600
+kubectl exec -n cockroachdb deployment/pgbouncer-app -- ls -l /pgbouncer-certs/tls.key
+
+# 2. ConfigMap syntax error - validate pgbouncer.ini
+kubectl get configmap -n cockroachdb pgbouncer-app-config -o yaml
+
+# 3. Backend unreachable - test connectivity to CockroachDB
+kubectl exec -n cockroachdb deployment/pgbouncer-app -- \
+    nc -zv example-crdb-cluster-public 26257
+```
+
+**Problem**: Connection refused when connecting through PgBouncer
+
+**Solution**:
+```bash
+# Verify PgBouncer is listening on correct port
+kubectl exec -n cockroachdb deployment/pgbouncer-app -- netstat -tlnp | grep 5432
+
+# Check PgBouncer logs for authentication errors
+kubectl logs -n cockroachdb deployment/pgbouncer-app | grep -i "authentication\|error\|failed"
+
+# Verify backend connection to CockroachDB works
+kubectl exec -n cockroachdb deployment/pgbouncer-app -- \
+    psql -h example-crdb-cluster-public -p 26257 -U pgb_app_user -d defaultdb
+
+# Check client certificate is valid
+kubectl get secret -n cockroachdb pgbouncer-app-client -o yaml
+```
+
+**Problem**: Pool size mismatch warning during setup
+
+**Solution**:
+```bash
+# Recalculate pool sizes based on formula:
+# Total connections = 4 × CPU_LIMIT × NODE_COUNT
+# Pool size per replica = (Total × POOL_PCT) / REPLICAS
+
+# Example for app pool:
+# Total = 4 × 8 × 3 = 96
+# App pool = 96 × 0.50 = 48
+# Per replica = 48 / 3 = 16
+
+# Update config.env with correct values
+vi config.env
+export PGBOUNCER_APP_DEFAULT_POOL_SIZE="16"
+export PGBOUNCER_BATCH_DEFAULT_POOL_SIZE="19"
+export PGBOUNCER_ADMIN_DEFAULT_POOL_SIZE="10"
+
+# Re-run Phase 5 setup
+cd manifests/phase5-pgbouncer
+./teardown.sh
+./setup.sh
+```
+
+### Istio Issues
+
+**Problem**: Istio installation fails
+
+**Solution**:
+```bash
+# Check Istio operator logs (if using operator)
+kubectl logs -n istio-operator deployment/istio-operator
+
+# Check for conflicting installations
+kubectl get crds | grep istio
+
+# Uninstall and reinstall
+istioctl uninstall --purge -y
+kubectl delete namespace istio-system
+cd manifests/phase6-istio
+./setup.sh
+```
+
+**Problem**: JWT validation failing at ingress
+
+**Solution**:
+```bash
+# Check RequestAuthentication configuration
+kubectl get requestauthentication -n cockroachdb jwt-auth-okta -o yaml
+
+# Verify JWKS URL is correct and accessible from cluster
+kubectl run -n istio-system curl-test --image=curlimages/curl:latest --rm -it -- \
+    curl -v https://your-okta-domain/oauth2/default/v1/keys
+
+# Check Istio proxy logs on PgBouncer pod
+kubectl logs -n cockroachdb <pgbouncer-app-pod-name> -c istio-proxy
+
+# Test JWT token manually
+curl -H "Authorization: Bearer ${JWT_TOKEN}" \
+    https://${INGRESS_HOST}:5432
+```
+
+**Problem**: Ingress gateway not getting external IP (stuck in Pending)
+
+**Solution**:
+```bash
+# Check service annotations
+kubectl describe svc -n istio-system istio-ingressgateway
+
+# Check AWS Load Balancer Controller logs (if using ALB)
+kubectl logs -n kube-system deployment/aws-load-balancer-controller
+
+# Verify subnet tags for auto-discovery
+aws ec2 describe-subnets --filters "Name=tag:kubernetes.io/role/elb,Values=1"
+
+# Manually create NLB if needed
+kubectl annotate svc -n istio-system istio-ingressgateway \
+    service.beta.kubernetes.io/aws-load-balancer-type=nlb
+```
+
+### Flyway Issues
+
+**Problem**: Flyway migration job fails
+
+**Solution**:
+```bash
+# Check job logs
+kubectl logs -n cockroachdb job/flyway-production-migration
+
+# Common issues:
+# 1. SQL syntax error - review migration script
+# 2. Missing table dependency - ensure migrations run in correct order (V001, V002, V003...)
+# 3. Connection timeout - verify Flyway can reach CockroachDB:26257
+
+# Manually apply a migration to test
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=production < sql/production/V015__enable_rls_accounts.sql
+```
+
+**Problem**: RLS policy syntax error during migration
+
+**Solution**:
+```bash
+# Test RLS policy manually in SQL shell
+kubectl exec -n cockroachdb example-crdb-cluster-0 -it -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=production
+
+# In SQL shell:
+\d role_party_access
+
+# Test USING clause
+SELECT current_setting('app.current_roles', true);
+
+# Manually create policy to debug
+CREATE POLICY test_policy ON accounts
+  FOR SELECT
+  USING (party_id IN (
+    SELECT party_id FROM role_party_access
+    WHERE role_name = 'advisor-team-east'
+  ));
+```
+
+### RLS Issues
+
+**Problem**: RLS policy not filtering data
+
+**Solution**:
+```bash
+# Verify RLS is enabled on table
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=production \
+    --execute="SELECT tablename, rowsecurity FROM pg_tables WHERE tablename = 'accounts';"
+
+# Ensure FORCE ROW LEVEL SECURITY is set (applies to table owner too)
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=production \
+    --execute="ALTER TABLE accounts FORCE ROW LEVEL SECURITY;"
+
+# Test session variable setting
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --database=production <<EOF
+BEGIN;
+SET LOCAL app.current_user = 'test@example.com';
+SET LOCAL app.current_roles = 'advisor-team-east';
+SELECT current_setting('app.current_user', true), current_setting('app.current_roles', true);
+COMMIT;
+EOF
+```
+
+**Problem**: Users with admin role bypassing RLS unexpectedly
+
+**Solution**: This is expected behavior. Users with `BYPASSRLS` privilege (like admin role) skip RLS policies. This is intentional for batch jobs and admin operations. If you need to test RLS, use a role without BYPASSRLS:
 
 ```bash
-# Check service
-kubectl get svc <service-name> -n cockroachdb --context crdb-dcp-east
+# Check which roles have BYPASSRLS
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SELECT rolname, rolbypassrls FROM pg_roles WHERE rolbypassrls = true;"
 
-# Check AWS Load Balancer Controller logs
-kubectl logs -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller --context crdb-dcp-east
-
-# Common causes:
-# - AWS LB Controller not installed
-# - Subnets not tagged correctly for EKS
-# - Security groups blocking traffic
+# To revoke BYPASSRLS from a role (use caution):
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="ALTER ROLE admin NOBYPASSRLS;"
 ```
 
-### Replication Lag High
+### Observability Issues
+
+**Problem**: Prometheus not scraping CockroachDB metrics
+
+**Solution**:
+```bash
+# Check ServiceMonitor exists
+kubectl get servicemonitor -n monitoring
+
+# Check Prometheus targets in UI (port-forward to 9090)
+kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090
+
+# Open http://localhost:9090/targets
+# Look for cockroachdb targets - should be UP
+
+# Check network policy allows Prometheus → CockroachDB:8080
+kubectl get networkpolicy -n cockroachdb
+
+# Test connectivity from Prometheus pod to CockroachDB metrics endpoint
+kubectl exec -n monitoring prometheus-prometheus-kube-prometheus-prometheus-0 -c prometheus -- \
+    curl -v http://example-crdb-cluster-0.example-crdb-cluster.cockroachdb:8080/_status/vars
+```
+
+**Problem**: Grafana dashboards not showing data
+
+**Solution**:
+```bash
+# Verify Grafana data source is configured
+kubectl exec -n monitoring deployment/prometheus-kube-prometheus-grafana -- \
+    curl -s http://admin:prom-operator@localhost:3000/api/datasources | jq .
+
+# Test Prometheus query from Grafana
+# In Grafana → Explore → select Prometheus data source
+# Query: rate(sql_query_count[5m])
+
+# If no data, check Prometheus is scraping:
+# http://localhost:9090/graph?g0.expr=sql_query_count&g0.tab=0
+
+# Re-import dashboards if needed
+kubectl apply -f manifests/phase9-observability/grafana-dashboards/
+```
+
+### General Debugging
+
+**Enable verbose logging**:
 
 ```bash
-# Check replication status
-kubectl exec -it cockroachdb-west-0 -n cockroachdb --context crdb-dcp-west -- \
-  cockroach sql --certs-dir=/cockroach/cockroach-certs --host=localhost -e \
-  "SHOW VIRTUAL CLUSTER main WITH REPLICATION STATUS;"
+# CockroachDB - enable SQL statement logging
+kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
+    ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
+    --execute="SET CLUSTER SETTING sql.trace.log_statement_execute = true;"
 
-# Common causes:
-# - Network latency between regions (check Transit Gateway routes)
-# - East cluster overloaded (scale up)
-# - Rangefeed not enabled on East
-# - Network policy blocking cross-region traffic on port 26257
+# PgBouncer - edit ConfigMap to increase logging
+kubectl edit configmap -n cockroachdb pgbouncer-app-config
+# Set: log_connections = 1, log_disconnections = 1, log_pooler_errors = 1, verbose = 1
+
+# Restart PgBouncer to apply changes
+kubectl rollout restart deployment/pgbouncer-app -n cockroachdb
+
+# Istio - increase log level
+kubectl exec -n cockroachdb <pgbouncer-pod> -c istio-proxy -- \
+    curl -X POST http://localhost:15000/logging?level=debug
 ```
 
-### Certificate Issues
+**Check resource usage**:
 
 ```bash
-# Check cert-manager certificates
-kubectl get certificate -n cockroachdb --context crdb-dcp-east
-kubectl describe certificate <cert-name> -n cockroachdb --context crdb-dcp-east
+# Pod resource usage
+kubectl top pods -n cockroachdb --containers
 
-# Check Vault issuer
-kubectl get clusterissuer vault-issuer -o yaml --context crdb-dcp-east
+# Node resource usage
+kubectl top nodes
 
-# Common causes:
-# - Vault auth role misconfigured
-# - Vault policy doesn't allow cert issuance
-# - cert-manager service account doesn't have correct annotations for Vault auth
+# Describe pod to see resource limits/requests and current usage
+kubectl describe pod -n cockroachdb example-crdb-cluster-0 | grep -A 10 "Requests:\|Limits:"
+
+# Check for OOMKilled pods
+kubectl get pods -n cockroachdb -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.containerStatuses[*].lastState.terminated.reason}{"\n"}{end}' | grep OOMKilled
 ```
 
-### Audit Logs Not Appearing in S3
+## Teardown
+
+Use the automated teardown script to remove deployed resources and avoid ongoing AWS costs.
+
+### Usage
 
 ```bash
-# Check Fluent Bit pods
-kubectl get pods -n cockroachdb -l app=fluent-bit --context crdb-dcp-east
-kubectl logs -f <fluent-bit-pod> -n cockroachdb --context crdb-dcp-east
+cd kubernetes/eks
 
-# Check IRSA
-kubectl describe sa fluent-bit -n cockroachdb --context crdb-dcp-east
-# Should have eks.amazonaws.com/role-arn annotation
+# Delete a specific phase only
+./teardown.sh --phase 7
 
-# Common causes:
-# - IRSA not configured or service account not annotated
-# - S3 bucket policy doesn't allow IRSA role
-# - Fluent Bit config syntax error (check ConfigMap)
-# - Network policy blocking S3 egress
+# Delete from Phase N down to Phase 1 (reverse order)
+./teardown.sh --from-phase 7
+
+# Delete all phases (13 through 1)
+./teardown.sh --all
+
+# Delete EKS cluster only (fast cleanup, skips individual phases)
+./teardown.sh --cluster-only
 ```
 
----
+### Common Scenarios
+
+**After testing Phase 7 (Flyway)**:
+```bash
+./teardown.sh --from-phase 7
+# Deletes: Phases 7, 6, 5, 4, 3, 2, 1 in reverse order
+```
+
+**Complete teardown (all phases)**:
+```bash
+./teardown.sh --all
+# Deletes: All phases 13 through 1
+```
+
+**Delete only observability stack (Phase 9)**:
+```bash
+./teardown.sh --phase 9
+# Deletes: Phase 9 only (Prometheus, Grafana, Alertmanager)
+```
+
+### What Gets Deleted (by phase)
+
+The script automatically removes (in reverse order):
+
+- **Phase 13**: ArgoCD installation, Application definitions, GitOps workflow
+- **Phase 12**: West EKS cluster, PCR replication streams, analytics pool
+- **Phase 11**: Fluent Bit DaemonSet, S3 audit bucket with Object Lock
+- **Phase 10**: NetworkPolicies, Pod Security Standards, IRSA configurations
+- **Phase 9**: Prometheus, Grafana, Alertmanager, ServiceMonitors
+- **Phase 8**: S3 backup bucket, Enterprise license configuration, encryption keys
+- **Phase 7**: Flyway Jobs, migration ConfigMaps, RLS scripts
+- **Phase 6**: Istio control plane, ingress gateway, RequestAuthentication, AuthorizationPolicy
+- **Phase 5**: Three PgBouncer pools (app/batch/admin), services, certificates
+- **Phase 4**: CockroachDB cluster, databases, roles, service accounts, JWT configuration
+- **Phase 3**: CockroachDB Operator, cert-manager, CRDs
+- **Phase 2**: Vault StatefulSet, PKI secrets engine
+- **Phase 1**: EKS cluster, VPC, node groups
+
+### Important Notes
+
+**Safety Features**:
+- Interactive confirmation prompts before deletion
+- Loads configuration from `config.env` automatically
+- Phases deleted in reverse dependency order
+- Clear status output with color-coded messages
+
+**EKS Cluster Deletion (Phase 1)**:
+- `eksctl delete cluster` automatically deletes all Kubernetes resources
+- Takes 10-15 minutes to complete
+- EBS volumes with `reclaimPolicy: Retain` persist (default for safety)
+
+**S3 Object Lock (Phase 11)**:
+- Audit log objects with Object Lock cannot be deleted until 7-year retention expires
+- For testing: Use `Governance` mode (not `Compliance`) to allow admin override
+- The script will skip locked objects and warn about retention
+
+**Cost Awareness**:
+- **EKS control plane**: ~$0.10/hour (~$73/month) per cluster
+- **EC2 nodes**: m5.2xlarge ~$0.384/hour × node count
+- **NAT Gateway**: ~$0.045/hour (~$32/month) per AZ
+- **EBS volumes**: ~$0.10/GB-month
+- **S3 storage**: ~$0.023/GB-month (Standard) + request costs
+- **Always delete test clusters** to avoid ongoing costs
+
+### Verify AWS Resources are Deleted
+
+After teardown completes, verify that all AWS resources have been removed:
+
+```bash
+# Check for remaining EKS clusters
+aws eks list-clusters --region us-east-2
+aws eks list-clusters --region us-west-2  # If Phase 12 was deployed
+
+# Check for remaining VPCs
+aws ec2 describe-vpcs --region us-east-2 --filters "Name=tag:Name,Values=example-crdb-*"
+
+# Check for remaining ELBs/NLBs
+aws elb describe-load-balancers --region us-east-2 | jq '.LoadBalancerDescriptions[] | select(.LoadBalancerName | contains("example-crdb"))'
+aws elbv2 describe-load-balancers --region us-east-2 | jq '.LoadBalancers[] | select(.LoadBalancerName | contains("example-crdb"))'
+
+# Check for remaining EBS volumes
+aws ec2 describe-volumes --region us-east-2 --filters "Name=tag:kubernetes.io/cluster/example-crdb-eks,Values=owned"
+
+# Check for remaining S3 buckets
+aws s3 ls | grep example-crdb
+```
+
+### Manual Cleanup (if automated teardown fails)
+
+If automated teardown scripts fail, manually delete resources:
+
+```bash
+# Delete EKS cluster
+eksctl delete cluster --name example-crdb-eks --region us-east-2 --wait
+
+# Delete VPC (if eksctl didn't clean it up)
+VPC_ID=$(aws ec2 describe-vpcs --region us-east-2 --filters "Name=tag:Name,Values=example-crdb-vpc" --query 'Vpcs[0].VpcId' --output text)
+aws ec2 delete-vpc --vpc-id $VPC_ID --region us-east-2
+
+# Delete S3 buckets (must empty first)
+aws s3 rb s3://example-crdb-backups --force
+aws s3 rb s3://example-crdb-audit-logs --force
+
+# Delete IAM roles
+aws iam list-roles | jq -r '.Roles[] | select(.RoleName | contains("example-crdb")) | .RoleName' | while read role; do
+    aws iam delete-role --role-name $role
+done
+```
 
 ## Next Steps
 
-- [ ] Test PCR failover and failback procedures in dev environment
-- [ ] Load test cluster with production-like workload
-- [ ] Configure CloudWatch/Datadog alerts for replication lag, disk usage, clock offset
-- [ ] Document runbook for incident response
-- [ ] Review CockroachDB production checklist: https://www.cockroachlabs.com/docs/stable/recommended-production-settings
-- [ ] Plan for certificate rotation testing
-- [ ] Set up automated backup restore testing
+After successful deployment of all phases:
 
-For questions or issues, refer to:
-- CockroachDB Operator docs: https://www.cockroachlabs.com/docs/stable/kubernetes-overview
-- CockroachDB PCR docs: https://www.cockroachlabs.com/docs/stable/physical-cluster-replication-overview
-- CockroachDB docs: https://www.cockroachlabs.com/docs/
-- Community forum: https://forum.cockroachlabs.com/
+1. **Deploy sample-data-pipeline**: Integrate the Python ETL pipeline from https://github.com/roachlong/sample-data-pipeline
+2. **Load production data**: Migrate real data using Flyway or bulk import scripts
+3. **Configure monitoring alerts**: Set up PagerDuty/Slack integrations for Alertmanager
+4. **Run load tests**: Validate connection pool sizing under realistic load
+5. **DR exercise**: Test failover to West cluster (Phase 12)
+6. **Security audit**: Pen-testing, vulnerability scanning, compliance review
+7. **Performance tuning**: Optimize pool sizes, query plans, indexes based on observability data
+8. **Automate operations**: Expand GitOps to cover day-2 operations (scaling, upgrades, backups)
+
+## Additional Resources
+
+- **Architecture**: [ARCHITECTURE.md](./ARCHITECTURE.md)
+- **Phase-Specific Guides**:
+  - [Phase 4: CockroachDB Cluster](./manifests/phase4-cluster/README.md)
+  - [Phase 5: PgBouncer Pools](./manifests/phase5-pgbouncer/README.md)
+  - [Phase 6: Istio JWT](./manifests/phase6-istio/README.md)
+  - [Phase 7: Flyway Migrations](./manifests/phase7-flyway/README.md)
+- **External Documentation**:
+  - [CockroachDB Kubernetes Operator](https://www.cockroachlabs.com/docs/stable/orchestrate-cockroachdb-with-kubernetes.html)
+  - [CockroachDB Physical Cluster Replication](https://www.cockroachlabs.com/docs/stable/physical-cluster-replication-overview.html)
+  - [PgBouncer Documentation](https://www.pgbouncer.org/usage.html)
+  - [Istio JWT Authentication](https://istio.io/latest/docs/tasks/security/authentication/authn-policy/#end-user-authentication)
+  - [Flyway Documentation](https://flywaydb.org/documentation/)
+  - [AWS EKS Best Practices](https://aws.github.io/aws-eks-best-practices/)
+
+## Support
+
+For issues or questions:
+- Review the Troubleshooting section above
+- Check CockroachDB cluster logs: `kubectl logs -n cockroachdb example-crdb-cluster-0`
+- Check PgBouncer logs: `kubectl logs -n cockroachdb deployment/pgbouncer-app`
+- Check Istio logs: `kubectl logs -n istio-system deployment/istiod`
+- Verify Okta JWT token claims: `echo $JWT_TOKEN | cut -d. -f2 | base64 -d | jq .`
+- Test connectivity between components with `kubectl exec ... -- nc -zv <host> <port>`
+- Review Grafana dashboards for performance metrics
+- Check Prometheus alerts for active issues
