@@ -117,155 +117,423 @@ PgBouncer pods restart with updated pool sizes. ConfigMap Reloader automatically
 
 ## Security Model
 
-### Two Authentication Paths
+### Three-Tier Role Architecture
 
-#### 1. Pooled Access (App + Batch Pools)
-
-**Use Cases:**
-- End-user queries through applications
-- Python pipeline scripts (merge_to_production.py, load_staging.py)
-- Circuit breaker APIs
-
-**Flow:**
-1. User authenticates to Okta → receives JWT
-2. Istio validates JWT, extracts `email` and `groups` claims
-3. Application middleware reads headers, normalizes groups to roles
-4. Middleware wraps transaction:
-   ```sql
-   BEGIN;
-   SET LOCAL app.current_user = 'alice@example.com';
-   SET LOCAL app.current_roles = 'crdb_advisor_team_east,crdb_compliance_team';
-   -- Business queries execute here
-   COMMIT;  -- Variables automatically cleared
-   ```
-5. RLS policies evaluate `current_setting('app.current_user')` and `current_setting('app.current_roles')`
-6. User sees only rows for parties their roles grant access to
-
-**No CockroachDB user per human** - users authenticate at the application layer, not the database layer.
-
-#### 2. Direct Access (Admin Pool + Developer Tooling)
-
-**Use Cases:**
-- DBAs using psql or DBeaver
-- Developers running ad-hoc queries
-- Break-glass access scenarios
-
-**Flow:**
-1. Developer authenticates to Okta → receives JWT
-2. Connects directly to CockroachDB (or via admin pool):
-   ```bash
-   cockroach sql \
-     --url "postgresql://alice@example.com@cockroachdb-public:26257/production" \
-     --certs-dir=/certs \
-     --password  # Paste JWT as password
-   ```
-3. CockroachDB validates JWT via native `server.jwt_authentication` settings
-4. Auto-provisions SQL user `alice@example.com` on first login
-5. Grants roles based on JWT `groups` claim
-6. User queries with their assigned role privileges
-
-### Row-Level Security (RLS) Design
-
-#### Okta Groups → CockroachDB Roles → Party Access
-
-**Mapping Architecture:**
+The security model uses three distinct types of roles that work together to enforce both **RBAC** (what operations you can perform) and **RLS** (which data you can see):
 
 ```
-Okta Groups                CockroachDB Roles         Party Access
-━━━━━━━━━━━                ━━━━━━━━━━━━━━━━━         ━━━━━━━━━━━━
-crdb_advisor_team_east     crdb_advisor_team_east →  [party_id_1, party_id_2, ...]
-                                 ↓
-                          (inherits)
-                                 ↓
-                          app                  →    (base permissions on production schema)
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Service Accounts          Parent Roles           Okta-Mapped Roles     │
+│  (LOGIN, cert auth)        (NOLOGIN, templates)   (NOLOGIN, RLS IDs)    │
+├─────────────────────────────────────────────────────────────────────────┤
+│  pgb_app_user    ─┐                                                     │
+│                   ├─→ app ────────┬→ crdb_advisor_team_east             │
+│  pgb_batch_user  ─┼─→ admin ──────┼→ crdb_advisor_team_west             │
+│  pgb_admin_user  ─┘   │           ├→ crdb_client_services               │
+│  flyway_svc      ─────┘           ├→ crdb_compliance_team               │
+│                                    ├→ crdb_fiduciary_admin               │
+│                       readonly ────┼→ crdb_batch_service                 │
+│                       pipeline     ├→ crdb_developers                    │
+│                       powerbi      │                                     │
+│                       compliance   │                                     │
+│                       developer    │                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Purpose:                 Purpose:               Purpose:
+• PgBouncer connects     • Define allowed       • RLS policy filtering
+• Certificate auth       • Permission templates • Auto-provisioned
+• RBAC ceiling           • Grant to service     • Maps Okta groups
+• WITH LOGIN             • accounts             • NOLOGIN
 ```
 
-**Database Tables:**
+#### 1. Service Accounts (LOGIN - Certificate Auth)
+
+These are the **only** users that can actually login to CockroachDB:
 
 ```sql
--- Maps roles to accessible party IDs
-CREATE TABLE role_party_access (
-    role_name STRING NOT NULL,
-    party_id UUID NOT NULL REFERENCES parties(party_id),
-    access_level STRING NOT NULL,  -- 'read_only', 'read_write'
-    granted_at TIMESTAMPTZ DEFAULT now(),
-    granted_by STRING,
-    PRIMARY KEY (role_name, party_id)
-);
-
--- Example data
-INSERT INTO role_party_access (role_name, party_id, access_level, granted_by) VALUES
-  ('crdb_advisor_team_east', '123e4567-...', 'read_write', 'admin'),
-  ('crdb_advisor_team_east', '234e5678-...', 'read_write', 'admin'),
-  ('crdb_compliance_team', '345e6789-...', 'read_only', 'audit-manager');
+CREATE USER pgb_app_user WITH LOGIN;      -- App pool backend
+CREATE USER pgb_batch_user WITH LOGIN;    -- Batch pool backend
+CREATE USER pgb_admin_user WITH LOGIN;    -- Admin pool backend
+CREATE USER flyway_svc WITH LOGIN;        -- Schema migrations
 ```
 
-**RLS Policies:**
+**Authentication:** Certificate-only (no password)
+- Certificates issued by Vault PKI via cert-manager
+- PgBouncer uses these certificates to authenticate to CockroachDB
+- Each PgBouncer pool authenticates as its service account
+
+**RBAC Ceiling:** Service account permissions are the **hard limit**:
+```sql
+-- App pool can only do what app role allows
+GRANT app TO pgb_app_user;
+
+-- Batch/admin pools have elevated permissions
+GRANT admin TO pgb_batch_user WITH ADMIN OPTION;
+GRANT admin TO pgb_admin_user WITH ADMIN OPTION;
+GRANT admin TO flyway_svc WITH ADMIN OPTION;
+```
+
+#### 2. Parent Roles (NOLOGIN - Permission Templates)
+
+These define **what operations** are allowed, not **who** can login:
 
 ```sql
--- Enable RLS on accounts table
-ALTER TABLE accounts ENABLE ROW LEVEL SECURITY;
-ALTER TABLE accounts FORCE ROW LEVEL SECURITY;
+CREATE ROLE readonly NOLOGIN;      -- Read-only access
+CREATE ROLE app NOLOGIN;           -- Application data access (SELECT, INSERT, UPDATE, DELETE)
+CREATE ROLE pipeline NOLOGIN;      -- ETL/staging access
+CREATE ROLE powerbi NOLOGIN;       -- Analytics/reporting
+CREATE ROLE compliance NOLOGIN;    -- Compliance views
+CREATE ROLE developer NOLOGIN;     -- Development environment
+CREATE ROLE admin NOLOGIN;         -- Full cluster access, DDL, BYPASSRLS
 
--- Policy: Users can only access accounts for parties their roles grant access to
-CREATE POLICY role_based_account_access ON accounts
+-- Inheritance hierarchy
+GRANT readonly TO app;  -- app inherits readonly permissions
+```
+
+**Permissions Example:**
+```sql
+-- Grant database-level permissions to parent roles
+GRANT ALL ON DATABASE production TO app;
+GRANT CONNECT ON DATABASE production TO readonly;
+
+-- Grant schema-level permissions
+USE production;
+GRANT USAGE ON SCHEMA public TO app;
+GRANT USAGE ON SCHEMA public TO readonly;
+
+-- Table permissions granted after Flyway creates tables (Phase 7)
+GRANT SELECT, INSERT, UPDATE, DELETE ON accounts TO app;
+GRANT SELECT ON accounts TO readonly;
+```
+
+#### 3. Okta-Mapped Roles (NOLOGIN - RLS Identities)
+
+These define **which data** users can see via RLS policies:
+
+```sql
+-- Created by Phase 4 setup (static)
+CREATE ROLE crdb_advisor_team_east NOLOGIN;
+CREATE ROLE crdb_advisor_team_west NOLOGIN;
+CREATE ROLE crdb_client_services NOLOGIN;
+CREATE ROLE crdb_compliance_team NOLOGIN;
+CREATE ROLE crdb_fiduciary_admin NOLOGIN;
+CREATE ROLE crdb_batch_service NOLOGIN;
+CREATE ROLE crdb_developers NOLOGIN;
+
+-- Grant parent role permissions
+GRANT app TO crdb_advisor_team_east;
+GRANT app TO crdb_advisor_team_west;
+GRANT readonly TO crdb_client_services;
+GRANT compliance TO crdb_compliance_team;
+GRANT app TO crdb_fiduciary_admin;
+GRANT admin TO crdb_batch_service;
+GRANT developer TO crdb_developers;
+```
+
+**Auto-Provisioning:** When a user logs in via JWT, CockroachDB:
+1. Creates a user with their email address (e.g., `alice@example.com`)
+2. Grants them roles based on JWT `groups` claim
+3. Uses identity mapping: `example-issuer /^(.*)@.*$ \1` to strip domain
+
+**RLS Filtering:** Policies read session variables set by application middleware:
+```sql
+CREATE POLICY advisor_east_access ON accounts
   FOR ALL
+  TO app  -- Anyone with app role
   USING (
+    current_setting('app.current_roles') = 'crdb_advisor_team_east'
+    AND region = 'east'
+  );
+```
+
+### RBAC Security Boundaries
+
+**Critical Security Principle:** You **cannot** escalate beyond the service account's granted roles.
+
+**What Happens:**
+```sql
+-- Connect through app pool → authenticated as pgb_app_user
+-- pgb_app_user has been granted: app role
+
+-- This FAILS (admin was never granted to pgb_app_user)
+SET ROLE admin;
+-- ERROR: permission denied to set role "admin"
+
+-- This works (app was granted to pgb_app_user)
+SET ROLE app;  -- Changes nothing, already the effective role
+
+-- Session variables are for RLS filtering, NOT authorization
+SET LOCAL app.current_user = 'alice@example.com';  -- RLS identity
+SET LOCAL app.current_roles = 'crdb_advisor_team_east';  -- RLS filtering
+```
+
+**RBAC is bounded by:**
+1. **Service account grants** - `pgb_app_user` only has `app` role
+2. **Parent role permissions** - `app` role only has SELECT/INSERT/UPDATE/DELETE
+3. **Database grants** - Even `app` role can only access granted databases/tables
+
+**Example - What Each Pool Can Do:**
+
+| Operation | App Pool (`app` role) | Batch Pool (`admin` role) | Admin Pool (`admin` role) |
+|-----------|----------------------|---------------------------|---------------------------|
+| SELECT from accounts | ✅ Yes (with RLS) | ✅ Yes (BYPASSRLS) | ✅ Yes (BYPASSRLS) |
+| INSERT into accounts | ✅ Yes (with RLS) | ✅ Yes (BYPASSRLS) | ✅ Yes (BYPASSRLS) |
+| CREATE TABLE | ❌ No (requires admin) | ✅ Yes | ✅ Yes |
+| GRANT privileges | ❌ No (requires admin) | ✅ Yes | ✅ Yes |
+| ALTER USER | ❌ No (requires admin) | ✅ Yes | ✅ Yes |
+| BACKUP | ❌ No (requires admin) | ✅ Yes | ✅ Yes |
+| SET ROLE admin | ❌ ERROR | ✅ Already admin | ✅ Already admin |
+
+### Multi-Layer Defense in Depth
+
+Security is enforced at **four independent layers** - even if one layer fails, others prevent compromise:
+
+#### Layer 1: Network Isolation (Istio Service Mesh - Phase 6)
+
+**Enforcement:** Applications **never** connect directly to PgBouncer.
+
+```
+Application → Istio Sidecar → PgBouncer → CockroachDB
+```
+
+**Istio Sidecar:**
+1. **Validates JWT** signature against Okta JWKS (cryptographic proof)
+2. **Rejects unsigned/expired JWTs** before reaching PgBouncer
+3. **Extracts claims** from validated JWT:
+   - `email` → `x-user-email` header
+   - `groups` → `x-user-groups` header
+4. **Application middleware** reads headers and injects session variables
+
+**Network Policies (Kubernetes):**
+```yaml
+# Only allow traffic to PgBouncer from pods with Istio sidecar
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pgbouncer-access
+spec:
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          istio-injection: enabled  # Must have Istio sidecar
+```
+
+**Why This Matters:** 
+- Applications cannot bypass JWT validation
+- Cannot forge session variables (Istio sets them from validated JWT)
+- Cannot connect directly to PgBouncer to inject fake identity
+
+#### Layer 2: Service Account Permissions (RBAC Ceiling)
+
+**Enforcement:** Database operations are bounded by service account grants.
+
+```sql
+-- App pool: No DDL, no BYPASSRLS, no admin operations
+GRANT app TO pgb_app_user;
+
+-- Even if malicious app tries:
+ALTER TABLE accounts DROP COLUMN balance;
+-- ERROR: permission denied (app role has no DDL privileges)
+
+SET ROLE admin;
+-- ERROR: permission denied to set role "admin"
+```
+
+**Pool Separation:**
+- App pool (port 5432) → `pgb_app_user` → limited permissions
+- Batch pool (port 5433) → `pgb_batch_user` → BYPASSRLS for ETL
+- Admin pool (port 5434) → `pgb_admin_user` → full access for DBAs
+
+**Network Policies** also enforce pool access:
+- App pool: accessible from application pods
+- Batch pool: accessible from ETL pods only
+- Admin pool: accessible from admin tools only
+
+#### Layer 3: RLS Policies (Data Filtering)
+
+**Enforcement:** Even with valid permissions, RLS filters which **rows** are visible.
+
+```sql
+-- RLS policy on accounts table
+CREATE POLICY role_based_access ON accounts
+  FOR ALL
+  TO app  -- Applied to anyone with app role
+  USING (
+    -- Filter based on session variables
     current_setting('app.current_user', true) != ''
     AND current_setting('app.current_roles', true) != ''
     AND party_id IN (
       SELECT party_id FROM role_party_access
-      WHERE role_name = ANY(string_to_array(current_setting('app.current_roles', true), ','))
-    )
-  )
-  WITH CHECK (
-    current_setting('app.current_user', true) != ''
-    AND current_setting('app.current_roles', true) != ''
-    AND party_id IN (
-      SELECT party_id FROM role_party_access
-      WHERE role_name = ANY(string_to_array(current_setting('app.current_roles', true), ','))
-        AND access_level = 'read_write'
+      WHERE role_name = ANY(string_to_array(
+        current_setting('app.current_roles', true), ','
+      ))
     )
   );
-
--- Batch and admin bypass RLS
-ALTER ROLE batch_svc BYPASSRLS;
-ALTER ROLE fiduciary_admin BYPASSRLS;
 ```
 
-**RLS Cascading:**
+**Trust Model:**
+- Session variables (`app.current_user`, `app.current_roles`) are set by **application middleware**
+- Middleware reads headers injected by **Istio** (Layer 1)
+- Istio validates **JWT from Okta** (cryptographic proof)
+- Cannot be forged because application cannot reach PgBouncer without Istio
 
-RLS on `accounts` automatically filters joined tables:
+**RLS Bypass:**
+- `admin` role has `BYPASSRLS` attribute (batch and admin pools)
+- Used for ETL operations that need full table access
+- Used for DBA operations and troubleshooting
+
+#### Layer 4: Certificate Authentication
+
+**Enforcement:** Service accounts require certificate authentication (no password).
 
 ```sql
--- Query joins accounts → transactions
-SELECT 
-    a.account_number,
-    t.transaction_id,
-    t.amount
-FROM accounts a
-JOIN transactions t ON t.account_id = a.account_id;
+-- Service accounts have LOGIN but no password
+CREATE USER pgb_app_user WITH LOGIN;  -- No PASSWORD clause
 
--- RLS filters accounts first based on party_id
--- Only transactions for accessible accounts are returned
--- No explicit RLS needed on transactions table!
+-- Authentication ONLY via certificate
+-- Certificate issued by Vault PKI with:
+--   CN = pgb_app_user
+--   Signed by trusted CA
 ```
 
-**Where to Apply RLS:**
-- ✅ `accounts` - primary access control point (filters by party_id)
-- ✅ `parties` - users should only see parties they manage
-- ❌ `transactions` - automatically filtered via account_id FK
-- ❌ `compliance_events` - automatically filtered via account_id FK
-- ❌ `metadata`, `staging` - no RLS (service accounts only)
+**Certificate Management:**
+- Vault PKI issues certificates with 1-year validity
+- cert-manager automatically renews before expiration
+- Kubernetes mounts certificates as secrets (read-only)
+- PgBouncer pods access via `/cockroach-certs/` mount
 
-### Service Account Roles
+**Why This Matters:**
+- No shared passwords to leak
+- Certificates tied to specific service accounts
+- Automatic rotation via cert-manager
+- Vault provides audit trail of all issued certificates
 
-| Account | Pool | Role | Privileges | RLS |
-|---------|------|------|------------|-----|
-| pgb_app_user | App | fiduciary_ops | SELECT, INSERT, UPDATE, DELETE on production schema | ✅ Enforced via session variables |
-| pgb_batch_user | Batch | batch_svc | Full access to metadata, staging, production | ❌ BYPASSRLS (ETL needs full table access) |
-| pgb_admin_user | Admin | fiduciary_admin | Full cluster access, DDL, DML, backups | ❌ BYPASSRLS (DBA operations) |
-| flyway_svc | Direct | fiduciary_admin | DDL, schema migrations | ❌ BYPASSRLS (bypasses PgBouncer) |
+### Complete Authentication Flow
+
+**User Journey (App Pool):**
+
+```
+1. User → Okta Login
+   ↓
+   Okta validates credentials → issues JWT
+   JWT contains: {
+     "email": "alice@example.com",
+     "groups": ["crdb_advisor_team_east"]
+   }
+
+2. User → Application (with JWT in Authorization header)
+   ↓
+   Application passes JWT to Istio
+
+3. Istio Sidecar
+   ↓
+   • Validates JWT signature against Okta JWKS
+   • Checks expiration
+   • Extracts claims → injects headers:
+     x-user-email: alice@example.com
+     x-user-groups: crdb_advisor_team_east
+   ↓
+   Forwards to Application
+
+4. Application Middleware
+   ↓
+   • Reads headers from Istio
+   • Wraps database transaction:
+   
+   BEGIN;
+   SET LOCAL app.current_user = 'alice@example.com';
+   SET LOCAL app.current_roles = 'crdb_advisor_team_east';
+   
+   -- Business query
+   SELECT * FROM accounts WHERE account_status = 'active';
+   -- RLS policy filters: only accounts where party_id IN (
+   --   SELECT party_id FROM role_party_access 
+   --   WHERE role_name = 'crdb_advisor_team_east'
+   -- )
+   
+   COMMIT;  -- Session variables automatically cleared
+
+5. Application → PgBouncer (app pool, port 5432)
+   ↓
+   PgBouncer accepts connection (any username, auth_type=any)
+
+6. PgBouncer → CockroachDB
+   ↓
+   • Authenticates as pgb_app_user (certificate)
+   • CockroachDB verifies certificate against CA
+   • pgb_app_user has app role
+   ↓
+   Query executes with:
+   - RBAC: app role permissions (SELECT, INSERT, UPDATE, DELETE)
+   - RLS: Filtered by session variables
+   ↓
+   Returns only accounts for crdb_advisor_team_east parties
+
+7. Results → Application → User
+```
+
+### Trust Model Summary
+
+**You ARE Trusting:**
+- **Okta** - to authenticate users and sign JWTs correctly
+- **Istio** - to validate JWTs and inject correct headers
+- **Application middleware** - to set session variables from headers (it's your code in your cluster)
+- **Network policies** - to prevent direct PgBouncer access
+- **CockroachDB RBAC** - to enforce service account permission boundaries
+
+**You are NOT Trusting:**
+- **End users** - to provide correct identity (JWT cryptographically verified)
+- **Applications** - to bypass Istio (network enforced)
+- **Service accounts** - to escalate privileges (RBAC enforced by CockroachDB)
+- **Session variables** - without validation chain (Istio → JWT → Okta)
+
+**Defense in Depth:** Each layer independently enforces security:
+- **Network down?** → RBAC still limits operations
+- **Istio bypassed?** → Still bounded by service account permissions (can't get admin)
+- **RLS policy bug?** → Still can't perform DDL or access other databases
+- **Certificate leaked?** → Still bounded by that service account's grants
+
+This is similar to how OAuth/OIDC works in modern architectures - your application tier is **trusted code** that mediates between untrusted users and backend systems, with cryptographic proof (JWT) and network enforcement (Istio + NetworkPolicies) ensuring the trust chain cannot be broken.
+
+### Security Validation Checklist
+
+**Phase 4 (Infrastructure):**
+- ✅ Service accounts created with LOGIN (certificate auth only)
+- ✅ Parent roles created with NOLOGIN (permission templates)
+- ✅ Okta-mapped roles created with NOLOGIN (RLS identities)
+- ✅ Certificates issued for all service accounts
+
+**Phase 5 (PgBouncer):**
+- ✅ Three pools with separate service accounts
+- ✅ auth_type=any (accepts any client username, authenticates backend as service account)
+- ✅ Certificate authentication to CockroachDB
+- ✅ Client and server TLS enabled
+
+**Phase 6 (Istio):**
+- ✅ RequestAuthentication validates JWT
+- ✅ Headers injected: x-user-email, x-user-groups
+- ✅ NetworkPolicies enforce Istio requirement
+
+**Phase 7 (Schema + RLS):**
+- ✅ RLS policies created on accounts and parties tables
+- ✅ Policies read current_setting('app.current_user') and current_setting('app.current_roles')
+- ✅ role_party_access table populated
+
+**Testing RBAC Boundaries:**
+```bash
+# Test that app pool cannot escalate
+psql "postgresql://test@pgbouncer-app:5432/production?sslmode=require" <<EOF
+SET ROLE admin;  -- Should FAIL
+CREATE TABLE test (id INT);  -- Should FAIL (no DDL)
+SELECT * FROM accounts;  -- Should work (with RLS)
+EOF
+
+# Test that batch pool bypasses RLS
+psql "postgresql://test@pgbouncer-batch:5433/production?sslmode=require" <<EOF
+SELECT COUNT(*) FROM accounts;  -- Should see ALL rows (BYPASSRLS)
+EOF
+```
 
 ## Component Access Patterns
 
@@ -317,15 +585,16 @@ jdbc:postgresql://cockroachdb-public.cockroachdb.svc.cluster.local:26257/product
 |----------|---------|--------|----------|-------------|
 | metadata | Governance, SOR mappings, circuit breakers | entity_sor_map, batch_runs, dq_violations, circuit_breaker_rules, role_party_access | GLOBAL | All pools |
 | staging | Raw data landing zone | stg_workday, stg_hubspot, stg_custodian, stg_core_banking, stg_compliance_events | REGIONAL BY TABLE | Batch pool |
-| production | System of record | accounts, transactions, parties, compliance_events, currencies, regulatory_codes | REGIONAL BY TABLE or REGIONAL BY ROW | All pools |
+| production | System of record | accounts, transactions, parties, compliance_events, currencies, regulatory_codes | REGIONAL BY ROW (accounts, parties); REGIONAL BY TABLE (others) | All pools |
 
 ### Key Production Tables
 
-**accounts** (REGIONAL BY TABLE):
+**accounts** (REGIONAL BY ROW):
 ```sql
 CREATE TABLE accounts (
-    account_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    party_id UUID NOT NULL REFERENCES parties(party_id),
+    crdb_region crdb_internal_region NOT NULL DEFAULT gateway_region()::crdb_internal_region,
+    account_id UUID DEFAULT gen_random_uuid(),
+    party_id UUID NOT NULL,  -- References parties(party_id) with same crdb_region
     account_number STRING NOT NULL,
     account_type STRING NOT NULL,  -- CHECKING, SAVINGS, CUSTODY, etc.
     account_status STRING NOT NULL, -- ACTIVE, SUSPENDED, CLOSED
@@ -336,18 +605,20 @@ CREATE TABLE accounts (
     source_record_id STRING NOT NULL,
     load_timestamp TIMESTAMPTZ DEFAULT now(),
     created_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now()
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    PRIMARY KEY (crdb_region, account_id)
 );
 
-ALTER TABLE accounts SET LOCALITY REGIONAL BY TABLE IN PRIMARY REGION;
+ALTER TABLE accounts SET LOCALITY REGIONAL BY ROW;
 ALTER TABLE accounts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE accounts FORCE ROW LEVEL SECURITY;
 ```
 
-**parties** (REGIONAL BY TABLE):
+**parties** (REGIONAL BY ROW):
 ```sql
 CREATE TABLE parties (
-    party_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    crdb_region crdb_internal_region NOT NULL DEFAULT gateway_region()::crdb_internal_region,
+    party_id UUID DEFAULT gen_random_uuid(),
     party_type STRING NOT NULL,  -- INDIVIDUAL, ORGANIZATION
     first_name STRING,
     last_name STRING,
@@ -358,10 +629,11 @@ CREATE TABLE parties (
     source_system STRING NOT NULL,
     source_record_id STRING NOT NULL,
     created_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now()
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    PRIMARY KEY (crdb_region, party_id)
 );
 
-ALTER TABLE parties SET LOCALITY REGIONAL BY TABLE IN PRIMARY REGION;
+ALTER TABLE parties SET LOCALITY REGIONAL BY ROW;
 ALTER TABLE parties ENABLE ROW LEVEL SECURITY;
 ALTER TABLE parties FORCE ROW LEVEL SECURITY;
 ```

@@ -201,6 +201,45 @@ cockroachdb-east          ClusterIP   None             <none>        26258/TCP,8
 cockroachdb-east-public   ClusterIP   172.20.xxx.xxx   <none>        26258/TCP,8080/TCP,26257/TCP
 ```
 
+### Verify Service Accounts
+
+Check that service account users were created and can authenticate with certificates:
+
+```bash
+# List service account users
+kubectl exec -n cockroachdb cockroachdb-east-0 -- ./cockroach sql --certs-dir=/cockroach/cockroach-certs --execute="SELECT username, user_id FROM system.users WHERE username LIKE 'pgb_%' OR username = 'flyway_svc';"
+
+# Test certificate authentication for pgb_app_user
+# Extract certificate from secret and test login
+kubectl get secret cockroachdb-client-pgb-app-user -n cockroachdb -o jsonpath='{.data.tls\.crt}' | base64 -d > /tmp/pgb_app_user.crt
+kubectl get secret cockroachdb-client-pgb-app-user -n cockroachdb -o jsonpath='{.data.tls\.key}' | base64 -d > /tmp/pgb_app_user.key
+kubectl get secret cockroachdb-client-pgb-app-user -n cockroachdb -o jsonpath='{.data.ca\.crt}' | base64 -d > /tmp/ca.crt
+
+# Connect using certificate (from a pod with psql client)
+kubectl run test-svc-account --rm -i --restart=Never --image=postgres:15 -n cockroachdb -- \
+  bash -c "echo '$(kubectl get secret cockroachdb-client-pgb-app-user -n cockroachdb -o jsonpath='{.data.tls\.crt}' | base64 -d)' > /tmp/client.crt && \
+  echo '$(kubectl get secret cockroachdb-client-pgb-app-user -n cockroachdb -o jsonpath='{.data.tls\.key}' | base64 -d)' > /tmp/client.key && \
+  echo '$(kubectl get secret cockroachdb-client-pgb-app-user -n cockroachdb -o jsonpath='{.data.ca\.crt}' | base64 -d)' > /tmp/ca.crt && \
+  chmod 600 /tmp/client.key && \
+  psql 'postgresql://pgb_app_user@cockroachdb-east-public:26257/defaultdb?sslmode=require&sslcert=/tmp/client.crt&sslkey=/tmp/client.key&sslrootcert=/tmp/ca.crt' -c 'SELECT current_user, current_database();'"
+```
+
+Expected output:
+```
+   username    | user_id 
+---------------+---------
+ flyway_svc    | 116
+ pgb_admin_user| 115
+ pgb_app_user  | 113
+ pgb_batch_user| 114
+
+ current_user  | current_database 
+---------------+------------------
+ pgb_app_user  | defaultdb
+```
+
+**Note**: Service accounts have LOGIN privilege but require certificate authentication - no password login is allowed. This will be used by PgBouncer in Phase 5 and Flyway in Phase 7.
+
 ## Architecture
 
 ```

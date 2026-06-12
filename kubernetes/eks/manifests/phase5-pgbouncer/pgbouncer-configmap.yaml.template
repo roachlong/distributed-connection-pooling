@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pgbouncer-config
+  namespace: ${CRDB_NAMESPACE}
+data:
+  pgbouncer.ini: |
+    [databases]
+    * = host=${CRDB_CLUSTER_NAME_EAST}-public port=26257
+
+    [pgbouncer]
+    listen_addr = 0.0.0.0
+    listen_port = ${PGBOUNCER_PORT}
+
+    # Authentication
+    auth_type = cert
+    auth_file = /etc/pgbouncer/userlist.txt
+
+    # Connection pooling
+    pool_mode = ${PGBOUNCER_POOL_MODE}
+    max_client_conn = ${PGBOUNCER_MAX_CLIENT_CONN}
+    default_pool_size = ${PGBOUNCER_DEFAULT_POOL_SIZE}
+    reserve_pool_size = ${PGBOUNCER_RESERVE_POOL_SIZE}
+
+    # TLS Configuration - Client side (applications connecting to PgBouncer)
+    client_tls_sslmode = verify-full
+    client_tls_ca_file = /pgbouncer-certs/ca.crt
+    client_tls_key_file = /pgbouncer-certs/tls.key
+    client_tls_cert_file = /pgbouncer-certs/tls.crt
+
+    # TLS Configuration - Server side (PgBouncer connecting to CockroachDB)
+    server_tls_sslmode = verify-full
+    server_tls_ca_file = /cockroach/cockroach-certs/ca.crt
+    server_tls_key_file = /cockroach/cockroach-certs/client.pgbouncer.key
+    server_tls_cert_file = /cockroach/cockroach-certs/client.pgbouncer.crt
+
+    # Performance tuning (from Terraform DCP module)
+    so_reuseport = 1
+    listen_backlog = 4096
+    server_round_robin = 1
+
+    # Logging
+    log_connections = 1
+    log_disconnections = 1
+    log_pooler_errors = 1
+
+    # Admin console
+    admin_users = pgbouncer
+    stats_users = pgbouncer
+
+    # Timeouts (disabled for load testing, as per Terraform DCP)
+    server_idle_timeout = 0
+    server_lifetime = 0
+    server_connect_timeout = 15
+    query_timeout = 0
+    query_wait_timeout = 120
+    client_idle_timeout = 0
+    idle_transaction_timeout = 0
+
+    # Connection limits
+    max_db_connections = 0
+    max_user_connections = 0
+
+  userlist.txt: |
+    "root" ""

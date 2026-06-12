@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgbouncer
+  namespace: ${CRDB_NAMESPACE}
+  labels:
+    app: pgbouncer
+    app.kubernetes.io/name: pgbouncer
+    app.kubernetes.io/component: connection-pooler
+spec:
+  type: ClusterIP
+  selector:
+    app: pgbouncer
+  ports:
+    - name: pgbouncer
+      port: ${PGBOUNCER_PORT}
+      targetPort: ${PGBOUNCER_PORT}
+      protocol: TCP
+  sessionAffinity: None

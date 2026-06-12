@@ -1,0 +1,17 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: pgbouncer-client
+  namespace: ${CRDB_NAMESPACE}
+spec:
+  secretName: pgbouncer-client
+  duration: 8760h  # 1 year
+  renewBefore: 720h  # 30 days
+  issuerRef:
+    name: vault-issuer
+    kind: ClusterIssuer
+  commonName: pgbouncer
+  dnsNames:
+    - pgbouncer
+  usages:
+    - client auth

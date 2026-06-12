@@ -1,0 +1,124 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgbouncer
+  namespace: ${CRDB_NAMESPACE}
+  labels:
+    app: pgbouncer
+    app.kubernetes.io/name: pgbouncer
+    app.kubernetes.io/component: connection-pooler
+    app.kubernetes.io/part-of: ${PROJECT_NAME}
+spec:
+  replicas: ${PGBOUNCER_REPLICAS}
+  selector:
+    matchLabels:
+      app: pgbouncer
+  template:
+    metadata:
+      labels:
+        app: pgbouncer
+        app.kubernetes.io/name: pgbouncer
+        app.kubernetes.io/component: connection-pooler
+    spec:
+      # Pod anti-affinity to spread across nodes
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - pgbouncer
+                topologyKey: kubernetes.io/hostname
+
+      containers:
+        - name: pgbouncer
+          image: edoburu/pgbouncer:latest
+          ports:
+            - name: pgbouncer
+              containerPort: ${PGBOUNCER_PORT}
+              protocol: TCP
+
+          resources:
+            requests:
+              cpu: "${PGBOUNCER_CPU_REQUEST}"
+              memory: "${PGBOUNCER_MEMORY_REQUEST}"
+            limits:
+              cpu: "${PGBOUNCER_CPU_LIMIT}"
+              memory: "${PGBOUNCER_MEMORY_LIMIT}"
+
+          # Liveness probe - check if PgBouncer is responding
+          livenessProbe:
+            tcpSocket:
+              port: ${PGBOUNCER_PORT}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # Readiness probe - check if PgBouncer can accept connections
+          readinessProbe:
+            tcpSocket:
+              port: ${PGBOUNCER_PORT}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+
+          # Mount configuration and certificates
+          volumeMounts:
+            - name: pgbouncer-config
+              mountPath: /etc/pgbouncer
+              readOnly: true
+            - name: pgbouncer-server-certs
+              mountPath: /pgbouncer-certs
+              readOnly: true
+            - name: cockroachdb-certs
+              mountPath: /cockroach/cockroach-certs
+              readOnly: true
+
+          # Environment variables
+          env:
+            - name: PGBOUNCER_INI
+              value: /etc/pgbouncer/pgbouncer.ini
+
+      volumes:
+        - name: pgbouncer-config
+          configMap:
+            name: pgbouncer-config
+            items:
+              - key: pgbouncer.ini
+                path: pgbouncer.ini
+              - key: userlist.txt
+                path: userlist.txt
+
+        - name: pgbouncer-server-certs
+          projected:
+            sources:
+              - secret:
+                  name: pgbouncer-server
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+                    - key: tls.crt
+                      path: tls.crt
+                    - key: tls.key
+                      path: tls.key
+                      mode: 0600
+
+        - name: cockroachdb-certs
+          projected:
+            sources:
+              - secret:
+                  name: pgbouncer-client
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+                    - key: tls.crt
+                      path: client.pgbouncer.crt
+                    - key: tls.key
+                      path: client.pgbouncer.key
+                      mode: 0600

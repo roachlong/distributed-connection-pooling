@@ -413,14 +413,14 @@ create_service_accounts() {
 
     local POD_NAME="${CRDB_CLUSTER_NAME_EAST}-0"
 
-    print_info "Creating service account users (NOLOGIN)..."
+    print_info "Creating service account users (certificate-only authentication)..."
     kubectl exec -n "${CRDB_NAMESPACE}" "${POD_NAME}" -- \
         ./cockroach sql --certs-dir=/cockroach/cockroach-certs -e "
-        -- Service account users (NOLOGIN, certificate-only)
-        CREATE USER IF NOT EXISTS pgb_app_user NOLOGIN;
-        CREATE USER IF NOT EXISTS pgb_batch_user NOLOGIN;
-        CREATE USER IF NOT EXISTS pgb_admin_user NOLOGIN;
-        CREATE USER IF NOT EXISTS flyway_svc NOLOGIN;
+        -- Service account users (LOGIN, certificate-only authentication)
+        CREATE USER IF NOT EXISTS pgb_app_user WITH LOGIN;
+        CREATE USER IF NOT EXISTS pgb_batch_user WITH LOGIN;
+        CREATE USER IF NOT EXISTS pgb_admin_user WITH LOGIN;
+        CREATE USER IF NOT EXISTS flyway_svc WITH LOGIN;
         "
 
     print_info "Granting roles to service accounts..."

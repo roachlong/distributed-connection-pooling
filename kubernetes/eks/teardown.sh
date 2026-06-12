@@ -184,40 +184,32 @@ teardown_phase_6() {
 }
 
 teardown_phase_5() {
-    print_header "Phase 5: PgBouncer"
+    print_header "Phase 5: PgBouncer Three-Pool Architecture"
 
     if ! kubectl get namespace "${CRDB_NAMESPACE}" &>/dev/null; then
         print_info "Namespace ${CRDB_NAMESPACE} does not exist, skipping"
         return 0
     fi
 
-    # Delete PgBouncer deployment and service
-    print_info "Deleting PgBouncer deployment..."
-    kubectl delete deployment pgbouncer -n "${CRDB_NAMESPACE}" --wait=false 2>/dev/null || true
+    # Delete three PgBouncer deployments
+    print_info "Deleting PgBouncer deployments..."
+    kubectl delete deployment pgbouncer-app -n "${CRDB_NAMESPACE}" --wait=false 2>/dev/null || true
+    kubectl delete deployment pgbouncer-batch -n "${CRDB_NAMESPACE}" --wait=false 2>/dev/null || true
+    kubectl delete deployment pgbouncer-admin -n "${CRDB_NAMESPACE}" --wait=false 2>/dev/null || true
 
-    print_info "Deleting PgBouncer service..."
-    kubectl delete service pgbouncer -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+    # Delete three PgBouncer services
+    print_info "Deleting PgBouncer services..."
+    kubectl delete service pgbouncer-app -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+    kubectl delete service pgbouncer-batch -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+    kubectl delete service pgbouncer-admin -n "${CRDB_NAMESPACE}" 2>/dev/null || true
 
-    # Delete ConfigMap
-    print_info "Deleting PgBouncer ConfigMap..."
-    kubectl delete configmap pgbouncer-config -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+    # Delete three ConfigMaps
+    print_info "Deleting PgBouncer ConfigMaps..."
+    kubectl delete configmap pgbouncer-app-config -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+    kubectl delete configmap pgbouncer-batch-config -n "${CRDB_NAMESPACE}" 2>/dev/null || true
+    kubectl delete configmap pgbouncer-admin-config -n "${CRDB_NAMESPACE}" 2>/dev/null || true
 
-    # Delete certificates
-    print_info "Deleting PgBouncer certificates..."
-    kubectl delete certificate pgbouncer-server -n "${CRDB_NAMESPACE}" 2>/dev/null || true
-    kubectl delete certificate pgbouncer-client -n "${CRDB_NAMESPACE}" 2>/dev/null || true
-
-    # Delete certificate secrets
-    kubectl delete secret pgbouncer-server -n "${CRDB_NAMESPACE}" 2>/dev/null || true
-    kubectl delete secret pgbouncer-client -n "${CRDB_NAMESPACE}" 2>/dev/null || true
-
-    # Optional: Delete pgbouncer database user (requires cluster to be running)
-    if kubectl get pod "${CRDB_CLUSTER_NAME_EAST}-0" -n "${CRDB_NAMESPACE}" &>/dev/null; then
-        print_info "Deleting pgbouncer database user..."
-        kubectl exec -n "${CRDB_NAMESPACE}" "${CRDB_CLUSTER_NAME_EAST}-0" -- \
-            ./cockroach sql --certs-dir=/cockroach/cockroach-certs \
-            --execute="DROP USER IF EXISTS pgbouncer;" 2>/dev/null || true
-    fi
+    # Note: Service account certificates are managed by Phase 4, not deleted here
 
     print_info "Phase 5 teardown complete"
 }
