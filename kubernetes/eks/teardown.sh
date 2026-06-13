@@ -170,15 +170,34 @@ teardown_phase_7() {
 }
 
 teardown_phase_6() {
-    print_header "Phase 6: Enterprise Features"
+    print_header "Phase 6: Istio Service Mesh"
 
-    if helm list -n external-secrets-system 2>/dev/null | grep -q external-secrets; then
-        print_info "Uninstalling External Secrets Operator..."
-        helm uninstall external-secrets -n external-secrets-system
+    if ! kubectl get namespace istio-system &>/dev/null; then
+        print_info "Istio not installed, skipping"
+        return 0
     fi
 
-    print_info "Deleting external-secrets-system namespace..."
-    kubectl delete namespace external-secrets-system --wait=false 2>/dev/null || true
+    print_info "Deleting Istio resources..."
+
+    # Delete application namespace resources
+    for ns in $(kubectl get namespaces -l istio-injection=enabled -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+        print_info "Cleaning up Istio resources in namespace: $ns"
+        kubectl delete requestauthentication --all -n "$ns" 2>/dev/null || true
+        kubectl delete authorizationpolicy --all -n "$ns" 2>/dev/null || true
+        kubectl delete virtualservices --all -n "$ns" 2>/dev/null || true
+        kubectl label namespace "$ns" istio-injection- 2>/dev/null || true
+    done
+
+    # Delete Istio gateway resources
+    kubectl delete gateway --all -n istio-system 2>/dev/null || true
+
+    # Delete Istio control plane
+    print_info "Deleting Istio control plane..."
+    kubectl delete namespace istio-system --wait=false 2>/dev/null || true
+
+    # Delete Istio CRDs
+    print_info "Deleting Istio CRDs..."
+    kubectl delete crds -l app=istio 2>/dev/null || true
 
     print_info "Phase 6 teardown complete"
 }

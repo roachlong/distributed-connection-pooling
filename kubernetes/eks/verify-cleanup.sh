@@ -213,17 +213,44 @@ fi
 #######################################
 print_header "8. Checking Load Balancers"
 
+# Check for project-named load balancers
 LOAD_BALANCERS=$(aws elbv2 describe-load-balancers \
     --region "${AWS_REGION_EAST}" \
     --profile "${AWS_PROFILE}" \
     --query "LoadBalancers[?contains(LoadBalancerName, '${PROJECT_NAME}')].LoadBalancerName" \
     --output text 2>/dev/null)
 
-if [[ -z "$LOAD_BALANCERS" ]]; then
+# Also check for Kubernetes-created load balancers (Istio ingress gateway, etc.)
+# These are tagged with kubernetes.io/cluster/<cluster-name>=owned
+K8S_LB_ARNS=$(aws elbv2 describe-load-balancers \
+    --region "${AWS_REGION_EAST}" \
+    --profile "${AWS_PROFILE}" \
+    --query "LoadBalancers[].LoadBalancerArn" \
+    --output text 2>/dev/null)
+
+K8S_LOAD_BALANCERS=""
+for arn in $K8S_LB_ARNS; do
+    if aws elbv2 describe-tags --resource-arns "$arn" \
+        --region "${AWS_REGION_EAST}" \
+        --profile "${AWS_PROFILE}" \
+        --query "TagDescriptions[].Tags[?Key=='kubernetes.io/cluster/${CLUSTER_NAME_EAST}'].Value" \
+        --output text 2>/dev/null | grep -q "owned"; then
+        lb_name=$(aws elbv2 describe-load-balancers --load-balancer-arns "$arn" \
+            --region "${AWS_REGION_EAST}" \
+            --profile "${AWS_PROFILE}" \
+            --query "LoadBalancers[].LoadBalancerName" \
+            --output text 2>/dev/null)
+        K8S_LOAD_BALANCERS="${K8S_LOAD_BALANCERS}${lb_name}\n"
+    fi
+done
+
+ALL_LOAD_BALANCERS=$(echo -e "${LOAD_BALANCERS}\n${K8S_LOAD_BALANCERS}" | grep -v '^$' | sort -u)
+
+if [[ -z "$ALL_LOAD_BALANCERS" ]]; then
     print_info "No load balancers found"
 else
     print_error "Found load balancers:"
-    echo "$LOAD_BALANCERS" | tr '\t' '\n'
+    echo -e "$ALL_LOAD_BALANCERS"
     FOUND_RESOURCES=$((FOUND_RESOURCES + 1))
 fi
 
