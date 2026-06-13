@@ -346,6 +346,11 @@ postgresql://pgb_app_user@pgbouncer-app.cockroachdb.svc.cluster.local:5432/produ
 ```python
 import psycopg
 
+# user_email and user_roles come from HTTP request headers:
+# - Phase 6 (Istio): x-user-email and x-user-groups headers (from validated JWT)
+# - Application middleware: Read headers from incoming HTTP request
+# Example: user_email = request.headers.get('x-user-email')
+
 conn = psycopg.connect(
     "postgresql://pgb_app_user@pgbouncer-app:5432/production?sslmode=require",
     sslcert="/path/to/client.root.crt",
@@ -357,7 +362,7 @@ conn.autocommit = False
 try:
     cursor = conn.cursor()
     cursor.execute("BEGIN;")
-    # Inject user identity from JWT token
+    # Inject user identity from request headers (Phase 6: Istio provides these)
     cursor.execute("SET LOCAL app.current_user = %s;", (user_email,))
     cursor.execute("SET LOCAL app.current_roles = %s;", (user_roles,))
     
@@ -769,11 +774,12 @@ This will remove:
 
 ### Phase 6: Istio Service Mesh
 
-Deploy Istio for JWT validation at ingress gateway:
-- Validate Okta JWT tokens before reaching PgBouncer
-- Extract `groups` claim from JWT
-- Propagate user identity to PgBouncer app pool
-- Enforce JWT requirement for external traffic
+Deploy Istio for JWT validation and user identity propagation:
+- Validate Okta JWT tokens at ingress gateway before reaching application services
+- Extract `email` and `groups` claims from JWT
+- Inject `x-user-email` and `x-user-groups` headers for application middleware
+- Application middleware reads headers and uses them for `SET LOCAL role` when connecting to PgBouncer
+- Enforce JWT requirement for external traffic to applications
 
 See [manifests/phase6-istio/README.md](../phase6-istio/README.md)
 

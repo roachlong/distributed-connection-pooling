@@ -288,41 +288,57 @@ SET LOCAL app.current_roles = 'crdb_advisor_team_east';  -- RLS filtering
 
 Security is enforced at **four independent layers** - even if one layer fails, others prevent compromise:
 
-#### Layer 1: Network Isolation (Istio Service Mesh - Phase 6)
+#### Layer 1: JWT Validation and Header Injection (Istio Service Mesh - Phase 6)
 
-**Enforcement:** Applications **never** connect directly to PgBouncer.
+**Enforcement:** External requests to applications **must** have valid JWT tokens.
 
 ```
-Application → Istio Sidecar → PgBouncer → CockroachDB
+External User → Istio Ingress Gateway → Application (with Istio sidecar)
 ```
 
-**Istio Sidecar:**
+**Istio Ingress Gateway & Sidecar:**
 1. **Validates JWT** signature against Okta JWKS (cryptographic proof)
-2. **Rejects unsigned/expired JWTs** before reaching PgBouncer
+2. **Rejects unsigned/expired JWTs** before reaching application
 3. **Extracts claims** from validated JWT:
-   - `email` → `x-user-email` header
-   - `groups` → `x-user-groups` header
-4. **Application middleware** reads headers and injects session variables
+   - `email` → `x-user-email` HTTP header
+   - `groups` → `x-user-groups` HTTP header
+4. **Forwards HTTP request** to application with injected headers
+
+**Application Middleware:**
+1. **Reads headers** from HTTP request (`x-user-email`, `x-user-groups`)
+2. **Creates database connection** to PgBouncer (PostgreSQL wire protocol, no Istio)
+3. **Injects session variables** via SQL:
+   ```sql
+   BEGIN;
+   SET LOCAL role = 'user@example.com';  -- from x-user-email header
+   -- Execute queries (RLS enforced)
+   COMMIT;
+   ```
 
 **Network Policies (Kubernetes):**
 ```yaml
-# Only allow traffic to PgBouncer from pods with Istio sidecar
+# Example: Restrict PgBouncer access to application namespaces only
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: pgbouncer-access
+  namespace: cockroachdb
 spec:
+  podSelector:
+    matchLabels:
+      app: pgbouncer
   ingress:
   - from:
-    - podSelector:
+    - namespaceSelector:
         matchLabels:
-          istio-injection: enabled  # Must have Istio sidecar
+          name: app-services  # Only allow from application namespace
 ```
 
 **Why This Matters:** 
-- Applications cannot bypass JWT validation
-- Cannot forge session variables (Istio sets them from validated JWT)
-- Cannot connect directly to PgBouncer to inject fake identity
+- External users cannot reach applications without valid JWT
+- Applications cannot forge headers (Istio validates JWT before injecting headers)
+- Headers are only trusted because network enforces Istio sidecar on app pods
+- Database connections from apps to PgBouncer use PostgreSQL protocol (not HTTP)
 
 #### Layer 2: Service Account Permissions (RBAC Ceiling)
 
@@ -374,9 +390,10 @@ CREATE POLICY role_based_access ON accounts
 
 **Trust Model:**
 - Session variables (`app.current_user`, `app.current_roles`) are set by **application middleware**
-- Middleware reads headers injected by **Istio** (Layer 1)
-- Istio validates **JWT from Okta** (cryptographic proof)
-- Cannot be forged because application cannot reach PgBouncer without Istio
+- Middleware reads `x-user-email` and `x-user-groups` headers from HTTP requests
+- Headers are injected by **Istio sidecar** after validating **JWT from Okta** (cryptographic proof)
+- Headers cannot be forged by external users (Istio rejects requests without valid JWT)
+- Applications are trusted code in the `app-services` namespace (network-enforced Istio sidecar)
 
 **RLS Bypass:**
 - `admin` role has `BYPASSRLS` attribute (batch and admin pools)
@@ -422,24 +439,28 @@ CREATE USER pgb_app_user WITH LOGIN;  -- No PASSWORD clause
      "groups": ["crdb_advisor_team_east"]
    }
 
-2. User → Application (with JWT in Authorization header)
+2. User → Istio Ingress Gateway (HTTP request with JWT in Authorization header)
    ↓
-   Application passes JWT to Istio
+   Istio RequestAuthentication resource processes request
 
-3. Istio Sidecar
+3. Istio Ingress Gateway
    ↓
    • Validates JWT signature against Okta JWKS
-   • Checks expiration
+   • Checks issuer, audience, expiration
    • Extracts claims → injects headers:
      x-user-email: alice@example.com
      x-user-groups: crdb_advisor_team_east
    ↓
-   Forwards to Application
+   Routes HTTP request to Application Service
 
-4. Application Middleware
+4. Application Receives HTTP Request
    ↓
-   • Reads headers from Istio
-   • Wraps database transaction:
+   Reads headers: x-user-email, x-user-groups
+
+5. Application Middleware
+   ↓
+   • Reads headers from HTTP request
+   • Creates database connection and wraps transaction:
    
    BEGIN;
    SET LOCAL app.current_user = 'alice@example.com';
@@ -454,11 +475,12 @@ CREATE USER pgb_app_user WITH LOGIN;  -- No PASSWORD clause
    
    COMMIT;  -- Session variables automatically cleared
 
-5. Application → PgBouncer (app pool, port 5432)
+6. Application → PgBouncer (app pool, port 5432)
    ↓
    PgBouncer accepts connection (any username, auth_type=any)
+   PostgreSQL wire protocol connection (no Istio involvement)
 
-6. PgBouncer → CockroachDB
+7. PgBouncer → CockroachDB
    ↓
    • Authenticates as pgb_app_user (certificate)
    • CockroachDB verifies certificate against CA
@@ -470,23 +492,24 @@ CREATE USER pgb_app_user WITH LOGIN;  -- No PASSWORD clause
    ↓
    Returns only accounts for crdb_advisor_team_east parties
 
-7. Results → Application → User
+8. Results → Application → User
 ```
 
 ### Trust Model Summary
 
 **You ARE Trusting:**
 - **Okta** - to authenticate users and sign JWTs correctly
-- **Istio** - to validate JWTs and inject correct headers
-- **Application middleware** - to set session variables from headers (it's your code in your cluster)
-- **Network policies** - to prevent direct PgBouncer access
+- **Istio** - to validate JWTs and inject correct headers into HTTP requests
+- **Application middleware** - to read headers and set session variables correctly (it's your code in your cluster)
+- **Network policies** - to restrict which pods can reach PgBouncer (only apps in trusted namespaces)
 - **CockroachDB RBAC** - to enforce service account permission boundaries
 
 **You are NOT Trusting:**
-- **End users** - to provide correct identity (JWT cryptographically verified)
-- **Applications** - to bypass Istio (network enforced)
+- **End users** - to provide correct identity (JWT cryptographically verified by Istio)
+- **External callers** - to bypass JWT validation (Istio enforces at ingress gateway)
+- **Applications** - to forge headers (only Istio can inject headers after JWT validation)
 - **Service accounts** - to escalate privileges (RBAC enforced by CockroachDB)
-- **Session variables** - without validation chain (Istio → JWT → Okta)
+- **Session variables** - without validation chain (Istio validates JWT → injects headers → app sets session vars)
 
 **Defense in Depth:** Each layer independently enforces security:
 - **Network down?** → RBAC still limits operations

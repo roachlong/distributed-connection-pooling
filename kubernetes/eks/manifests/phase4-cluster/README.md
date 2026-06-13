@@ -510,10 +510,11 @@ See [manifests/phase5-pgbouncer/README.md](../phase5-pgbouncer/README.md)
 
 ### Phase 6: Istio Service Mesh
 
-Deploy Istio for JWT validation at ingress gateway:
+Deploy Istio for JWT validation and user identity propagation:
 - RequestAuthentication resource (validates Okta JWT tokens)
 - AuthorizationPolicy (requires valid JWT)
-- Extract groups claim and propagate to PgBouncer as session variables
+- Injects `x-user-email` and `x-user-groups` headers for application middleware
+- Application middleware uses headers to set session variables (`SET LOCAL role`) when connecting to PgBouncer
 
 See [manifests/phase6-istio/README.md](../phase6-istio/README.md)
 
