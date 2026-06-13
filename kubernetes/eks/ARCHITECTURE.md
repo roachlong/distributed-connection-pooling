@@ -17,7 +17,7 @@ This reference architecture implements a production-ready, multi-tenant Cockroac
 │  • End Users (Browser → Okta OIDC → JWT)                            │
 │  • Python Pipeline Scripts (Service Account Credentials)             │
 │  • DBA Tools (psql, DBeaver with Okta JWT)                          │
-│  • Power BI (Phase 10 - connects to PCR West standby)               │
+│  • Power BI (Phase 13 - connects to PCR West standby)               │
 └────────────────────────────┬─────────────────────────────────────────┘
                              │
                              ↓
@@ -571,7 +571,7 @@ EOF
 | End-user queries | App | 5432 | pgb_app_user | **Yes** | Application-layer queries with RLS |
 | DBA operations | Admin | 5434 | pgb_admin_user | No | Manual queries, troubleshooting |
 | Flyway migrations | Direct | 26257 | flyway_svc | No | Schema DDL (bypasses PgBouncer) |
-| Power BI (Phase 10) | Analytics | 5435 | pgb_analytics_user | Partial | Connects to PCR West, pre-filtered views |
+| Power BI (Phase 13) | Analytics | 5435 | pgb_analytics_user | Partial | Connects to PCR West, pre-filtered views |
 
 ### Why Flyway Bypasses PgBouncer
 
@@ -694,9 +694,17 @@ Phase 7: Flyway Schema Migrations
     ├─ Add RLS tables and policies (V015-V016)
     ├─ Bypasses PgBouncer, connects to :26257
     ↓
-Phase 8-9: Security, Observability (unchanged)
+Phase 8: Apache NiFi Data Flow Platform
+    ├─ ZooKeeper (3 nodes), Kafka (3 brokers)
+    ├─ NiFi cluster (3 nodes, dedicated r6i.4xlarge node group)
+    ├─ NiFi Registry (Git-backed flow versioning)
+    └─ JDBC to CockroachDB via PgBouncer batch pool (:5433)
     ↓
-Phase 10: Physical Cluster Replication (PCR)
+Phase 9-11: Enterprise Features, Observability, Security (unchanged)
+    ↓
+Phase 12: Audit Logging
+    ↓
+Phase 13: Physical Cluster Replication (PCR)
     ├─ Deploy West standby cluster
     ├─ Add Analytics Pool (100% of West capacity, port 5435)
     └─ Deploy Power BI client
@@ -914,7 +922,7 @@ All access logged via:
 
 ## Future Enhancements
 
-### Phase 10+: Analytics (PCR West Standby)
+### Phase 13+: Analytics (PCR West Standby)
 
 Deploy analytics pool pointing to West standby cluster:
 

@@ -14,12 +14,13 @@ Complete step-by-step deployment guide for the distributed connection pooling re
 - [Phase 5: PgBouncer Connection Pools](#phase-5-pgbouncer-connection-pools)
 - [Phase 6: Istio Service Mesh](#phase-6-istio-service-mesh)
 - [Phase 7: Flyway Schema Migrations](#phase-7-flyway-schema-migrations)
-- [Phase 8: Enterprise Features](#phase-8-enterprise-features)
-- [Phase 9: Observability Stack](#phase-9-observability-stack)
-- [Phase 10: Security Hardening](#phase-10-security-hardening)
-- [Phase 11: Audit Logging](#phase-11-audit-logging)
-- [Phase 12: Physical Cluster Replication (PCR)](#phase-12-physical-cluster-replication-pcr)
-- [Phase 13: GitOps (Optional)](#phase-13-gitops-optional)
+- [Phase 8: Apache NiFi Data Flow Platform](#phase-8-apache-nifi-data-flow-platform)
+- [Phase 9: Enterprise Features](#phase-9-enterprise-features)
+- [Phase 10: Observability Stack](#phase-10-observability-stack)
+- [Phase 11: Security Hardening](#phase-11-security-hardening)
+- [Phase 12: Audit Logging](#phase-12-audit-logging)
+- [Phase 13: Physical Cluster Replication (PCR)](#phase-13-physical-cluster-replication-pcr)
+- [Phase 14: GitOps (Optional)](#phase-14-gitops-optional)
 - [Post-Deployment Validation](#post-deployment-validation)
 - [Troubleshooting](#troubleshooting)
 - [Teardown](#teardown)
@@ -53,7 +54,7 @@ brew install gettext
 # istioctl (for Phase 6)
 brew install istioctl
 
-# ArgoCD CLI (for Phase 13, optional)
+# ArgoCD CLI (for Phase 14, optional)
 brew install argocd
 ```
 
@@ -85,7 +86,7 @@ aws sts get-caller-identity
 
 You'll need an Okta tenant with admin access to configure OIDC applications and groups. If you don't have one, sign up for a free developer account at https://developer.okta.com/.
 
-### CockroachDB Enterprise License (Phase 8)
+### CockroachDB Enterprise License (Phase 9)
 
 For enterprise features (backup/restore, encryption-at-rest, RBAC, changefeed), you'll need a CockroachDB Enterprise license. Request a trial license at https://www.cockroachlabs.com/get-started-cockroachdb/.
 
@@ -124,17 +125,19 @@ Phase 6: Istio Service Mesh (JWT Validation)
     ↓
 Phase 7: Flyway Schema Migrations
     ↓
-Phase 8: Enterprise Features (License, Encryption, Backups)
+Phase 8: Apache NiFi Data Flow Platform (ZooKeeper, Kafka, NiFi Cluster, Registry)
     ↓
-Phase 9: Observability Stack (Prometheus, Grafana, Alertmanager)
+Phase 9: Enterprise Features (License, Encryption, Backups)
     ↓
-Phase 10: Security Hardening (Network Policies, Pod Security, IRSA)
+Phase 10: Observability Stack (Prometheus, Grafana, Alertmanager)
     ↓
-Phase 11: Audit Logging (Fluent Bit, S3 Object Lock)
+Phase 11: Security Hardening (Network Policies, Pod Security, IRSA)
     ↓
-Phase 12: Physical Cluster Replication (PCR West Standby)
+Phase 12: Audit Logging (Fluent Bit, S3 Object Lock)
     ↓
-Phase 13: GitOps (ArgoCD, optional)
+Phase 13: Physical Cluster Replication (PCR West Standby)
+    ↓
+Phase 14: GitOps (ArgoCD, optional)
 ```
 
 ## Phase 0: Okta Configuration
@@ -865,7 +868,7 @@ kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
 
 Expected: `rowsecurity = t` (true) for both tables, and policies named `role_based_account_access` and `role_based_party_access`.
 
-## Phase 8: Enterprise Features
+## Phase 9: Enterprise Features
 
 Enable CockroachDB Enterprise features: licensing, backup/restore, encryption-at-rest, and changefeeds.
 
@@ -877,7 +880,7 @@ Enable CockroachDB Enterprise features: licensing, backup/restore, encryption-at
 ### Step 1: Set Enterprise License
 
 ```bash
-cd ../phase8-enterprise
+cd ../phase9-enterprise
 chmod +x setup.sh
 
 # Add your enterprise license to config.env
@@ -885,7 +888,7 @@ vi ../../config.env
 export CRDB_ENTERPRISE_LICENSE="your-license-key-here"
 ```
 
-### Step 2: Run Phase 8 Setup
+### Step 2: Run Phase 9 Setup
 
 ```bash
 ./setup.sh
@@ -938,14 +941,14 @@ kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
     --execute="SHOW BACKUPS IN 's3://${BACKUP_BUCKET_NAME}/cockroachdb/backups/manual?AWS_ACCESS_KEY_ID={ACCESS_KEY}&AWS_SECRET_ACCESS_KEY={SECRET_KEY}';"
 ```
 
-## Phase 9: Observability Stack
+## Phase 10: Observability Stack
 
 Deploy Prometheus, Grafana, and Alertmanager for monitoring, metrics, and alerting.
 
-### Step 1: Run Phase 9 Setup
+### Step 1: Run Phase 10 Setup
 
 ```bash
-cd ../phase9-observability
+cd ../phase10-observability
 chmod +x setup.sh
 ./setup.sh
 ```
@@ -1034,14 +1037,14 @@ kubectl port-forward -n monitoring svc/alertmanager-operated 9093:9093 &
 # You should see any active alerts (initially none if cluster is healthy)
 ```
 
-## Phase 10: Security Hardening
+## Phase 11: Security Hardening
 
 Apply security best practices: network policies, pod security standards, IRSA, and secrets management.
 
-### Step 1: Run Phase 10 Setup
+### Step 1: Run Phase 11 Setup
 
 ```bash
-cd ../phase10-security
+cd ../phase11-security
 chmod +x setup.sh
 ./setup.sh
 ```
@@ -1122,7 +1125,7 @@ kubectl exec -n cockroachdb example-crdb-cluster-0 -- \
     nc -zv example-crdb-cluster-1.example-crdb-cluster.cockroachdb 26257
 ```
 
-## Phase 11: Audit Logging
+## Phase 12: Audit Logging
 
 Deploy Fluent Bit to collect CockroachDB audit logs and ship them to S3 with Object Lock (WORM).
 
@@ -1131,10 +1134,10 @@ Deploy Fluent Bit to collect CockroachDB audit logs and ship them to S3 with Obj
 - S3 bucket for audit logs with Object Lock enabled (created in this phase)
 - IRSA configured for Fluent Bit service account (created in this phase)
 
-### Step 1: Run Phase 11 Setup
+### Step 1: Run Phase 12 Setup
 
 ```bash
-cd ../phase11-audit
+cd ../phase12-audit
 chmod +x setup.sh
 ./setup.sh
 ```
@@ -1228,13 +1231,13 @@ aws s3api head-object \
 
 Expected: Retention date 7 years in the future (for compliance).
 
-## Phase 12: Physical Cluster Replication (PCR)
+## Phase 13: Physical Cluster Replication (PCR)
 
 Deploy a second CockroachDB cluster in us-west-2 for disaster recovery using Physical Cluster Replication.
 
 ### Prerequisites
 
-- CockroachDB Enterprise license (Phase 8 must be completed)
+- CockroachDB Enterprise license (Phase 9 must be completed)
 - Second EKS cluster in us-west-2 (or create new one in this phase)
 
 ### Architecture
@@ -1263,7 +1266,7 @@ Deploy a second CockroachDB cluster in us-west-2 for disaster recovery using Phy
 ### Step 1: Create West EKS Cluster (if needed)
 
 ```bash
-cd ../phase12-pcr
+cd ../phase13-pcr
 
 # Update config.env with West region settings
 export AWS_REGION_WEST="us-west-2"
@@ -1275,7 +1278,7 @@ export EKS_CLUSTER_NAME_WEST="example-crdb-eks-west"
 
 This creates a separate EKS cluster in us-west-2 with the same configuration as East.
 
-### Step 2: Run Phase 12 Setup
+### Step 2: Run Phase 13 Setup
 
 ```bash
 chmod +x setup.sh
@@ -1396,14 +1399,14 @@ kubectl exec -n cockroachdb example-crdb-cluster-0 --context east-cluster -- \
     --execute="SELECT * FROM crdb_internal.cluster_replication_streams;"
 ```
 
-## Phase 13: GitOps (Optional)
+## Phase 14: GitOps (Optional)
 
 Deploy ArgoCD for GitOps-based application delivery and continuous deployment.
 
 ### Step 1: Install ArgoCD
 
 ```bash
-cd ../phase13-gitops
+cd ../phase14-gitops
 chmod +x setup.sh
 ./setup.sh
 ```
@@ -2062,7 +2065,7 @@ kubectl exec -n monitoring deployment/prometheus-kube-prometheus-grafana -- \
 # http://localhost:9090/graph?g0.expr=sql_query_count&g0.tab=0
 
 # Re-import dashboards if needed
-kubectl apply -f manifests/phase9-observability/grafana-dashboards/
+kubectl apply -f manifests/phase10-observability/grafana-dashboards/
 ```
 
 ### General Debugging
@@ -2139,22 +2142,23 @@ cd kubernetes/eks
 # Deletes: All phases 13 through 1
 ```
 
-**Delete only observability stack (Phase 9)**:
+**Delete only observability stack (Phase 10)**:
 ```bash
 ./teardown.sh --phase 9
-# Deletes: Phase 9 only (Prometheus, Grafana, Alertmanager)
+# Deletes: Phase 10 only (Prometheus, Grafana, Alertmanager)
 ```
 
 ### What Gets Deleted (by phase)
 
 The script automatically removes (in reverse order):
 
-- **Phase 13**: ArgoCD installation, Application definitions, GitOps workflow
-- **Phase 12**: West EKS cluster, PCR replication streams, analytics pool
-- **Phase 11**: Fluent Bit DaemonSet, S3 audit bucket with Object Lock
-- **Phase 10**: NetworkPolicies, Pod Security Standards, IRSA configurations
-- **Phase 9**: Prometheus, Grafana, Alertmanager, ServiceMonitors
-- **Phase 8**: S3 backup bucket, Enterprise license configuration, encryption keys
+- **Phase 14**: ArgoCD installation, Application definitions, GitOps workflow
+- **Phase 13**: West EKS cluster, PCR replication streams, analytics pool
+- **Phase 12**: Fluent Bit DaemonSet, S3 audit bucket with Object Lock
+- **Phase 11**: NetworkPolicies, Pod Security Standards, IRSA configurations
+- **Phase 10**: Prometheus, Grafana, Alertmanager, ServiceMonitors
+- **Phase 9**: S3 backup bucket, Enterprise license configuration, encryption keys
+- **Phase 8**: NiFi cluster, ZooKeeper, Kafka, NiFi Registry, all PVCs, nifi namespace
 - **Phase 7**: Flyway Jobs, migration ConfigMaps, RLS scripts
 - **Phase 6**: Istio control plane, ingress gateway, RequestAuthentication, AuthorizationPolicy
 - **Phase 5**: Three PgBouncer pools (app/batch/admin), services, certificates
@@ -2176,7 +2180,7 @@ The script automatically removes (in reverse order):
 - Takes 10-15 minutes to complete
 - EBS volumes with `reclaimPolicy: Retain` persist (default for safety)
 
-**S3 Object Lock (Phase 11)**:
+**S3 Object Lock (Phase 12)**:
 - Audit log objects with Object Lock cannot be deleted until 7-year retention expires
 - For testing: Use `Governance` mode (not `Compliance`) to allow admin override
 - The script will skip locked objects and warn about retention
@@ -2196,7 +2200,7 @@ After teardown completes, verify that all AWS resources have been removed:
 ```bash
 # Check for remaining EKS clusters
 aws eks list-clusters --region us-east-2
-aws eks list-clusters --region us-west-2  # If Phase 12 was deployed
+aws eks list-clusters --region us-west-2  # If Phase 13 was deployed
 
 # Check for remaining VPCs
 aws ec2 describe-vpcs --region us-east-2 --filters "Name=tag:Name,Values=example-crdb-*"
@@ -2242,7 +2246,7 @@ After successful deployment of all phases:
 2. **Load production data**: Migrate real data using Flyway or bulk import scripts
 3. **Configure monitoring alerts**: Set up PagerDuty/Slack integrations for Alertmanager
 4. **Run load tests**: Validate connection pool sizing under realistic load
-5. **DR exercise**: Test failover to West cluster (Phase 12)
+5. **DR exercise**: Test failover to West cluster (Phase 13)
 6. **Security audit**: Pen-testing, vulnerability scanning, compliance review
 7. **Performance tuning**: Optimize pool sizes, query plans, indexes based on observability data
 8. **Automate operations**: Expand GitOps to cover day-2 operations (scaling, upgrades, backups)

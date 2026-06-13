@@ -48,10 +48,10 @@ This reference architecture demonstrates a production-ready distributed connecti
 ## Prerequisites
 
 - **AWS Account**: Commercial AWS with permissions for EKS, VPCs, S3, IAM, KMS
-- **CLI Tools**: kubectl, helm, eksctl, aws CLI, istioctl, argocd (Phase 13 only)
+- **CLI Tools**: kubectl, helm, eksctl, aws CLI, istioctl, argocd (Phase 14 only)
 - **Okta Tenant**: Admin access to configure OIDC application and security groups
 - **HashiCorp Vault**: For PKI certificate management (deployed in Phase 2)
-- **CockroachDB Enterprise License**: For encryption-at-rest, backups, and PCR (Phase 8+)
+- **CockroachDB Enterprise License**: For encryption-at-rest, backups, and PCR (Phase 9+)
 - **Kubernetes Knowledge**: Basic familiarity with pods, services, deployments, configmaps
 
 ## Getting Started
@@ -75,19 +75,20 @@ kubernetes/eks/
 │   ├── phase5-pgbouncer/     # Three PgBouncer pools (app, batch, admin)
 │   ├── phase6-istio/         # Istio service mesh for JWT validation
 │   ├── phase7-flyway/        # Flyway schema migrations, RLS policies
-│   ├── phase8-enterprise/    # Enterprise license, encryption, backups
-│   ├── phase9-observability/ # Prometheus, Grafana, alerting
-│   ├── phase10-security/     # Network policies, IRSA, pod security
-│   ├── phase11-audit/        # Audit logging to S3 with Object Lock
-│   ├── phase12-pcr/          # Physical Cluster Replication (West standby)
-│   └── phase13-gitops/       # ArgoCD GitOps workflow (optional)
+│   ├── phase8-nifi/          # Apache NiFi cluster, ZooKeeper, Kafka, Registry
+│   ├── phase9-enterprise/    # Enterprise license, encryption, backups
+│   ├── phase10-observability/ # Prometheus, Grafana, alerting
+│   ├── phase11-security/     # Network policies, IRSA, pod security
+│   ├── phase12-audit/        # Audit logging to S3 with Object Lock
+│   ├── phase13-pcr/          # Physical Cluster Replication (West standby)
+│   └── phase14-gitops/       # ArgoCD GitOps workflow (optional)
 └── generated/                # Generated manifests, reference documentation
     └── references/           # Connectivity guide, RLS design docs
 ```
 
 ## Implementation Plan
 
-This reference architecture is built incrementally over 13 phases, where each phase is independently testable before moving to the next. This approach allows for incremental validation and troubleshooting.
+This reference architecture is built incrementally over 14 phases, where each phase is independently testable before moving to the next. This approach allows for incremental validation and troubleshooting.
 
 ### Phase Overview
 
@@ -101,14 +102,14 @@ This reference architecture is built incrementally over 13 phases, where each ph
 | **5** | [PgBouncer Pools](#phase-5-pgbouncer-connection-pools) | 2-3h | Phase 4 |
 | **6** | [Istio Service Mesh](#phase-6-istio-service-mesh) | 1-2h | Phase 5 |
 | **7** | [Flyway Migrations](#phase-7-flyway-schema-migrations) | 1-2h | Phase 6, sample-data-pipeline |
-| **8** | [Enterprise Features](#phase-8-enterprise-features) | 1-2h | Phase 7, Enterprise license |
-| **9** | [Observability Stack](#phase-9-observability-stack) | 2-3h | Phase 8 |
-| **10** | [Security Hardening](#phase-10-security-hardening) | 2-3h | Phase 9 |
-| **11** | [Audit Logging](#phase-11-audit-logging) | 2-3h | Phase 10 |
-| **12** | [PCR (Disaster Recovery)](#phase-12-physical-cluster-replication-pcr) | 4-6h | Phase 11, West region |
-| **13** | [GitOps](#phase-13-gitops-optional) _(optional)_ | 2-4h | Phase 12 |
+| **8** | [Enterprise Features](#phase-9-enterprise-features) | 1-2h | Phase 7, Enterprise license |
+| **9** | [Observability Stack](#phase-10-observability-stack) | 2-3h | Phase 9 |
+| **10** | [Security Hardening](#phase-11-security-hardening) | 2-3h | Phase 10 |
+| **11** | [Audit Logging](#phase-12-audit-logging) | 2-3h | Phase 11 |
+| **12** | [PCR (Disaster Recovery)](#phase-13-physical-cluster-replication-pcr) | 4-6h | Phase 12, West region |
+| **13** | [GitOps](#phase-14-gitops-optional) _(optional)_ | 2-4h | Phase 13 |
 
-**Total Estimated Time**: 25-40 hours (excludes optional Phase 13)
+**Total Estimated Time**: 25-40 hours (excludes optional Phase 14)
 
 ---
 
@@ -156,41 +157,50 @@ Deploy Flyway for automated schema migrations:
 - Add custom RLS scripts (role_party_access table, RLS policies)
 - Flyway connects directly to CockroachDB:26257 (bypasses PgBouncer)
 
-#### Phase 8: Enterprise Features
+#### Phase 8: Apache NiFi Data Flow Platform
+Deploy multi-node NiFi 2.x cluster as the data flow and ETL orchestration layer:
+- 3-node NiFi StatefulSet with dedicated r6i.4xlarge node group
+- ZooKeeper 3-node StatefulSet for cluster coordination
+- Kafka 3-broker StatefulSet for event streaming
+- NiFi Registry with Git-backed flow versioning
+- cert-manager TLS for all nodes, Istio passthrough for NiFi ports
+- CockroachDB JDBC via PgBouncer batch pool (port 5433, BYPASSRLS)
+
+#### Phase 9: Enterprise Features
 Enable Enterprise features with license:
 - S3 backups with IRSA (automated full + incremental)
 - Encryption-at-rest with customer-managed keys
 - Changefeeds for audit events
 
-#### Phase 9: Observability Stack
+#### Phase 10: Observability Stack
 Deploy Prometheus + Grafana monitoring:
 - ServiceMonitor for CockroachDB metrics
 - PgBouncer exporter for pool statistics
 - Pre-configured Grafana dashboards
 - Alert rules for cluster health
 
-#### Phase 10: Security Hardening
+#### Phase 11: Security Hardening
 Apply security best practices:
 - NetworkPolicies (deny-all default, explicit allow rules)
 - Pod Security Standards (restricted)
 - IRSA for S3 access (no hardcoded credentials)
 - Certificate rotation (90-day TTL)
 
-#### Phase 11: Audit Logging
+#### Phase 12: Audit Logging
 Deploy audit log pipeline to S3:
 - Enable CockroachDB audit logging (all SQL statements, auth events)
 - Fluent Bit DaemonSet for log collection
 - S3 bucket with Object Lock (7-year retention)
 - Optional Athena table for querying
 
-#### Phase 12: Physical Cluster Replication (PCR)
+#### Phase 13: Physical Cluster Replication (PCR)
 Deploy West standby cluster for disaster recovery:
 - Second EKS cluster in us-west-2
 - Physical replication from East (primary) to West (standby)
 - Analytics PgBouncer pool on West (100% of West capacity)
 - Automated failover scripts (manual invocation)
 
-#### Phase 13: GitOps (Optional)
+#### Phase 14: GitOps (Optional)
 Migrate to ArgoCD-based deployment workflow:
 - ArgoCD installation in both clusters
 - Application definitions for all phases
@@ -229,25 +239,26 @@ cd kubernetes/eks
 **Complete teardown (all phases)**:
 ```bash
 ./teardown.sh --all
-# Deletes: All phases 13 through 1
+# Deletes: All phases 14 through 1
 ```
 
-**Delete only observability stack (Phase 9)**:
+**Delete only observability stack (Phase 10)**:
 ```bash
 ./teardown.sh --phase 9
-# Deletes: Phase 9 only (Prometheus, Grafana, Alertmanager)
+# Deletes: Phase 10 only (Prometheus, Grafana, Alertmanager)
 ```
 
 ### What Gets Deleted (by phase)
 
 The script automatically removes (in reverse order):
 
-- **Phase 13**: ArgoCD installation, Application definitions, GitOps workflow
-- **Phase 12**: West EKS cluster, PCR replication streams, analytics pool
-- **Phase 11**: Fluent Bit DaemonSet, S3 audit bucket with Object Lock
-- **Phase 10**: NetworkPolicies, Pod Security Standards, IRSA configurations
-- **Phase 9**: Prometheus, Grafana, Alertmanager, ServiceMonitors
-- **Phase 8**: S3 backup bucket, Enterprise license configuration, encryption keys
+- **Phase 14**: ArgoCD installation, Application definitions, GitOps workflow
+- **Phase 13**: West EKS cluster, PCR replication streams, analytics pool
+- **Phase 12**: Fluent Bit DaemonSet, S3 audit bucket with Object Lock
+- **Phase 11**: NetworkPolicies, Pod Security Standards, IRSA configurations
+- **Phase 10**: Prometheus, Grafana, Alertmanager, ServiceMonitors
+- **Phase 9**: S3 backup bucket, Enterprise license configuration, encryption keys
+- **Phase 8**: NiFi cluster, ZooKeeper, Kafka, NiFi Registry, all PVCs, nifi namespace
 - **Phase 7**: Flyway Jobs, migration ConfigMaps, RLS scripts
 - **Phase 6**: Istio control plane, ingress gateway, RequestAuthentication, AuthorizationPolicy
 - **Phase 5**: Three PgBouncer pools (app/batch/admin), services, certificates
@@ -269,7 +280,7 @@ The script automatically removes (in reverse order):
 - Takes 10-15 minutes to complete
 - EBS volumes with `reclaimPolicy: Retain` persist (default for safety)
 
-**S3 Object Lock (Phase 11)**:
+**S3 Object Lock (Phase 12)**:
 - Audit log objects with Object Lock cannot be deleted until 7-year retention expires
 - For testing: Use `Governance` mode (not `Compliance`) to allow admin override
 - The script will skip locked objects and warn about retention
@@ -289,7 +300,7 @@ After teardown, check for orphaned resources:
 ```bash
 # Check for remaining EKS clusters
 aws eks list-clusters --region us-east-2
-aws eks list-clusters --region us-west-2  # If Phase 12 was deployed
+aws eks list-clusters --region us-west-2  # If Phase 13 was deployed
 
 # Check for orphaned VPCs
 aws ec2 describe-vpcs --region us-east-2 --filters "Name=tag:Name,Values=example-crdb-*"
@@ -350,13 +361,14 @@ If a phase fails:
 - [x] Phase 5: PgBouncer - **Single pool deployed, ready for three-pool refactor**
 - [ ] Phase 6: Istio Service Mesh - **Documentation complete**
 - [ ] Phase 7: Flyway Schema Migrations - **Documentation complete**
-- [ ] Phase 8: Enterprise Features - **Documentation complete**
-- [ ] Phase 9: Observability Stack - **Documentation complete**
-- [ ] Phase 10: Security Hardening - **Documentation complete**
-- [ ] Phase 11: Audit Logging - **Documentation complete**
-- [ ] Phase 12: Physical Cluster Replication - **Documentation complete**
-- [ ] Phase 13: GitOps (optional) - **Documentation complete**
+- [ ] Phase 8: Apache NiFi Data Flow Platform - **Architecture documented, implementation pending**
+- [ ] Phase 9: Enterprise Features - **Documentation complete**
+- [ ] Phase 10: Observability Stack - **Documentation complete**
+- [ ] Phase 11: Security Hardening - **Documentation complete**
+- [ ] Phase 12: Audit Logging - **Documentation complete**
+- [ ] Phase 13: Physical Cluster Replication - **Documentation complete**
+- [ ] Phase 14: GitOps (optional) - **Documentation complete**
 
-**Next**: Review documentation, then update Phases 4-7 for full data access controls implementation.
+**Next**: Complete Phases 6 (Istio) and 7 (Flyway), then implement Phase 8 (NiFi) data flow platform.
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for complete design and [DEPLOYMENT.md](./DEPLOYMENT.md) for step-by-step instructions.

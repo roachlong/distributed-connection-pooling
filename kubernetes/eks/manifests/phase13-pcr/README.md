@@ -1,4 +1,4 @@
-# Phase 10: Physical Cluster Replication (PCR)
+# Phase 13: Physical Cluster Replication (PCR)
 
 **Status**: Not yet implemented
 
@@ -8,7 +8,7 @@ Deploy secondary region (us-west-2) EKS cluster and configure active-passive PCR
 
 ## Implementation Notes
 
-When building Phase 10 setup script, apply the same auto-update logic for `KMS_KEY_ARN_WEST` as Phase 1 does for `KMS_KEY_ARN_EAST`:
+When building Phase 13 setup script, apply the same auto-update logic for `KMS_KEY_ARN_WEST` as Phase 1 does for `KMS_KEY_ARN_EAST`:
 
 ```bash
 # Auto-update config.env if:
@@ -21,7 +21,7 @@ fi
 
 ## Dependencies
 
-- Phase 1-9 completed in East region
+- Phase 1-12 completed in East region (including NiFi Phase 8, Enterprise Phase 9)
 - Transit Gateway or VPC peering configured between regions
 - Same configuration pattern as Phase 1 but for WEST region variables
 
