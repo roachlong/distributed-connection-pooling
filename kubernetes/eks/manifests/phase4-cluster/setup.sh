@@ -433,6 +433,17 @@ create_service_accounts() {
         GRANT admin TO flyway_svc WITH ADMIN OPTION;
         "
 
+    print_info "Configuring statement timeout for batch/pipeline service accounts (best practice)..."
+    kubectl exec -n "${CRDB_NAMESPACE}" "${POD_NAME}" -- \
+        ./cockroach sql --certs-dir=/cockroach/cockroach-certs -e "
+        -- Statement timeout prevents runaway queries from consuming cluster resources
+        -- Applied to batch/pipeline accounts only (not app pool - handled by application timeouts)
+        ALTER ROLE pgb_batch_user SET statement_timeout = '${BATCH_STATEMENT_TIMEOUT}';
+        ALTER ROLE flyway_svc SET statement_timeout = '${BATCH_STATEMENT_TIMEOUT}';
+        "
+
+    print_info "Statement timeout set to ${BATCH_STATEMENT_TIMEOUT} for batch/pipeline accounts"
+
     print_info "Service account users created successfully"
 }
 

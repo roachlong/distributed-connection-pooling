@@ -366,6 +366,25 @@ SET ROLE admin;
 - Batch pool: accessible from ETL pods only
 - Admin pool: accessible from admin tools only
 
+**Statement Timeout (Best Practice):**
+
+Batch and pipeline service accounts have statement timeout configured to prevent runaway queries:
+
+```sql
+-- Applied to batch/pipeline service accounts during Phase 4
+ALTER ROLE pgb_batch_user SET statement_timeout = '5min';
+ALTER ROLE nifi_svc SET statement_timeout = '5min';
+ALTER ROLE flyway_svc SET statement_timeout = '5min';
+```
+
+**Why This Matters:**
+- Prevents poorly written queries from consuming cluster resources indefinitely
+- Limits blast radius of query bugs (fails fast rather than degrading cluster performance)
+- Protects against accidental infinite loops or Cartesian products
+- Configurable per service account based on workload (default: 5 minutes)
+
+**Note:** App pool service accounts (`pgb_app_user`) do NOT have statement timeout by default - application-level timeouts should handle this to avoid disrupting user experience.
+
 #### Layer 3: RLS Policies (Data Filtering)
 
 **Enforcement:** Even with valid permissions, RLS filters which **rows** are visible.

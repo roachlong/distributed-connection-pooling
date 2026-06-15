@@ -240,6 +240,53 @@ Expected output:
 
 **Note**: Service accounts have LOGIN privilege but require certificate authentication - no password login is allowed. This will be used by PgBouncer in Phase 5 and Flyway in Phase 7.
 
+### Verify Statement Timeout (Best Practice)
+
+Check that statement timeout is configured for batch/pipeline service accounts to prevent runaway queries:
+
+```bash
+# Verify statement timeout configuration
+kubectl exec -n cockroachdb cockroachdb-east-0 -- ./cockroach sql --certs-dir=/cockroach/cockroach-certs --execute="
+SELECT 
+  role_name,
+  variable,
+  value
+FROM pg_catalog.pg_db_role_setting drs
+JOIN pg_catalog.pg_roles r ON drs.setconfig IS NOT NULL AND r.oid = drs.setrole
+WHERE variable = 'statement_timeout'
+ORDER BY role_name;
+"
+```
+
+Expected output:
+```
+    role_name    |      variable      | value
+-----------------+--------------------+--------
+ flyway_svc      | statement_timeout  | 5min
+ pgb_batch_user  | statement_timeout  | 5min
+```
+
+**Test statement timeout enforcement:**
+
+```bash
+# Test that long-running query is cancelled after timeout (should fail after 5 minutes)
+kubectl exec -n cockroachdb cockroachdb-east-0 -- ./cockroach sql --certs-dir=/cockroach/cockroach-certs --execute="
+SET ROLE pgb_batch_user;
+SELECT pg_sleep(400);  -- 400 seconds = 6.7 minutes (exceeds 5min timeout)
+"
+```
+
+Expected: Query should be cancelled with error:
+```
+ERROR: query execution canceled due to statement timeout
+```
+
+**Why This Matters:**
+- Prevents poorly written batch queries from consuming cluster resources indefinitely
+- Limits blast radius of query bugs (fails fast vs. degrading performance)
+- Protects against accidental infinite loops or Cartesian products
+- `pgb_app_user` does NOT have statement timeout (handled by application-level timeouts)
+
 ## Architecture
 
 ```
