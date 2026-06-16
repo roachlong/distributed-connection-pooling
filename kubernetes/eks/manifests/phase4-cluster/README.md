@@ -245,24 +245,37 @@ Expected output:
 Check that statement timeout is configured for batch/pipeline service accounts to prevent runaway queries:
 
 ```bash
-# Verify statement timeout configuration
+# Verify statement timeout for pgb_batch_user
 kubectl exec -n cockroachdb cockroachdb-east-0 -- ./cockroach sql --certs-dir=/cockroach/cockroach-certs --execute="
-SELECT 
-  rolname AS role_name,
-  unnest(rolconfig) AS setting
-FROM pg_catalog.pg_roles
-WHERE rolconfig IS NOT NULL
-  AND unnest(rolconfig) LIKE 'statement_timeout%'
-ORDER BY rolname;
+SET ROLE pgb_batch_user;
+SHOW statement_timeout;
+"
+
+# Verify statement timeout for flyway_svc
+kubectl exec -n cockroachdb cockroachdb-east-0 -- ./cockroach sql --certs-dir=/cockroach/cockroach-certs --execute="
+SET ROLE flyway_svc;
+SHOW statement_timeout;
+"
+
+# Verify pgb_app_user does NOT have timeout (should show default 0)
+kubectl exec -n cockroachdb cockroachdb-east-0 -- ./cockroach sql --certs-dir=/cockroach/cockroach-certs --execute="
+SET ROLE pgb_app_user;
+SHOW statement_timeout;
 "
 ```
 
-Expected output:
+Expected output for batch/pipeline roles (5 minutes):
 ```
-    role_name    |        setting
------------------+------------------------
- flyway_svc      | statement_timeout=5min
- pgb_batch_user  | statement_timeout=5min
+  statement_timeout
+--------------------
+  00:05:00
+```
+
+Expected output for pgb_app_user (no timeout - handled by application):
+```
+  statement_timeout
+--------------------
+  0
 ```
 
 **Test statement timeout enforcement:**
