@@ -240,58 +240,22 @@ Expected output:
 
 **Note**: Service accounts have LOGIN privilege but require certificate authentication - no password login is allowed. This will be used by PgBouncer in Phase 5 and Flyway in Phase 7.
 
-### Verify Statement Timeout (Best Practice)
+### Statement Timeout Configuration (Best Practice)
 
-Check that statement timeout is configured for batch/pipeline service accounts to prevent runaway queries:
+Phase 4 configures `statement_timeout` for batch/pipeline service accounts to prevent runaway queries:
 
-```bash
-# Verify statement timeout for pgb_batch_user
-kubectl exec -n cockroachdb cockroachdb-east-0 -- ./cockroach sql --certs-dir=/cockroach/cockroach-certs --execute="
-SET ROLE pgb_batch_user;
-SHOW statement_timeout;
-"
+- **pgb_batch_user**: 5 minutes (configured via `BATCH_STATEMENT_TIMEOUT`)
+- **flyway_svc**: 5 minutes (configured via `BATCH_STATEMENT_TIMEOUT`)
+- **pgb_app_user**: No timeout (handled by application-level timeouts)
 
-# Verify statement timeout for flyway_svc
-kubectl exec -n cockroachdb cockroachdb-east-0 -- ./cockroach sql --certs-dir=/cockroach/cockroach-certs --execute="
-SET ROLE flyway_svc;
-SHOW statement_timeout;
-"
+**Configuration applied during service account creation:**
 
-# Verify pgb_app_user does NOT have timeout (should show default 0)
-kubectl exec -n cockroachdb cockroachdb-east-0 -- ./cockroach sql --certs-dir=/cockroach/cockroach-certs --execute="
-SET ROLE pgb_app_user;
-SHOW statement_timeout;
-"
+```sql
+ALTER ROLE pgb_batch_user SET statement_timeout = '5min';
+ALTER ROLE flyway_svc SET statement_timeout = '5min';
 ```
 
-Expected output for batch/pipeline roles (5 minutes):
-```
-  statement_timeout
---------------------
-  00:05:00
-```
-
-Expected output for pgb_app_user (no timeout - handled by application):
-```
-  statement_timeout
---------------------
-  0
-```
-
-**Test statement timeout enforcement:**
-
-```bash
-# Test that long-running query is cancelled after timeout (should fail after 5 minutes)
-kubectl exec -n cockroachdb cockroachdb-east-0 -- ./cockroach sql --certs-dir=/cockroach/cockroach-certs --execute="
-SET ROLE pgb_batch_user;
-SELECT pg_sleep(400);  -- 400 seconds = 6.7 minutes (exceeds 5min timeout)
-"
-```
-
-Expected: Query should be cancelled with error:
-```
-ERROR: query execution canceled due to statement timeout
-```
+**Note:** Timeout verification is performed in **Phase 5** when PgBouncer pools authenticate as these service accounts using their client certificates. Session variable defaults set by `ALTER ROLE ... SET` only apply at connection time (when authenticating as the role), not when using `SET ROLE` to switch roles.
 
 **Why This Matters:**
 - Prevents poorly written batch queries from consuming cluster resources indefinitely
