@@ -280,7 +280,48 @@ kubectl get gateway -n istio-system
 # See generated/phase6/sample-virtualservice.yaml for template
 ```
 
-### Get Ingress Gateway External Endpoint
+### Testing Without Ingress Gateway (In-Cluster Methods)
+
+If `ENABLE_ISTIO_INGRESS="false"`, you can test JWT authentication using in-cluster methods:
+
+**Option 1: Port-Forward to Test Application**
+
+```bash
+# Deploy a test app (see Phase 7 or TESTING_CHECKLIST.md)
+kubectl port-forward -n app-services deployment/your-test-app 8080:8080
+
+# Test from your local machine with JWT token
+curl -H "Authorization: Bearer $JWT_TOKEN" http://localhost:8080/api/test
+```
+
+**Option 2: Exec into Pod and Test Internally**
+
+```bash
+# Exec into any pod in the mesh
+kubectl exec -it -n app-services deployment/your-test-app -- sh
+
+# Make requests with JWT from inside the cluster
+curl -H "Authorization: Bearer $JWT_TOKEN" http://some-service.app-services:8080/api
+```
+
+**Option 3: Deploy Test Client Pod**
+
+```bash
+# Deploy a curl pod in the app-services namespace
+kubectl run test-client -n app-services --rm -it --restart=Never \
+    --image=curlimages/curl -- sh
+
+# Then make requests with JWT tokens
+curl -H "Authorization: Bearer $JWT_TOKEN" http://your-service:8080/api
+```
+
+**Key Points:**
+- Istio sidecar validates JWT for **all** traffic in `app-services` namespace (not just ingress)
+- `RequestAuthentication` and `AuthorizationPolicy` apply to in-cluster service-to-service calls
+- Ingress gateway is only needed for external → cluster traffic
+- Testing via port-forward or kubectl exec works the same as external ingress
+
+### Get Ingress Gateway External Endpoint (If Enabled)
 
 ```bash
 export INGRESS_HOST=$(kubectl get svc -n istio-system istio-ingressgateway \
@@ -291,6 +332,8 @@ echo $INGRESS_HOST
 ```
 
 **Important**: It may take 2-3 minutes for the AWS NLB to provision and become healthy.
+
+**Note**: If ingress gateway is disabled (`ENABLE_ISTIO_INGRESS="false"`), use in-cluster testing methods above.
 
 ---
 
