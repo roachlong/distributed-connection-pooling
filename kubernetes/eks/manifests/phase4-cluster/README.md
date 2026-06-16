@@ -248,22 +248,21 @@ Check that statement timeout is configured for batch/pipeline service accounts t
 # Verify statement timeout configuration
 kubectl exec -n cockroachdb cockroachdb-east-0 -- ./cockroach sql --certs-dir=/cockroach/cockroach-certs --execute="
 SELECT 
-  role_name,
-  variable,
-  value
-FROM pg_catalog.pg_db_role_setting drs
-JOIN pg_catalog.pg_roles r ON drs.setconfig IS NOT NULL AND r.oid = drs.setrole
-WHERE variable = 'statement_timeout'
-ORDER BY role_name;
+  rolname AS role_name,
+  unnest(rolconfig) AS setting
+FROM pg_catalog.pg_roles
+WHERE rolconfig IS NOT NULL
+  AND unnest(rolconfig) LIKE 'statement_timeout%'
+ORDER BY rolname;
 "
 ```
 
 Expected output:
 ```
-    role_name    |      variable      | value
------------------+--------------------+--------
- flyway_svc      | statement_timeout  | 5min
- pgb_batch_user  | statement_timeout  | 5min
+    role_name    |        setting
+-----------------+------------------------
+ flyway_svc      | statement_timeout=5min
+ pgb_batch_user  | statement_timeout=5min
 ```
 
 **Test statement timeout enforcement:**
