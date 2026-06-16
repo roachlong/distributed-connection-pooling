@@ -304,6 +304,59 @@ Expected output for each pool:
  pgb_admin_user | production       # Admin pool
 ```
 
+### Verify Statement Timeout Configuration
+
+Verify that `statement_timeout` is configured for batch/pipeline service accounts (from Phase 4):
+
+```bash
+# Test batch pool - should show 5 minute timeout
+kubectl run test-timeout-batch --rm -i --restart=Never --namespace=cockroachdb \
+    --image=postgres:16-alpine --command -- \
+    psql "postgresql://test@pgbouncer-batch:5433/production?sslmode=require" \
+    -c "SHOW statement_timeout;"
+
+# Test app pool - should show no timeout (0)
+kubectl run test-timeout-app --rm -i --restart=Never --namespace=cockroachdb \
+    --image=postgres:16-alpine --command -- \
+    psql "postgresql://test@pgbouncer-app:5432/production?sslmode=require" \
+    -c "SHOW statement_timeout;"
+```
+
+Expected output:
+```
+# Batch pool (pgb_batch_user has timeout from Phase 4)
+ statement_timeout 
+-------------------
+ 300000           # 5 minutes in milliseconds
+
+# App pool (pgb_app_user has no timeout - handled by application)
+ statement_timeout 
+-------------------
+ 0
+```
+
+**Test timeout enforcement (batch pool only):**
+
+```bash
+# This should fail after 5 minutes with statement timeout error
+kubectl run test-timeout-enforcement --rm -i --restart=Never --namespace=cockroachdb \
+    --image=postgres:16-alpine --command -- \
+    psql "postgresql://test@pgbouncer-batch:5433/production?sslmode=require" \
+    -c "SELECT pg_sleep(400);"
+```
+
+Expected: Query cancelled after 5 minutes:
+```
+ERROR: query execution canceled due to statement timeout
+```
+
+**Why This Matters:**
+- PgBouncer authenticates to CockroachDB using service account client certificates
+- Session variable defaults configured in Phase 4 (`ALTER ROLE ... SET statement_timeout`) apply at connection time
+- Batch pool connections inherit the 5-minute timeout from `pgb_batch_user` role
+- App pool connections have no timeout (controlled by application logic)
+- Protects cluster from runaway batch queries while keeping app queries flexible
+
 ### Check PgBouncer Statistics
 
 ```bash
