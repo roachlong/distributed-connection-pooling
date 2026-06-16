@@ -368,22 +368,50 @@ SET ROLE admin;
 
 **Statement Timeout (Best Practice):**
 
-Batch and pipeline service accounts have statement timeout configured to prevent runaway queries:
+Configure role-level statement timeouts to prevent runaway queries from consuming cluster resources. CockroachDB supports `ALTER ROLE ... SET statement_timeout`, which applies at connection time when authenticating as the role.
+
+**Timeout Strategy by Workload:**
 
 ```sql
--- Applied to batch/pipeline service accounts during Phase 4
+-- Batch/ETL jobs - shorter timeout for frequent, repeatable operations
 ALTER ROLE pgb_batch_user SET statement_timeout = '5min';
-ALTER ROLE nifi_svc SET statement_timeout = '5min';
-ALTER ROLE flyway_svc SET statement_timeout = '5min';
+
+-- Schema migrations - longer timeout for DDL, index creation, backfills
+ALTER ROLE flyway_svc SET statement_timeout = '30min';
+
+-- App pool - no timeout (handled by application-level timeouts)
+-- pgb_app_user has no role-level timeout
 ```
+
+**Rationale:**
+
+1. **Batch Jobs (5 min)**: ETL and data pipelines are frequent, repeatable operations. Failing fast prevents cascading issues.
+
+2. **Schema Migrations (30 min)**: Flyway migrations can include:
+   - Creating indexes on large tables (10-30+ minutes)
+   - Backfilling data after schema changes
+   - Complex ALTER TABLE operations
+   - Large-scale data migrations
+
+3. **App Pool (no timeout)**: Application connections manage their own timeouts based on business logic. A global timeout would be too restrictive for legitimate long-running reports or analytics queries.
+
+**How It Works:**
+- Session variable defaults set via `ALTER ROLE ... SET` apply **at connection time** (when authenticating with the role's client certificate)
+- PgBouncer pools authenticate to CockroachDB using service account client certificates, inheriting the role's timeout
+- The timeout does NOT apply when using `SET ROLE` to switch roles within an existing session
+
+**Defense in Depth:**
+- PgBouncer `query_timeout` can be set as an additional backstop
+- Application-level timeouts provide fine-grained control for specific queries
+- Avoid database-level `ALTER DATABASE ... SET` (too broad - affects all connections)
 
 **Why This Matters:**
 - Prevents poorly written queries from consuming cluster resources indefinitely
 - Limits blast radius of query bugs (fails fast rather than degrading cluster performance)
 - Protects against accidental infinite loops or Cartesian products
-- Configurable per service account based on workload (default: 5 minutes)
+- Different workloads have different legitimate timeout requirements
 
-**Note:** App pool service accounts (`pgb_app_user`) do NOT have statement timeout by default - application-level timeouts should handle this to avoid disrupting user experience.
+**Recommendation**: Configure `query_timeout` in PgBouncer batch pool (Phase 5) as the infrastructure-level control.
 
 #### Layer 3: RLS Policies (Data Filtering)
 

@@ -439,10 +439,10 @@ create_service_accounts() {
         -- Statement timeout prevents runaway queries from consuming cluster resources
         -- Applied to batch/pipeline accounts only (not app pool - handled by application timeouts)
         ALTER ROLE pgb_batch_user SET statement_timeout = '${BATCH_STATEMENT_TIMEOUT}';
-        ALTER ROLE flyway_svc SET statement_timeout = '${BATCH_STATEMENT_TIMEOUT}';
+        ALTER ROLE flyway_svc SET statement_timeout = '${FLYWAY_STATEMENT_TIMEOUT}';
         "
 
-    print_info "Statement timeout set to ${BATCH_STATEMENT_TIMEOUT} for batch/pipeline accounts"
+    print_info "Statement timeout set: pgb_batch_user=${BATCH_STATEMENT_TIMEOUT}, flyway_svc=${FLYWAY_STATEMENT_TIMEOUT}"
 
     print_info "Service account users created successfully"
 }

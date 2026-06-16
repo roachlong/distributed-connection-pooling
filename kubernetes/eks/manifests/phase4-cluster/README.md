@@ -242,26 +242,29 @@ Expected output:
 
 ### Statement Timeout Configuration (Best Practice)
 
-Phase 4 configures `statement_timeout` for batch/pipeline service accounts to prevent runaway queries:
+Phase 4 configures `statement_timeout` for batch/pipeline service accounts to prevent runaway queries. Different workloads have different timeout requirements:
 
 - **pgb_batch_user**: 5 minutes (configured via `BATCH_STATEMENT_TIMEOUT`)
-- **flyway_svc**: 5 minutes (configured via `BATCH_STATEMENT_TIMEOUT`)
+  - ETL/batch jobs - frequent, repeatable operations that should fail fast
+- **flyway_svc**: 30 minutes (configured via `FLYWAY_STATEMENT_TIMEOUT`)
+  - Schema migrations - DDL, index creation, backfills can legitimately take 10-30+ minutes
 - **pgb_app_user**: No timeout (handled by application-level timeouts)
+  - Application queries need flexible timeouts based on business logic
 
 **Configuration applied during service account creation:**
 
 ```sql
 ALTER ROLE pgb_batch_user SET statement_timeout = '5min';
-ALTER ROLE flyway_svc SET statement_timeout = '5min';
+ALTER ROLE flyway_svc SET statement_timeout = '30min';
 ```
 
 **Note:** Timeout verification is performed in **Phase 5** when PgBouncer pools authenticate as these service accounts using their client certificates. Session variable defaults set by `ALTER ROLE ... SET` only apply at connection time (when authenticating as the role), not when using `SET ROLE` to switch roles.
 
 **Why This Matters:**
-- Prevents poorly written batch queries from consuming cluster resources indefinitely
+- Prevents poorly written queries from consuming cluster resources indefinitely
 - Limits blast radius of query bugs (fails fast vs. degrading performance)
 - Protects against accidental infinite loops or Cartesian products
-- `pgb_app_user` does NOT have statement timeout (handled by application-level timeouts)
+- Different workloads require different timeout thresholds (batch vs. migrations vs. apps)
 
 ## Architecture
 
