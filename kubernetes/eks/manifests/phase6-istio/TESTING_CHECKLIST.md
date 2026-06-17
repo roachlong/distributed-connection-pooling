@@ -233,23 +233,36 @@ kubectl run test-client --rm -i --restart=Never --namespace=app-services \
 **Get JWT from Okta using Authorization Code Flow:**
 
 ```bash
-# Option 1: Use existing JWT from okta-crdb-sync or other tools (easiest)
+# Option 1: Use existing JWT from okta-crdb-sync (if available)
 export JWT=$(cat ~/.crdb-token | jq -r '.id_token')
 
-# Option 2: Get new JWT via browser (authorization code flow)
+# Option 2: Get new JWT via OAuth2 authorization code flow
 # Step 1: Build authorization URL
-AUTH_URL="${OKTA_ISSUER}/v1/authorize?client_id=${OKTA_CLIENT_ID}&response_type=id_token&scope=openid%20profile%20email%20groups&redirect_uri=http://localhost:8765/callback&state=test&nonce=$(date +%s)"
+AUTH_URL="${OKTA_ISSUER}/v1/authorize?client_id=${OKTA_CLIENT_ID}&response_type=code&scope=openid%20profile%20email%20groups&redirect_uri=http://localhost:8765/callback&state=test&nonce=$(date +%s)"
 
 echo "Open this URL in your browser:"
 echo $AUTH_URL
 
 # Step 2: After logging in, Okta redirects to:
-#   http://localhost:8765/callback#id_token=eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
+#   http://localhost:8765/callback?code=abc123...&state=test
 # 
-# Step 3: Copy the id_token value from the URL (everything after id_token= and before &)
-# Note: The redirect will fail (localhost:8765 not listening), but that's OK - we just need the token from URL
+# Copy the authorization code from the URL (the value after code= and before &state)
+# Note: The redirect will fail (localhost:8765 not listening), but that's OK - we just need the code from URL
 
-export JWT="<paste id_token value here>"
+export AUTH_CODE="<paste authorization code here>"
+
+# Step 3: Exchange authorization code for tokens
+# Note: You'll need your client_secret from Okta app settings
+export CLIENT_SECRET="<your-okta-client-secret>"
+
+export JWT=$(curl -k -s -X POST ${OKTA_ISSUER}/v1/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=authorization_code" \
+  -d "client_id=${OKTA_CLIENT_ID}" \
+  -d "client_secret=${CLIENT_SECRET}" \
+  -d "code=${AUTH_CODE}" \
+  -d "redirect_uri=http://localhost:8765/callback" \
+  | jq -r '.id_token')
 
 # Verify JWT claims
 echo $JWT | cut -d. -f2 | base64 -d | jq .
@@ -260,7 +273,10 @@ echo $JWT | cut -d. -f2 | base64 -d | jq .
 # - groups: ["crdb_advisor_team_east"] or similar
 ```
 
-**Note:** Authorization code flow is the recommended OAuth2 grant type for production applications. The password grant type (username/password via curl) is deprecated and should not be enabled.
+**Note:** 
+- Authorization code flow is the standard OAuth2 grant type for production applications
+- The `-k` flag (or `--insecure`) skips SSL certificate verification (use only for testing with self-signed certificates)
+- The authorization code is exchanged for tokens using `client_secret`, which should be kept secure
 
 **Test with JWT:**
 ```bash
@@ -838,13 +854,23 @@ kubectl run test-client --rm -i --restart=Never --namespace=app-services \
 
 # 2. Get a new JWT token (old one still has east group claim)
 # Build authorization URL
-AUTH_URL_WEST="${OKTA_ISSUER}/v1/authorize?client_id=${OKTA_CLIENT_ID}&response_type=id_token&scope=openid%20profile%20email%20groups&redirect_uri=http://localhost:8765/callback&state=test&nonce=$(date +%s)"
+AUTH_URL_WEST="${OKTA_ISSUER}/v1/authorize?client_id=${OKTA_CLIENT_ID}&response_type=code&scope=openid%20profile%20email%20groups&redirect_uri=http://localhost:8765/callback&state=test&nonce=$(date +%s)"
 
 echo "Open this URL in your browser to get new token with updated groups:"
 echo $AUTH_URL_WEST
 
-# After logging in, copy id_token from redirect URL
-export JWT_WEST="<paste new id_token here>"
+# After logging in, copy authorization code from redirect URL
+export AUTH_CODE_WEST="<paste authorization code here>"
+
+# Exchange code for tokens
+export JWT_WEST=$(curl -k -s -X POST ${OKTA_ISSUER}/v1/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=authorization_code" \
+  -d "client_id=${OKTA_CLIENT_ID}" \
+  -d "client_secret=${CLIENT_SECRET}" \
+  -d "code=${AUTH_CODE_WEST}" \
+  -d "redirect_uri=http://localhost:8765/callback" \
+  | jq -r '.id_token')
 
 # 3. Verify new JWT has west group
 echo $JWT_WEST | cut -d. -f2 | base64 -d | jq .groups
