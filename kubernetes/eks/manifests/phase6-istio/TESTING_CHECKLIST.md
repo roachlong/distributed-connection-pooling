@@ -495,7 +495,9 @@ INSERT INTO test_rls_data (team_role, data) VALUES
     ('crdb_advisor_team_east', 'Sensitive data for East team - Query 2'),
     ('crdb_advisor_team_west', 'Sensitive data for West team - Query 1'),
     ('crdb_advisor_team_west', 'Sensitive data for West team - Query 2'),
-    ('crdb_advisor_team_central', 'Sensitive data for Central team - Query 1');
+    ('crdb_advisor_team_central', 'Sensitive data for Central team - Query 1'),
+    ('crdb_dev', 'Developer environment data - Query 1'),
+    ('crdb_dev', 'Developer environment data - Query 2');
 
 -- Grant permissions to app pool service account
 GRANT SELECT ON test_rls_data TO pgb_app_user;
@@ -503,10 +505,11 @@ GRANT SELECT ON test_rls_data TO pgb_app_user;
 -- Enable RLS
 ALTER TABLE test_rls_data ENABLE ROW LEVEL SECURITY;
 
--- Create RLS policy that filters by session variable
+-- Create RLS policy that filters by session variable (supports multiple groups)
+-- app.current_roles will be comma-separated: "crdb_dev,crdb_advisor_team_east"
 CREATE POLICY team_isolation ON test_rls_data
     FOR SELECT
-    USING (team_role = current_setting('app.current_roles', true));
+    USING (team_role = ANY(string_to_array(current_setting('app.current_roles', true), ',')));
 
 -- Verify table and data
 SELECT team_role, COUNT(*) FROM test_rls_data GROUP BY team_role;
@@ -518,12 +521,13 @@ SELECT team_role, COUNT(*) FROM test_rls_data GROUP BY team_role;
 #  crdb_advisor_team_east    |     2
 #  crdb_advisor_team_west    |     2
 #  crdb_advisor_team_central |     1
+#  crdb_dev                  |     2
 ```
 
 **What This Sets Up:**
-- ✅ Test table with team-specific data
-- ✅ RLS policy that filters by `app.current_roles` session variable
-- ✅ Different teams see different data (East sees only East data, etc.)
+- ✅ Test table with team-specific data (7 total rows)
+- ✅ RLS policy that filters by `app.current_roles` session variable (supports multiple groups)
+- ✅ Users with multiple groups see data from ALL their groups (not just one)
 
 ### 9b. Deploy Sample Application
 
@@ -540,6 +544,8 @@ data:
     from flask import Flask, request, jsonify
     import psycopg2
     import os
+    import base64
+    import json
 
     app = Flask(__name__)
 
@@ -548,6 +554,24 @@ data:
     DB_PORT = "5432"
     DB_NAME = "production"
     DB_SSLMODE = "require"
+
+    def decode_groups_header(groups_header):
+        """Decode Istio-injected groups header (may be base64 encoded array)"""
+        if not groups_header:
+            return ""
+        
+        try:
+            # Try to decode as base64 (Istio encodes arrays)
+            decoded = base64.b64decode(groups_header).decode('utf-8')
+            # Parse as JSON array
+            groups_array = json.loads(decoded)
+            if isinstance(groups_array, list):
+                # Convert to comma-separated string for SET LOCAL
+                return ','.join(groups_array)
+            return str(groups_array)
+        except Exception:
+            # If not base64 or not JSON, use as-is (plain string)
+            return groups_header
 
     @app.route('/health')
     def health():
@@ -559,7 +583,7 @@ data:
         
         # Step 1: Read Istio-injected headers
         user_email = request.headers.get('x-user-email', 'unknown')
-        user_groups = request.headers.get('x-user-groups', '')
+        user_groups_raw = request.headers.get('x-user-groups', '')
         
         if user_email == 'unknown':
             return jsonify({
@@ -568,7 +592,10 @@ data:
             }), 401
         
         try:
-            # Step 2: Connect to PgBouncer as pgb_app_user
+            # Step 2: Decode groups header (handles base64 encoded arrays)
+            user_groups = decode_groups_header(user_groups_raw)
+            
+            # Step 3: Connect to PgBouncer as pgb_app_user
             conn = psycopg2.connect(
                 host=DB_HOST,
                 port=DB_PORT,
@@ -578,15 +605,15 @@ data:
             )
             cur = conn.cursor()
             
-            # Step 3: Set session variables for RLS
+            # Step 4: Set session variables for RLS
             cur.execute("SET LOCAL app.current_user = %s", (user_email,))
             cur.execute("SET LOCAL app.current_roles = %s", (user_groups,))
             
-            # Step 4: Query RLS-protected table (should only see data for user's team)
-            cur.execute("SELECT id, team_role, data, created_at FROM test_rls_data ORDER BY created_at")
+            # Step 5: Query RLS-protected table (should see data for ALL user's groups)
+            cur.execute("SELECT id, team_role, data, created_at FROM test_rls_data ORDER BY team_role, created_at")
             rows = cur.fetchall()
             
-            # Step 5: Also get total count without RLS (as superuser for comparison)
+            # Step 6: Get total count for comparison
             cur.execute("SELECT COUNT(*) FROM test_rls_data")
             total_rows = cur.fetchone()[0]
             
@@ -598,7 +625,8 @@ data:
                 "message": "RLS filtering successful",
                 "user_identity": {
                     "email": user_email,
-                    "groups": user_groups
+                    "groups_raw": user_groups_raw,
+                    "groups_decoded": user_groups
                 },
                 "rls_filtered_data": [
                     {
@@ -610,7 +638,7 @@ data:
                 ],
                 "visible_rows": len(rows),
                 "total_rows_in_table": total_rows,
-                "proof": f"User with role '{user_groups}' sees {len(rows)} of {total_rows} rows (RLS filtering worked!)"
+                "proof": f"User with groups '{user_groups}' sees {len(rows)} of {total_rows} rows (RLS filtering worked!)"
             }), 200
             
         except Exception as e:
@@ -622,7 +650,7 @@ data:
         
         # Step 1: Read Istio-injected headers
         user_email = request.headers.get('x-user-email', 'unknown')
-        user_groups = request.headers.get('x-user-groups', '')
+        user_groups_raw = request.headers.get('x-user-groups', '')
         
         if user_email == 'unknown':
             return jsonify({
@@ -631,30 +659,31 @@ data:
             }), 401
         
         try:
-            # Step 2: Connect to PgBouncer as pgb_app_user (service account)
-            # Note: All users connect as the same service account
+            # Step 2: Decode groups header
+            user_groups = decode_groups_header(user_groups_raw)
+            
+            # Step 3: Connect to PgBouncer as pgb_app_user (service account)
             conn = psycopg2.connect(
                 host=DB_HOST,
                 port=DB_PORT,
                 database=DB_NAME,
-                user="test",  # PgBouncer auth_type=any allows any username
+                user="test",
                 sslmode=DB_SSLMODE
             )
             cur = conn.cursor()
             
-            # Step 3: Middleware pattern - set session variables for RLS
+            # Step 4: Middleware pattern - set session variables for RLS
             cur.execute("SET LOCAL app.current_user = %s", (user_email,))
             cur.execute("SET LOCAL app.current_roles = %s", (user_groups,))
             
-            # Step 4: Verify session context
+            # Step 5: Verify session context
             cur.execute("SHOW app.current_user")
             current_user = cur.fetchone()[0]
             
             cur.execute("SHOW app.current_roles")
             current_roles = cur.fetchone()[0]
             
-            # Step 5: Query that would be subject to RLS (example)
-            # In real app, this would query tables with RLS policies
+            # Step 6: Query database info
             cur.execute("SELECT current_user, session_user, current_database()")
             db_info = cur.fetchone()
             
@@ -666,7 +695,8 @@ data:
                 "message": "Auth flow successful",
                 "user_identity": {
                     "email": user_email,
-                    "groups": user_groups
+                    "groups_raw": user_groups_raw,
+                    "groups_decoded": user_groups
                 },
                 "session_context": {
                     "app_current_user": current_user,
@@ -808,11 +838,11 @@ kubectl run test-client --rm -i --restart=Never --namespace=app-services \
 
 This is the **critical test** that proves RLS actually filters data based on JWT groups.
 
-**First test: With crdb_advisor_team_east group**
+**First test: With current groups (crdb_dev, crdb_advisor_team_east)**
 
 ```bash
 # Call /rls-test endpoint with JWT (use JWT from Test 7b)
-# Your JWT should have groups claim: "crdb_advisor_team_east"
+# Your JWT has groups claim: ["crdb_dev", "crdb_advisor_team_east"]
 kubectl run test-client --rm -i --restart=Never --namespace=app-services \
   --image=curlimages/curl:latest -- \
   curl -s -H "Authorization: Bearer $JWT" http://sample-auth-app:8080/rls-test | jq .
@@ -822,9 +852,22 @@ kubectl run test-client --rm -i --restart=Never --namespace=app-services \
 #   "message": "RLS filtering successful",
 #   "user_identity": {
 #     "email": "your-email@example.com",
-#     "groups": "crdb_advisor_team_east"
+#     "groups_raw": "WyJjcmRiX2RldiIsImNyZGJfYWR2aXNvcl90ZWFtX2Vhc3QiXQ==",
+#     "groups_decoded": "crdb_dev,crdb_advisor_team_east"
 #   },
 #   "rls_filtered_data": [
+#     {
+#       "id": "...",
+#       "team_role": "crdb_dev",
+#       "data": "Developer environment data - Query 1",
+#       "created_at": "..."
+#     },
+#     {
+#       "id": "...",
+#       "team_role": "crdb_dev",
+#       "data": "Developer environment data - Query 2",
+#       "created_at": "..."
+#     },
 #     {
 #       "id": "...",
 #       "team_role": "crdb_advisor_team_east",
@@ -838,16 +881,17 @@ kubectl run test-client --rm -i --restart=Never --namespace=app-services \
 #       "created_at": "..."
 #     }
 #   ],
-#   "visible_rows": 2,
-#   "total_rows_in_table": 5,
-#   "proof": "User with role 'crdb_advisor_team_east' sees 2 of 5 rows (RLS filtering worked!)"
+#   "visible_rows": 4,
+#   "total_rows_in_table": 7,
+#   "proof": "User with groups 'crdb_dev,crdb_advisor_team_east' sees 4 of 7 rows (RLS filtering worked!)"
 # }
 ```
 
 **What This Proves:**
-- ✅ User with `crdb_advisor_team_east` sees **only 2 rows** (East team data)
+- ✅ User with MULTIPLE groups sees data from **ALL their groups** (4 rows: 2 from crdb_dev + 2 from crdb_advisor_team_east)
 - ✅ **Cannot see** the 3 rows for West/Central teams (RLS filtered them out)
-- ✅ RLS policy is enforcing based on `app.current_roles` session variable
+- ✅ RLS policy uses `ANY` to match against comma-separated groups
+- ✅ Istio base64-encodes array groups → app decodes → converts to comma-separated string
 
 **Second test: Change Okta group to crdb_advisor_team_west**
 
