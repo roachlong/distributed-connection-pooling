@@ -606,49 +606,136 @@ await connection.ExecuteAsync("SET LOCAL app.current_roles = @roles", new { role
 
 ### Python (Flask/FastAPI)
 
-**Working Example:** See Test 9 in `TESTING_CHECKLIST.md` for a complete Flask application demonstrating:
-- Reading Istio-injected headers (`x-user-email`, `x-user-groups`)
-- Connecting to PgBouncer as `pgb_app_user` service account
-- Setting session variables with `SET LOCAL app.current_user`, `SET LOCAL app.current_roles`
-- Verifying session context vs database connection user
-- No user provisioning required (users don't exist in CRDB)
+**Concept Example:** See Test 9 in `TESTING_CHECKLIST.md` for a simple demonstration (inline code for clarity)
 
-**Key Implementation Points:**
+**Production Pattern:** Use middleware/decorator to automatically handle SET LOCAL for every request
+
+#### Flask Middleware Pattern
+
 ```python
-from flask import Flask, request, jsonify
+from flask import Flask, request, g
+from contextvars import ContextVar
 import psycopg2
+from functools import wraps
 
 app = Flask(__name__)
 
-@app.route('/api/endpoint')
-def endpoint():
-    # Step 1: Read Istio-injected headers
+# Thread-safe context storage
+user_context = ContextVar('user_context', default=None)
+
+# Middleware - runs before every request
+@app.before_request
+def extract_user_context():
+    """Read Istio-injected headers and store in request context"""
     user_email = request.headers.get('x-user-email')
     user_groups = request.headers.get('x-user-groups')
     
-    # Step 2: Connect to PgBouncer as service account
-    conn = psycopg2.connect(
-        host="pgbouncer-app.cockroachdb.svc.cluster.local",
-        port=5432,
-        database="production",
-        user="test",  # PgBouncer auth_type=any
-        sslmode="require"
-    )
+    if not user_email:
+        return jsonify({"error": "Missing user identity"}), 401
     
-    # Step 3: Middleware pattern - set session variables
-    cur = conn.cursor()
-    cur.execute("SET LOCAL app.current_user = %s", (user_email,))
-    cur.execute("SET LOCAL app.current_roles = %s", (user_groups,))
+    user_context.set({
+        'email': user_email,
+        'groups': user_groups
+    })
+
+# Database connection wrapper
+class CRDBConnection:
+    def __init__(self):
+        self.conn = psycopg2.connect(
+            host="pgbouncer-app.cockroachdb.svc.cluster.local",
+            port=5432,
+            database="production",
+            user="test",
+            sslmode="require"
+        )
+        self._inject_context()
     
-    # Step 4: Execute queries - RLS applies based on session variables
-    cur.execute("SELECT * FROM my_table")
-    results = cur.fetchall()
+    def _inject_context(self):
+        """Automatically inject user context via SET LOCAL"""
+        ctx = user_context.get()
+        if ctx:
+            cur = self.conn.cursor()
+            cur.execute("SET LOCAL app.current_user = %s", (ctx['email'],))
+            cur.execute("SET LOCAL app.current_roles = %s", (ctx['groups'],))
+            cur.close()
     
-    conn.commit()
+    def __enter__(self):
+        return self.conn
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type:
+            self.conn.rollback()
+        else:
+            self.conn.commit()
+        self.conn.close()
+
+# Business logic - no SET LOCAL needed!
+@app.route('/api/accounts')
+def get_accounts():
+    """Developer writes normal queries - RLS applies automatically"""
+    with CRDBConnection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM accounts WHERE status = 'active'")
+        results = cur.fetchall()
+    
     return jsonify(results)
 ```
 
-**For production:** Refactor into reusable middleware/decorator pattern (see TESTING_CHECKLIST Test 9 for full example)
+#### FastAPI Middleware Pattern
+
+```python
+from fastapi import FastAPI, Request, Depends
+from contextvars import ContextVar
+import psycopg2
+
+app = FastAPI()
+user_context = ContextVar('user_context', default=None)
+
+# Middleware
+@app.middleware("http")
+async def extract_user_context(request: Request, call_next):
+    user_email = request.headers.get('x-user-email')
+    user_groups = request.headers.get('x-user-groups')
+    
+    if not user_email:
+        return JSONResponse({"error": "Missing user identity"}, status_code=401)
+    
+    user_context.set({'email': user_email, 'groups': user_groups})
+    response = await call_next(request)
+    return response
+
+# Dependency injection for database connection
+def get_db():
+    conn = psycopg2.connect(...)
+    ctx = user_context.get()
+    if ctx:
+        cur = conn.cursor()
+        cur.execute("SET LOCAL app.current_user = %s", (ctx['email'],))
+        cur.execute("SET LOCAL app.current_roles = %s", (ctx['groups'],))
+        cur.close()
+    
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+# Business logic
+@app.get("/api/accounts")
+def get_accounts(db = Depends(get_db)):
+    cur = db.cursor()
+    cur.execute("SELECT * FROM accounts WHERE status = 'active'")
+    return cur.fetchall()
+```
+
+**Key Benefits:**
+- ✅ SET LOCAL automatically applied to every request (no code duplication)
+- ✅ Developers write normal queries (RLS is transparent)
+- ✅ Context propagates through entire request lifecycle
+- ✅ Connection wrapper ensures session variables are set before any query
 
 ## Security Model
 
