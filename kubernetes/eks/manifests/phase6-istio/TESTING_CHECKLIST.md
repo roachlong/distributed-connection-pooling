@@ -238,16 +238,16 @@ export JWT=$(cat ~/.crdb-token | jq -r '.id_token')
 
 # Option 2: Get new JWT via browser (authorization code flow)
 # Step 1: Build authorization URL
-AUTH_URL="${OKTA_ISSUER}/v1/authorize?client_id=${OKTA_CLIENT_ID}&response_type=id_token&scope=openid%20profile%20email%20groups&redirect_uri=http://localhost:8080/callback&state=test&nonce=$(date +%s)"
+AUTH_URL="${OKTA_ISSUER}/v1/authorize?client_id=${OKTA_CLIENT_ID}&response_type=id_token&scope=openid%20profile%20email%20groups&redirect_uri=http://localhost:8765/callback&state=test&nonce=$(date +%s)"
 
 echo "Open this URL in your browser:"
 echo $AUTH_URL
 
 # Step 2: After logging in, Okta redirects to:
-#   http://localhost:8080/callback#id_token=eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
+#   http://localhost:8765/callback#id_token=eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
 # 
 # Step 3: Copy the id_token value from the URL (everything after id_token= and before &)
-# Note: The redirect will fail (localhost:8080 not listening), but that's OK - we just need the token from URL
+# Note: The redirect will fail (localhost:8765 not listening), but that's OK - we just need the token from URL
 
 export JWT="<paste id_token value here>"
 
@@ -838,7 +838,7 @@ kubectl run test-client --rm -i --restart=Never --namespace=app-services \
 
 # 2. Get a new JWT token (old one still has east group claim)
 # Build authorization URL
-AUTH_URL_WEST="${OKTA_ISSUER}/v1/authorize?client_id=${OKTA_CLIENT_ID}&response_type=id_token&scope=openid%20profile%20email%20groups&redirect_uri=http://localhost:8080/callback&state=test&nonce=$(date +%s)"
+AUTH_URL_WEST="${OKTA_ISSUER}/v1/authorize?client_id=${OKTA_CLIENT_ID}&response_type=id_token&scope=openid%20profile%20email%20groups&redirect_uri=http://localhost:8765/callback&state=test&nonce=$(date +%s)"
 
 echo "Open this URL in your browser to get new token with updated groups:"
 echo $AUTH_URL_WEST
