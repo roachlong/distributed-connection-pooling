@@ -230,26 +230,37 @@ kubectl run test-client --rm -i --restart=Never --namespace=app-services \
 
 ### 7b. Test With Valid JWT (Should Succeed)
 
-**Get JWT from Okta:**
-```bash
-# Option 1: Use Okta token endpoint (if password grant enabled)
-export JWT=$(curl -s -X POST ${OKTA_ISSUER}/v1/token \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "grant_type=password" \
-  -d "client_id=${OKTA_CLIENT_ID}" \
-  -d "client_secret=<your-client-secret>" \
-  -d "username=<test-user@example.com>" \
-  -d "password=<password>" \
-  -d "scope=openid profile email groups" \
-  | jq -r '.id_token')
+**Get JWT from Okta using Authorization Code Flow:**
 
-# Option 2: Use existing JWT from your okta-crdb-sync workflow
-# export JWT=$(cat ~/.crdb-token | jq -r '.id_token')
+```bash
+# Option 1: Use existing JWT from okta-crdb-sync or other tools (easiest)
+export JWT=$(cat ~/.crdb-token | jq -r '.id_token')
+
+# Option 2: Get new JWT via browser (authorization code flow)
+# Step 1: Build authorization URL
+AUTH_URL="${OKTA_ISSUER}/v1/authorize?client_id=${OKTA_CLIENT_ID}&response_type=id_token&scope=openid%20profile%20email%20groups&redirect_uri=http://localhost:8080/callback&state=test&nonce=$(date +%s)"
+
+echo "Open this URL in your browser:"
+echo $AUTH_URL
+
+# Step 2: After logging in, Okta redirects to:
+#   http://localhost:8080/callback#id_token=eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
+# 
+# Step 3: Copy the id_token value from the URL (everything after id_token= and before &)
+# Note: The redirect will fail (localhost:8080 not listening), but that's OK - we just need the token from URL
+
+export JWT="<paste id_token value here>"
 
 # Verify JWT claims
 echo $JWT | cut -d. -f2 | base64 -d | jq .
-# Should show email and groups claims
+# Should show:
+# - iss: <your OKTA_ISSUER>
+# - aud: <your OKTA_AUDIENCE>
+# - email: <your email>
+# - groups: ["crdb_advisor_team_east"] or similar
 ```
+
+**Note:** Authorization code flow is the recommended OAuth2 grant type for production applications. The password grant type (username/password via curl) is deprecated and should not be enabled.
 
 **Test with JWT:**
 ```bash
@@ -352,7 +363,7 @@ kubectl apply -f /tmp/echo-virtualservice.yaml
 **Get JWT from Okta:**
 ```bash
 # Option 1: Use Okta token endpoint (if password grant enabled)
-export JWT=$(curl -s -X POST ${OKTA_ISSUER}/v1/token \
+export JWT=$(curl --insecure -s -X POST ${OKTA_ISSUER}/v1/token \
   -H "Content-Type: application/x-www-form-urlencoded" \
   -d "grant_type=password" \
   -d "client_id=${OKTA_CLIENT_ID}" \
@@ -826,19 +837,18 @@ kubectl run test-client --rm -i --restart=Never --namespace=app-services \
 #    Add: crdb_advisor_team_west
 
 # 2. Get a new JWT token (old one still has east group claim)
-export JWT_WEST=$(curl -s -X POST ${OKTA_ISSUER}/v1/token \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "grant_type=password" \
-  -d "client_id=${OKTA_CLIENT_ID}" \
-  -d "client_secret=<your-client-secret>" \
-  -d "username=<your-email>" \
-  -d "password=<password>" \
-  -d "scope=openid profile email groups" \
-  | jq -r '.id_token')
+# Build authorization URL
+AUTH_URL_WEST="${OKTA_ISSUER}/v1/authorize?client_id=${OKTA_CLIENT_ID}&response_type=id_token&scope=openid%20profile%20email%20groups&redirect_uri=http://localhost:8080/callback&state=test&nonce=$(date +%s)"
+
+echo "Open this URL in your browser to get new token with updated groups:"
+echo $AUTH_URL_WEST
+
+# After logging in, copy id_token from redirect URL
+export JWT_WEST="<paste new id_token here>"
 
 # 3. Verify new JWT has west group
 echo $JWT_WEST | cut -d. -f2 | base64 -d | jq .groups
-# Should show: "crdb_advisor_team_west"
+# Should show: ["crdb_advisor_team_west"] or "crdb_advisor_team_west"
 
 # 4. Call /rls-test with new JWT
 kubectl run test-client --rm -i --restart=Never --namespace=app-services \
