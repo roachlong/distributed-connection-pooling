@@ -677,10 +677,10 @@ data:
             cur.execute("SET LOCAL app.current_roles = %s", (user_groups,))
             
             # Step 5: Verify session context
-            cur.execute("SHOW app.current_user")
+            cur.execute("SELECT current_setting('app.current_user', true)")
             current_user = cur.fetchone()[0]
             
-            cur.execute("SHOW app.current_roles")
+            cur.execute("SELECT current_setting('app.current_roles', true)")
             current_roles = cur.fetchone()[0]
             
             # Step 6: Query database info
