@@ -551,26 +551,104 @@ Application teams must implement middleware to consume Istio-injected headers an
 
 ### Java (Spring Boot)
 
-See: `kubernetes/eks/manifests/phase6-istio/reference-implementations/java/`
-- Servlet Filter to read headers
+**Pattern:** Same middleware approach as Python example in TESTING_CHECKLIST Test 9
+
+**Implementation Requirements:**
+- Servlet Filter to read Istio-injected headers (`x-user-email`, `x-user-groups`)
 - ThreadLocal storage for request context
-- Connection wrapper to inject SET LOCAL
-- Spring @Transactional integration
+- Connection wrapper to inject `SET LOCAL` before query execution
+- Spring `@Transactional` integration to ensure session variables are set per transaction
+
+**Key Pattern:**
+```java
+// Servlet Filter
+public class UserContextFilter implements Filter {
+    public void doFilter(ServletRequest request, HttpServletResponse response, FilterChain chain) {
+        String userEmail = request.getHeader("x-user-email");
+        String userGroups = request.getHeader("x-user-groups");
+        UserContext.set(userEmail, userGroups);  // ThreadLocal
+        chain.doFilter(request, response);
+        UserContext.clear();
+    }
+}
+
+// Connection Wrapper
+connection.prepareStatement("SET LOCAL app.current_user = ?").execute(userEmail);
+connection.prepareStatement("SET LOCAL app.current_roles = ?").execute(userGroups);
+```
 
 ### C# (ASP.NET Core)
 
-See: `kubernetes/eks/manifests/phase6-istio/reference-implementations/dotnet/`
-- ASP.NET Middleware to read headers
+**Pattern:** Same middleware approach as Python example in TESTING_CHECKLIST Test 9
+
+**Implementation Requirements:**
+- ASP.NET Middleware to read Istio-injected headers (`x-user-email`, `x-user-groups`)
 - AsyncLocal storage for request context
-- DbConnection wrapper to inject SET LOCAL
-- Entity Framework integration
+- DbConnection wrapper to inject `SET LOCAL` before query execution
+- Entity Framework integration to set session variables automatically
+
+**Key Pattern:**
+```csharp
+// Middleware
+public class UserContextMiddleware {
+    public async Task InvokeAsync(HttpContext context, RequestDelegate next) {
+        var userEmail = context.Request.Headers["x-user-email"];
+        var userGroups = context.Request.Headers["x-user-groups"];
+        UserContext.Current = new UserContext(userEmail, userGroups);  // AsyncLocal
+        await next(context);
+    }
+}
+
+// DbConnection Wrapper
+await connection.ExecuteAsync("SET LOCAL app.current_user = @user", new { user = userEmail });
+await connection.ExecuteAsync("SET LOCAL app.current_roles = @roles", new { roles = userGroups });
+```
 
 ### Python (Flask/FastAPI)
 
-See: `kubernetes/eks/manifests/phase6-istio/reference-implementations/python/`
-- Flask/FastAPI middleware to read headers
-- contextvars for request context
-- psycopg3 connection pool wrapper to inject SET LOCAL
+**Working Example:** See Test 9 in `TESTING_CHECKLIST.md` for a complete Flask application demonstrating:
+- Reading Istio-injected headers (`x-user-email`, `x-user-groups`)
+- Connecting to PgBouncer as `pgb_app_user` service account
+- Setting session variables with `SET LOCAL app.current_user`, `SET LOCAL app.current_roles`
+- Verifying session context vs database connection user
+- No user provisioning required (users don't exist in CRDB)
+
+**Key Implementation Points:**
+```python
+from flask import Flask, request, jsonify
+import psycopg2
+
+app = Flask(__name__)
+
+@app.route('/api/endpoint')
+def endpoint():
+    # Step 1: Read Istio-injected headers
+    user_email = request.headers.get('x-user-email')
+    user_groups = request.headers.get('x-user-groups')
+    
+    # Step 2: Connect to PgBouncer as service account
+    conn = psycopg2.connect(
+        host="pgbouncer-app.cockroachdb.svc.cluster.local",
+        port=5432,
+        database="production",
+        user="test",  # PgBouncer auth_type=any
+        sslmode="require"
+    )
+    
+    # Step 3: Middleware pattern - set session variables
+    cur = conn.cursor()
+    cur.execute("SET LOCAL app.current_user = %s", (user_email,))
+    cur.execute("SET LOCAL app.current_roles = %s", (user_groups,))
+    
+    # Step 4: Execute queries - RLS applies based on session variables
+    cur.execute("SELECT * FROM my_table")
+    results = cur.fetchall()
+    
+    conn.commit()
+    return jsonify(results)
+```
+
+**For production:** Refactor into reusable middleware/decorator pattern (see TESTING_CHECKLIST Test 9 for full example)
 
 ## Security Model
 
