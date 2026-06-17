@@ -269,7 +269,7 @@ export JWT=$(curl -k -X POST ${OKTA_ISSUER}/v1/token \
   | jq -r '.id_token')
 
 # Verify JWT claims
-echo $JWT | cut -d. -f2 | base64 -d | jq .
+echo $JWT | python3 -c "import sys, json, base64; payload = sys.stdin.read().strip().split('.')[1]; padding = '=' * (4 - len(payload) % 4); print(json.dumps(json.loads(base64.urlsafe_b64decode(payload + padding)), indent=2))"
 # Should show:
 # - iss: <your OKTA_ISSUER>
 # - aud: <your OKTA_AUDIENCE>
@@ -331,7 +331,7 @@ kubectl run test-client --rm -i --restart=Never --namespace=app-services \
 **If headers NOT present:**
 - Check RequestAuthentication: `kubectl describe requestauthentication jwt-auth-okta -n app-services`
 - Verify `outputClaimToHeaders` is configured correctly
-- Verify JWT has `email` and `groups` claims: `echo $JWT | cut -d. -f2 | base64 -d | jq .`
+- Verify JWT has `email` and `groups` claims: `echo $JWT | python3 -c "import sys, json, base64; payload = sys.stdin.read().strip().split('.')[1]; padding = '=' * (4 - len(payload) % 4); print(json.dumps(json.loads(base64.urlsafe_b64decode(payload + padding)), indent=2))"`
 
 ## Test 8: Test JWT Validation (Via Ingress Gateway)
 
@@ -397,7 +397,7 @@ export JWT=$(curl --insecure -s -X POST ${OKTA_ISSUER}/v1/token \
 # export JWT=$(cat ~/.crdb-token | jq -r '.id_token')
 
 # Decode JWT to verify claims
-echo $JWT | cut -d. -f2 | base64 -d | jq .
+echo $JWT | python3 -c "import sys, json, base64; payload = sys.stdin.read().strip().split('.')[1]; padding = '=' * (4 - len(payload) % 4); print(json.dumps(json.loads(base64.urlsafe_b64decode(payload + padding)), indent=2))"
 
 # Should show:
 # {
@@ -877,7 +877,7 @@ export JWT_WEST=$(curl -k -X POST ${OKTA_ISSUER}/v1/token \
   | jq -r '.id_token')
 
 # 3. Verify new JWT has west group
-echo $JWT_WEST | cut -d. -f2 | base64 -d | jq .groups
+echo $JWT_WEST | python3 -c "import sys, json, base64; payload = sys.stdin.read().strip().split('.')[1]; padding = '=' * (4 - len(payload) % 4); print(json.loads(base64.urlsafe_b64decode(payload + padding)).get('groups', 'No groups claim'))"
 # Should show: ["crdb_advisor_team_west"] or "crdb_advisor_team_west"
 
 # 4. Call /rls-test with new JWT
@@ -1033,7 +1033,7 @@ kubectl get requestauthentication jwt-auth-okta -n app-services -o yaml
 # - audiences contains your OKTA_AUDIENCE
 
 # Decode your JWT to verify claims
-echo $JWT | cut -d. -f2 | base64 -d | jq .
+echo $JWT | python3 -c "import sys, json, base64; payload = sys.stdin.read().strip().split('.')[1]; padding = '=' * (4 - len(payload) % 4); print(json.dumps(json.loads(base64.urlsafe_b64decode(payload + padding)), indent=2))"
 
 # Verify:
 # - "iss" claim matches OKTA_ISSUER
