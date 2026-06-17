@@ -261,13 +261,11 @@ export AUTH_CODE="<paste authorization code here>"
 # Note: You'll need your client_secret from Okta app settings
 export CLIENT_SECRET="<your-okta-client-secret>"
 
-export JWT=$(curl -k -s -X POST ${OKTA_ISSUER}/v1/token \
-  -H "Content-Type: application/x-www-form-urlencoded" \
+export JWT=$(curl -k -X POST ${OKTA_ISSUER}/v1/token \
   -d "grant_type=authorization_code" \
-  -d "client_id=${OKTA_CLIENT_ID}" \
-  -d "client_secret=${CLIENT_SECRET}" \
   -d "code=${AUTH_CODE}" \
   -d "redirect_uri=http://localhost:8765/callback" \
+  -u "${OKTA_CLIENT_ID}:${CLIENT_SECRET}" \
   | jq -r '.id_token')
 
 # Verify JWT claims
@@ -871,13 +869,11 @@ echo $AUTH_URL_WEST
 export AUTH_CODE_WEST="<paste authorization code here>"
 
 # Exchange code for tokens
-export JWT_WEST=$(curl -k -s -X POST ${OKTA_ISSUER}/v1/token \
-  -H "Content-Type: application/x-www-form-urlencoded" \
+export JWT_WEST=$(curl -k -X POST ${OKTA_ISSUER}/v1/token \
   -d "grant_type=authorization_code" \
-  -d "client_id=${OKTA_CLIENT_ID}" \
-  -d "client_secret=${CLIENT_SECRET}" \
   -d "code=${AUTH_CODE_WEST}" \
   -d "redirect_uri=http://localhost:8765/callback" \
+  -u "${OKTA_CLIENT_ID}:${CLIENT_SECRET}" \
   | jq -r '.id_token')
 
 # 3. Verify new JWT has west group
