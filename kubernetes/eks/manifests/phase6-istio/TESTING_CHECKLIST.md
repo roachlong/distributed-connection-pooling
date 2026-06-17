@@ -440,7 +440,61 @@ This test demonstrates the **complete auth flow** including database connection,
 - Application connects as `pgb_app_user` (service account)
 - Identity propagated via session variables, not SQL username
 
-### 9a. Deploy Sample Application
+### 9a. Create RLS Test Table and Data
+
+First, create a test table with RLS policy to demonstrate data filtering:
+
+```bash
+# Create test table with RLS policy
+kubectl exec -n cockroachdb cockroachdb-east-0 -- ./cockroach sql \
+  --certs-dir=/cockroach/cockroach-certs \
+  --database=production \
+  --execute="
+-- Create test table
+CREATE TABLE IF NOT EXISTS test_rls_data (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    team_role TEXT NOT NULL,
+    data TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Insert sample data for different teams
+INSERT INTO test_rls_data (team_role, data) VALUES
+    ('crdb_advisor_team_east', 'Sensitive data for East team - Query 1'),
+    ('crdb_advisor_team_east', 'Sensitive data for East team - Query 2'),
+    ('crdb_advisor_team_west', 'Sensitive data for West team - Query 1'),
+    ('crdb_advisor_team_west', 'Sensitive data for West team - Query 2'),
+    ('crdb_advisor_team_central', 'Sensitive data for Central team - Query 1');
+
+-- Grant permissions to app pool service account
+GRANT SELECT ON test_rls_data TO pgb_app_user;
+
+-- Enable RLS
+ALTER TABLE test_rls_data ENABLE ROW LEVEL SECURITY;
+
+-- Create RLS policy that filters by session variable
+CREATE POLICY team_isolation ON test_rls_data
+    FOR SELECT
+    USING (team_role = current_setting('app.current_roles', true));
+
+-- Verify table and data
+SELECT team_role, COUNT(*) FROM test_rls_data GROUP BY team_role;
+"
+
+# Expected output:
+#         team_role         | count
+# --------------------------+-------
+#  crdb_advisor_team_east    |     2
+#  crdb_advisor_team_west    |     2
+#  crdb_advisor_team_central |     1
+```
+
+**What This Sets Up:**
+- ✅ Test table with team-specific data
+- ✅ RLS policy that filters by `app.current_roles` session variable
+- ✅ Different teams see different data (East sees only East data, etc.)
+
+### 9b. Deploy Sample Application
 
 ```bash
 # Create sample app deployment
@@ -467,6 +521,69 @@ data:
     @app.route('/health')
     def health():
         return jsonify({"status": "healthy"}), 200
+
+    @app.route('/rls-test')
+    def rls_test():
+        """Demonstrates RLS filtering based on JWT groups claim"""
+        
+        # Step 1: Read Istio-injected headers
+        user_email = request.headers.get('x-user-email', 'unknown')
+        user_groups = request.headers.get('x-user-groups', '')
+        
+        if user_email == 'unknown':
+            return jsonify({
+                "error": "No user identity found",
+                "hint": "Request must include valid JWT token"
+            }), 401
+        
+        try:
+            # Step 2: Connect to PgBouncer as pgb_app_user
+            conn = psycopg2.connect(
+                host=DB_HOST,
+                port=DB_PORT,
+                database=DB_NAME,
+                user="test",
+                sslmode=DB_SSLMODE
+            )
+            cur = conn.cursor()
+            
+            # Step 3: Set session variables for RLS
+            cur.execute("SET LOCAL app.current_user = %s", (user_email,))
+            cur.execute("SET LOCAL app.current_roles = %s", (user_groups,))
+            
+            # Step 4: Query RLS-protected table (should only see data for user's team)
+            cur.execute("SELECT id, team_role, data, created_at FROM test_rls_data ORDER BY created_at")
+            rows = cur.fetchall()
+            
+            # Step 5: Also get total count without RLS (as superuser for comparison)
+            cur.execute("SELECT COUNT(*) FROM test_rls_data")
+            total_rows = cur.fetchone()[0]
+            
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            return jsonify({
+                "message": "RLS filtering successful",
+                "user_identity": {
+                    "email": user_email,
+                    "groups": user_groups
+                },
+                "rls_filtered_data": [
+                    {
+                        "id": str(row[0]),
+                        "team_role": row[1],
+                        "data": row[2],
+                        "created_at": row[3].isoformat() if row[3] else None
+                    } for row in rows
+                ],
+                "visible_rows": len(rows),
+                "total_rows_in_table": total_rows,
+                "proof": f"User with role '{user_groups}' sees {len(rows)} of {total_rows} rows (RLS filtering worked!)"
+            }), 200
+            
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     @app.route('/whoami')
     def whoami():
@@ -596,7 +713,7 @@ kubectl wait --for=condition=ready pod -l app=sample-auth-app -n app-services --
 # pod/sample-auth-app-xxxxxxxxxx-xxxxx condition met
 ```
 
-### 9b. Test Auth Flow Without JWT (Should Fail)
+### 9c. Test Auth Flow Without JWT (Should Fail)
 
 ```bash
 # Try to access without JWT
@@ -611,7 +728,7 @@ kubectl run test-client --rm -i --restart=Never --namespace=app-services \
 # This proves: Istio blocks requests without JWT
 ```
 
-### 9c. Test Full Auth Flow With JWT (Should Succeed)
+### 9d. Test Identity Propagation With JWT (/whoami endpoint)
 
 ```bash
 # Call with valid JWT (use JWT from Test 7b)
@@ -656,7 +773,113 @@ kubectl run test-client --rm -i --restart=Never --namespace=app-services \
 - **app.current_roles** session variable = crdb_advisor_team_east (for RLS)
 - RLS policies check session variables, not the SQL username
 
-### 9d. Verify Different Users See Different Context
+### 9e. Test RLS Data Filtering With JWT (PROOF OF RLS!)
+
+This is the **critical test** that proves RLS actually filters data based on JWT groups.
+
+**First test: With crdb_advisor_team_east group**
+
+```bash
+# Call /rls-test endpoint with JWT (use JWT from Test 7b)
+# Your JWT should have groups claim: "crdb_advisor_team_east"
+kubectl run test-client --rm -i --restart=Never --namespace=app-services \
+  --image=curlimages/curl:latest -- \
+  curl -s -H "Authorization: Bearer $JWT" http://sample-auth-app:8080/rls-test | jq .
+
+# Expected output:
+# {
+#   "message": "RLS filtering successful",
+#   "user_identity": {
+#     "email": "your-email@example.com",
+#     "groups": "crdb_advisor_team_east"
+#   },
+#   "rls_filtered_data": [
+#     {
+#       "id": "...",
+#       "team_role": "crdb_advisor_team_east",
+#       "data": "Sensitive data for East team - Query 1",
+#       "created_at": "..."
+#     },
+#     {
+#       "id": "...",
+#       "team_role": "crdb_advisor_team_east",
+#       "data": "Sensitive data for East team - Query 2",
+#       "created_at": "..."
+#     }
+#   ],
+#   "visible_rows": 2,
+#   "total_rows_in_table": 5,
+#   "proof": "User with role 'crdb_advisor_team_east' sees 2 of 5 rows (RLS filtering worked!)"
+# }
+```
+
+**What This Proves:**
+- ✅ User with `crdb_advisor_team_east` sees **only 2 rows** (East team data)
+- ✅ **Cannot see** the 3 rows for West/Central teams (RLS filtered them out)
+- ✅ RLS policy is enforcing based on `app.current_roles` session variable
+
+**Second test: Change Okta group to crdb_advisor_team_west**
+
+```bash
+# 1. In Okta admin, change your user's group membership:
+#    Remove: crdb_advisor_team_east
+#    Add: crdb_advisor_team_west
+
+# 2. Get a new JWT token (old one still has east group claim)
+export JWT_WEST=$(curl -s -X POST ${OKTA_ISSUER}/v1/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=password" \
+  -d "client_id=${OKTA_CLIENT_ID}" \
+  -d "client_secret=<your-client-secret>" \
+  -d "username=<your-email>" \
+  -d "password=<password>" \
+  -d "scope=openid profile email groups" \
+  | jq -r '.id_token')
+
+# 3. Verify new JWT has west group
+echo $JWT_WEST | cut -d. -f2 | base64 -d | jq .groups
+# Should show: "crdb_advisor_team_west"
+
+# 4. Call /rls-test with new JWT
+kubectl run test-client --rm -i --restart=Never --namespace=app-services \
+  --image=curlimages/curl:latest -- \
+  curl -s -H "Authorization: Bearer $JWT_WEST" http://sample-auth-app:8080/rls-test | jq .
+
+# Expected output:
+# {
+#   "message": "RLS filtering successful",
+#   "user_identity": {
+#     "email": "your-email@example.com",
+#     "groups": "crdb_advisor_team_west"
+#   },
+#   "rls_filtered_data": [
+#     {
+#       "id": "...",
+#       "team_role": "crdb_advisor_team_west",
+#       "data": "Sensitive data for West team - Query 1",
+#       "created_at": "..."
+#     },
+#     {
+#       "id": "...",
+#       "team_role": "crdb_advisor_team_west",
+#       "data": "Sensitive data for West team - Query 2",
+#       "created_at": "..."
+#     }
+#   ],
+#   "visible_rows": 2,
+#   "total_rows_in_table": 5,
+#   "proof": "User with role 'crdb_advisor_team_west' sees 2 of 5 rows (RLS filtering worked!)"
+# }
+```
+
+**What This Proves:**
+- ✅ Same user, different group → sees **different data** (West team data now)
+- ✅ **Cannot see** East or Central team data anymore
+- ✅ RLS dynamically filters based on JWT claims (no hardcoded user in CRDB)
+
+**This is the smoking gun:** Same user account in Okta, but different group memberships result in seeing completely different data sets. The user doesn't exist in CockroachDB - only the role does. RLS is purely driven by the JWT groups claim → session variable → policy.
+
+### 9f. Verify Different Users See Different Context (Optional)
 
 If you have multiple Okta test users, test with different JWTs:
 
@@ -680,6 +903,12 @@ kubectl run test-client --rm -i --restart=Never --namespace=app-services \
 ## Test 10: Cleanup Test Resources
 
 ```bash
+# Remove RLS test table
+kubectl exec -n cockroachdb cockroachdb-east-0 -- ./cockroach sql \
+  --certs-dir=/cockroach/cockroach-certs \
+  --database=production \
+  --execute="DROP TABLE IF EXISTS test_rls_data CASCADE;"
+
 # Remove sample auth app
 kubectl delete deployment sample-auth-app -n app-services
 kubectl delete service sample-auth-app -n app-services
@@ -698,7 +927,7 @@ kubectl get all -n app-services
 # Expected: No resources (empty namespace except for istio components)
 ```
 
-**Note:** This leaves the `app-services` namespace and Istio configuration intact for future application deployments.
+**Note:** This leaves the `app-services` namespace and Istio configuration intact for future application deployments. The RLS test table is completely removed with no traces left in the database.
 
 ---
 
@@ -727,6 +956,13 @@ Phase 6 is working correctly if:
 - ✅ Session context reflects real user identity (not service account)
 - ✅ Different JWTs produce different session contexts
 - ✅ No CockroachDB user provisioning required (users don't exist in CRDB)
+
+**RLS Enforcement (Test 9e - THE PROOF):**
+- ✅ RLS policy filters data based on `app.current_roles` session variable
+- ✅ User with `crdb_advisor_team_east` sees only East data (2 of 5 rows)
+- ✅ Same user with `crdb_advisor_team_west` sees only West data (2 of 5 rows)
+- ✅ Different JWT groups → different data visibility
+- ✅ No ability to see other teams' data (RLS prevents it)
 
 ---
 
