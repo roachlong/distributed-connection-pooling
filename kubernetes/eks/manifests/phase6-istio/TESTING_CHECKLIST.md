@@ -243,11 +243,17 @@ AUTH_URL="${OKTA_ISSUER}/v1/authorize?client_id=${OKTA_CLIENT_ID}&response_type=
 echo "Open this URL in your browser:"
 echo $AUTH_URL
 
-# Step 2: After logging in, Okta redirects to:
-#   http://localhost:8765/callback?code=abc123...&state=test
+# Step 2: After logging in, browser shows "This site can't be reached" - THIS IS EXPECTED!
+# Look at the browser address bar, it will show:
+#   http://localhost:8765/callback?code=OflGxGLXSu8aBq8vLy_FVrJN82M...&state=test
 # 
-# Copy the authorization code from the URL (the value after code= and before &state)
-# Note: The redirect will fail (localhost:8765 not listening), but that's OK - we just need the code from URL
+# Copy the authorization code from the URL (everything after code= and before &state)
+# Example: if URL is http://localhost:8765/callback?code=abc123xyz&state=test
+#          then AUTH_CODE is "abc123xyz"
+# 
+# Note: The connection fails because no server is listening on localhost:8765
+#       (okta-crdb-sync runs a server, but we're doing manual testing)
+#       We just need the code from the URL - the failed connection is expected!
 
 export AUTH_CODE="<paste authorization code here>"
 
@@ -859,7 +865,9 @@ AUTH_URL_WEST="${OKTA_ISSUER}/v1/authorize?client_id=${OKTA_CLIENT_ID}&response_
 echo "Open this URL in your browser to get new token with updated groups:"
 echo $AUTH_URL_WEST
 
-# After logging in, copy authorization code from redirect URL
+# Browser will show "This site can't be reached" - look at address bar for the code!
+# URL will be: http://localhost:8765/callback?code=xyz789...&state=test
+# Copy the code parameter value
 export AUTH_CODE_WEST="<paste authorization code here>"
 
 # Exchange code for tokens
